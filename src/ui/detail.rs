@@ -39,9 +39,9 @@ use skillbase_core::{
     LocationKind, Outcome, Registry, Roots, SKILL_FILE_NAME, STORE_ID, Skill, SkillDoc, SkillError,
 };
 
-use super::agent_icon;
 use super::model::{Issue, Scan, SkillView, agent_label, display_path, has_disable_state};
 use super::report;
+use super::{BAND_HEIGHT, agent_icon, drag_band};
 
 /// How many differing paths a duplicate lists before it starts counting.
 const DIFF_PATHS: usize = 6;
@@ -927,12 +927,17 @@ impl DetailPane {
             .into_any_element()
     }
 
-    fn header(&self, skill: &SkillView, cx: &mut Context<Self>) -> impl IntoElement {
+    fn header(
+        &self,
+        skill: &SkillView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let invalid = skill.parse_error.is_some();
 
-        h_flex()
+        drag_band("detail-header", window, cx)
             .flex_shrink_0()
-            .h_12()
+            .h(BAND_HEIGHT)
             .px_5()
             .gap_3()
             .items_center()
@@ -1885,14 +1890,17 @@ impl DetailPane {
         let this = cx.entity().downgrade();
 
         TabBar::new("detail-tabs")
-            // Underline rather than the boxed default: the boxed variant marks
-            // the selected tab by weight alone against this theme, and these
-            // tabs sit directly under the pane's own header, where a second
-            // band of chrome would compete with it.
-            .underline()
+            // Segmented rather than the boxed default: the boxed variant marks
+            // the selected tab by weight alone against this theme, and the
+            // segmented one's trough gives this second band a shape of its own
+            // under the header without a rule between the two.
+            .segmented()
             // Enough open files to overflow the pane get a dropdown rather
-            // than being clipped off the right edge.
-            .menu(true)
+            // than being clipped off the right edge. The trigger is drawn
+            // unconditionally, though, and inside the segmented trough it
+            // reads as a select rather than as an overflow, so it is asked for
+            // only once there are enough tabs to be worth one.
+            .menu(labels.len() > 4)
             .selected_index(selected)
             .children(labels.into_iter().map(|(showing, label, dirty, closable)| {
                 Tab::new().label(label).suffix(
@@ -2227,7 +2235,7 @@ fn issue_lines(issues: Vec<&Issue>, cx: &mut Context<DetailPane>) -> Vec<AnyElem
 }
 
 impl Render for DetailPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(skill) = self.skill.clone() else {
             return self.empty_state(cx).into_any_element();
         };
@@ -2244,13 +2252,13 @@ impl Render for DetailPane {
             .size_full()
             .min_w_0()
             .bg(cx.theme().background)
-            .child(self.header(&skill, cx))
+            .child(self.header(&skill, window, cx))
             .child(
-                div()
+                h_flex()
                     .flex_shrink_0()
+                    .h_11()
                     .px_5()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
+                    .items_center()
                     .child(self.tabs(cx)),
             )
             .child(div().flex_1().min_h_0().child(body))

@@ -1,14 +1,20 @@
-//! The scope sidebar: a Library group, an Agents group listing only the agents
-//! that exist on this machine, and Settings pinned to the bottom.
+//! The sidebar column: its two header bands, a New skill row, a Library group,
+//! an Agents group listing only the agents that exist on this machine, and
+//! Settings pinned to the bottom.
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem,
+    Sidebar, SidebarItem, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
 };
-use gpui_kit::component::{ActiveTheme as _, Collapsible, IconName};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{
+    ActiveTheme as _, Collapsible, Icon, IconName, Sizable as _, StyledExt as _, TitleBar, h_flex,
+    v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Context, Div, ElementId, IntoElement, ParentElement as _, SharedString, Styled as _,
-    Window, div, px,
+    App, Context, Div, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use skillbase_core::{AgentDef, Registry};
 
@@ -16,6 +22,7 @@ use super::agent_icon;
 
 use crate::app::Skillbase;
 
+use super::BAND_HEIGHT;
 use super::model::{Library, Scope};
 
 /// Wide enough for the longest scope label, and visibly subordinate to the
@@ -29,9 +36,14 @@ impl Skillbase {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let scope = self.scope;
-        let collapsed = self.sidebar_collapsed;
         let in_settings = self.showing_settings;
         let scan = self.scan();
+
+        // A new skill lands in the store whatever the selected scope is, so it
+        // reads as a destination's peer rather than as a list control.
+        let new_skill = SidebarMenuItem::new("New skill")
+            .icon(IconName::Plus)
+            .on_click(cx.listener(|this, _, window, cx| this.open_new_skill_dialog(window, cx)));
 
         let library: Vec<_> =
             Library::ALL
@@ -87,29 +99,118 @@ impl Skillbase {
                 })
                 .collect();
 
-        // Settings goes into the footer as a bare menu rather than wrapped in
-        // `SidebarFooter`. That wrapper adds its own padding on top of the
-        // footer region's, which indents the row 8px past every row above it,
-        // and paints a second hover background around the item's own. Once the
-        // sidebar collapses to 48px the doubled padding leaves the item no
-        // width at all and clips the icon out of sight.
-        let settings = scope_menu()
-            .child(
-                SidebarMenuItem::new("Settings")
-                    .icon(IconName::Settings)
-                    .active(in_settings)
-                    .on_click(cx.listener(|this, _, _, cx| this.show_settings(cx))),
-            )
-            .collapsed(collapsed)
-            .render("settings", window, cx);
+        let settings_item = SidebarMenuItem::new("Settings")
+            .icon(IconName::Settings)
+            .active(in_settings)
+            .on_click(cx.listener(|this, _, _, cx| this.show_settings(cx)));
 
-        Sidebar::new("scopes")
-            .collapsible(SidebarCollapsible::Icon)
-            .collapsed(collapsed)
+        v_flex()
+            .h_full()
+            .flex_shrink_0()
             .w(px(SIDEBAR_WIDTH))
-            .child(ScopeGroup::first("Library", library))
-            .child(ScopeGroup::new("Agents", agents))
-            .footer(settings)
+            .bg(cx.theme().tokens.sidebar)
+            // The column owns the boundary with the work area, so the two bands
+            // and the navigation under them cannot draw it at different widths.
+            .border_r_1()
+            .border_color(cx.theme().sidebar_border)
+            .child(self.sidebar_identity_band(cx))
+            .child(self.sidebar_name_band(cx))
+            .child(
+                div().flex().flex_1().min_h_0().child(
+                    Sidebar::new("scopes")
+                        .w_full()
+                        .border_r_0()
+                        .child(ScopeGroup::leading(vec![new_skill]))
+                        .child(ScopeGroup::new("Library", library))
+                        .child(ScopeGroup::new("Agents", agents))
+                        // Settings goes into the footer as a bare menu rather
+                        // than wrapped in `SidebarFooter`. That wrapper adds its
+                        // own padding on top of the footer region's, which
+                        // indents the row 8px past every row above it, and
+                        // paints a second hover background around the item's
+                        // own.
+                        .footer(
+                            scope_menu()
+                                .child(settings_item)
+                                .render("settings", window, cx),
+                        ),
+                ),
+            )
+    }
+
+    /// The sidebar's first band: nothing but the collapse control, because the
+    /// macOS traffic lights take the rest of the row.
+    ///
+    /// `TitleBar` is what stands in here rather than a plain row, for the inset
+    /// those lights need and for the window drag and double-click zoom it
+    /// already owns. Its bottom hairline is painted in the sidebar's own colour
+    /// so the band and the sidebar read as one surface.
+    fn sidebar_identity_band(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        TitleBar::new()
+            .h(BAND_HEIGHT)
+            .bg(cx.theme().tokens.sidebar)
+            .border_color(cx.theme().tokens.sidebar)
+            .child(
+                h_flex().h_full().items_center().child(
+                    SidebarToggleButton::new()
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                ),
+            )
+    }
+
+    /// The sidebar's second band: what the application is called, and the one
+    /// command whose scope is the whole machine rather than the visible list.
+    fn sidebar_name_band(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let home = self.roots.home().display().to_string();
+
+        h_flex()
+            .flex_shrink_0()
+            .h_11()
+            .px_3()
+            .gap_2()
+            .items_center()
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    // The rows below inset their contents by this much again
+                    // inside the same padding, and the name sits on that spine.
+                    .pl_2()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().font_medium().truncate().child("Skillbase"))
+                    .when(self.home_overridden, |this| {
+                        // Every mutation lands under this directory, so where
+                        // it points is named rather than implied.
+                        this.child(
+                            div()
+                                .id("home-override")
+                                .flex_shrink_0()
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(format!("SKILLBASE_HOME={home}")).build(window, cx)
+                                })
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .xsmall()
+                                        .text_color(cx.theme().warning),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                Button::new("refresh")
+                    .ghost()
+                    .small()
+                    .icon(IconName::RotateCw)
+                    .tooltip("Re-scan every scope")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.rescan(None, window, cx);
+                        // Cheap after the first read, which is cached, and
+                        // Refresh is the one gesture that means "look at the
+                        // machine again".
+                        this.count_usage(window, cx);
+                    })),
+            )
     }
 }
 
@@ -126,14 +227,15 @@ fn scope_menu() -> SidebarMenu {
 ///
 /// `SidebarGroup` would do this, but it puts nothing above its label, so the
 /// first row of a group crowds the last row of the one before it; and it is
-/// not `Styled`, so a caller cannot add the space. It also drops its label
-/// when the sidebar collapses, leaving two runs of icons with no boundary
-/// between them at all.
+/// not `Styled`, so a caller cannot add the space. It also insists on a label,
+/// which the run of commands at the top does not want.
 #[derive(Clone)]
 struct ScopeGroup {
-    label: SharedString,
+    /// `None` for the group of commands at the top, which is short enough and
+    /// distinct enough that a heading would only name what the row says.
+    label: Option<SharedString>,
     items: Vec<SidebarMenuItem>,
-    /// True for the group at the top, which needs no space or rule above it.
+    /// True for the group at the top, which needs no space above it.
     leading: bool,
     collapsed: bool,
 }
@@ -141,17 +243,19 @@ struct ScopeGroup {
 impl ScopeGroup {
     fn new(label: impl Into<SharedString>, items: Vec<SidebarMenuItem>) -> Self {
         Self {
-            label: label.into(),
+            label: Some(label.into()),
             items,
             leading: false,
             collapsed: false,
         }
     }
 
-    fn first(label: impl Into<SharedString>, items: Vec<SidebarMenuItem>) -> Self {
+    fn leading(items: Vec<SidebarMenuItem>) -> Self {
         Self {
+            label: None,
+            items,
             leading: true,
-            ..Self::new(label, items)
+            collapsed: false,
         }
     }
 }
@@ -177,13 +281,14 @@ impl SidebarItem for ScopeGroup {
         let id = id.into();
         let collapsed = self.collapsed;
         let leading = self.leading;
+        let label = self.label.clone().filter(|_| !collapsed);
 
         div()
             .flex()
             .flex_col()
             // Sections stand apart; rows within a section do not.
             .when(!leading, |this| this.pt_4())
-            .when(!collapsed, |this| {
+            .when_some(label, |this, label| {
                 this.child(
                     div()
                         .flex()
@@ -193,19 +298,7 @@ impl SidebarItem for ScopeGroup {
                         .px_2()
                         .text_xs()
                         .text_color(cx.theme().sidebar_foreground.opacity(0.7))
-                        .child(self.label.clone()),
-                )
-            })
-            .when(collapsed && !leading, |this| {
-                // With no room for the label, a hairline says the same thing:
-                // these two runs of icons are different kinds of scope.
-                this.child(
-                    div()
-                        .flex_shrink_0()
-                        .mx_2()
-                        .mb_4()
-                        .h(px(1.))
-                        .bg(cx.theme().border),
+                        .child(label),
                 )
             })
             .child(

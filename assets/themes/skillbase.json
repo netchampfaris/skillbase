@@ -302,7 +302,7 @@
         "tab.background": "#00000000",
         "tab.foreground": "#8A8A8A",
         "tab_bar.background": "#1E1E1E",
-        "tab_bar.segmented.background": "#2A2A2D",
+        "tab_bar.segmented.background": "#121212",
         "table.active.background": "#A8A8B4",
         "table.active.border": "#2A2A2D",
         "table.background": "#181818",

@@ -1,5 +1,5 @@
-//! The middle pane: a search field and the ordering control over a scrolling
-//! list of skill rows.
+//! The middle column: a band naming the scope and ordering it, a search field,
+//! and a scrolling list of skill rows.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::{DialogClose, DialogFooter};
@@ -33,7 +33,7 @@ pub const LIST_MAX_WIDTH: f32 = 460.;
 impl Skillbase {
     pub(crate) fn render_skill_list(
         &self,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let query = self.search.read(cx).value();
@@ -95,26 +95,44 @@ impl Skillbase {
             }
         };
 
+        // What the column is showing, and how much of it there is. A dash
+        // stands in until the first scan lands, so the header does not claim
+        // zero.
+        let total = self.scan().map(|scan| scan.count(self.scope));
+        let scope_row = h_flex()
+            .h_full()
+            .w_full()
+            .px_3()
+            .gap_2()
+            .items_center()
+            .children(self.sidebar_reopen(cx))
+            .child(div().text_sm().font_medium().child(self.scope.title()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(match total {
+                        Some(total) => total.to_string(),
+                        None => "—".to_string(),
+                    }),
+            )
+            .child(div().flex_1().min_w_0())
+            .child(self.sort_menu(cx));
+
         v_flex()
             .size_full()
             .min_w_0()
             .bg(cx.theme().background)
+            .child(self.column_band("skill-list-band", scope_row, window, cx))
             .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .h_12()
-                    .px_3()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Input::new(&self.search)
-                                .small()
-                                .cleanable(true)
-                                .prefix(Icon::new(IconName::Search).small()),
-                        ),
-                    )
-                    .child(self.sort_menu(cx)),
+                h_flex().flex_shrink_0().h_11().px_3().items_center().child(
+                    div().flex_1().min_w_0().child(
+                        Input::new(&self.search)
+                            .small()
+                            .cleanable(true)
+                            .prefix(Icon::new(IconName::Search).small()),
+                    ),
+                ),
             )
             .child(
                 div()
@@ -169,8 +187,8 @@ impl Skillbase {
     ///
     /// A menu rather than a pair of buttons: the two orderings are one choice,
     /// and the menu can say where "most used" gets its numbers, which a button
-    /// cannot. Sorting is a property of the list, so it lives in the list's
-    /// header even though New and Refresh have gone up to the title bar.
+    /// cannot. Sorting is a property of what the column is showing, so it sits
+    /// in the band that names it.
     fn sort_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.preferences.sort;
         // Only Claude Code and Copilot CLI record skill invocations, and Claude

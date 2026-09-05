@@ -6,8 +6,10 @@ mod assets;
 mod theme;
 mod ui;
 
-use gpui_kit::component::{Root, Theme, TitleBar};
-use gpui_kit::{App, AppContext as _, WindowBounds, WindowOptions, px, size};
+use gpui_kit::component::{Root, Theme};
+use gpui_kit::{
+    App, AppContext as _, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
+};
 
 use crate::app::Skillbase;
 
@@ -35,10 +37,21 @@ fn main() {
                     cx,
                 )),
                 window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
-                // Insets the macOS traffic lights over the title bar, which
-                // carries the sidebar's colour, so the sidebar runs up under
-                // them with no seam.
-                ..TitleBar::window_options()
+                titlebar: Some(TitlebarOptions {
+                    title: None,
+                    appears_transparent: true,
+                    // 18 = (48 - 12) / 2: a 12pt control centred in the 48pt
+                    // header band the leftmost column opens with, so the lights
+                    // sit on that band's centre line rather than above it.
+                    traffic_light_position: Some(point(px(16.), px(18.))),
+                }),
+                // The header bands draw themselves and move the window with
+                // `start_window_move`, so AppKit must not treat them as a
+                // system window-move region as well: it would handle double
+                // clicks a second time and delay every click while it waits to
+                // see whether one is coming.
+                app_owns_titlebar_drag: true,
+                ..Default::default()
             };
 
             cx.spawn(async move |cx| {

@@ -7,9 +7,75 @@ pub mod settings;
 pub mod sidebar;
 
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{Icon, IconName, WindowExt as _};
-use gpui_kit::{App, Window};
+use gpui_kit::component::{Icon, IconName, InteractiveElementExt as _, WindowExt as _, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    App, Context, Div, InteractiveElement as _, IntoElement, MouseButton, Pixels, Render,
+    SharedString, Stateful, Window, WindowControlArea, div, px,
+};
 use skillbase_core::{AgentDef, InstallError, Outcome, Roots};
+
+/// The height of the first header band in every column.
+///
+/// The three columns share it so their headers form one band across the top of
+/// the window, and the macOS traffic lights are centred in it by
+/// `traffic_light_position` in `main`.
+pub(crate) const BAND_HEIGHT: Pixels = px(48.);
+
+/// A header band the window can be dragged by.
+///
+/// Only the band that is a `TitleBar` gets that from the component, and the
+/// window should move from anywhere along the top. This is the gesture the
+/// component implements: a press arms the move and the first movement while it
+/// is armed hands the drag to the platform, so a press that does not move still
+/// reaches the buttons in the band.
+pub fn drag_band(id: &'static str, window: &mut Window, cx: &mut App) -> Stateful<Div> {
+    let state = window.use_keyed_state(SharedString::from(format!("{id}-drag")), cx, |_, _| {
+        DragBand { should_move: false }
+    });
+
+    h_flex()
+        .id(id)
+        .window_control_area(WindowControlArea::Drag)
+        .when(cfg!(target_os = "macos"), |this| {
+            this.on_double_click(|_, window, _| window.titlebar_double_click())
+        })
+        .when(cfg!(target_os = "linux"), |this| {
+            this.on_double_click(|_, window, _| window.zoom_window())
+        })
+        .on_mouse_down_out(window.listener_for(&state, |state, _, _, _| {
+            state.should_move = false;
+        }))
+        .on_mouse_down(
+            MouseButton::Left,
+            window.listener_for(&state, |state, _, _, _| {
+                state.should_move = true;
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            window.listener_for(&state, |state, _, _, _| {
+                state.should_move = false;
+            }),
+        )
+        .on_mouse_move(window.listener_for(&state, |state, _, window, _| {
+            if state.should_move {
+                state.should_move = false;
+                window.start_window_move();
+            }
+        }))
+}
+
+/// Whether the pointer went down on a [`drag_band`] and has not come up yet.
+struct DragBand {
+    should_move: bool,
+}
+
+impl Render for DragBand {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
 
 /// Agents that ship a brand mark under `assets/icons/agents`.
 ///

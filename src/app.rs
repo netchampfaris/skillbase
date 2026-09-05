@@ -1,4 +1,4 @@
-//! The application view: the title bar and the three panes beneath it.
+//! The application view: three columns, each opening with its own header band.
 //!
 //! This view owns the one [`Roots`] every read and every write resolves
 //! against, the scan that comes back from it, the selection and the search
@@ -7,25 +7,22 @@
 
 use std::rc::Rc;
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::sidebar::SidebarToggleButton;
-use gpui_kit::component::{
-    ActiveTheme as _, IconName, Root, Sizable as _, StyledExt as _, TitleBar, WindowExt as _,
-    h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Root, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, Task, Window, div, px,
+    AnyElement, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
 use skillbase_core::{Roots, Usage};
 
 use crate::ui::detail::{DetailEvent, DetailPane};
 use crate::ui::list::{LIST_MAX_WIDTH, LIST_MIN_WIDTH, LIST_WIDTH};
 use crate::ui::model::{Library, Preferences, Scan, Scope, SkillSort, resolve_roots};
+use crate::ui::{BAND_HEIGHT, drag_band};
 
 /// Where the scan has got to. A scan of every scope on a busy machine takes
 /// long enough that the first paint must not wait for it.
@@ -40,8 +37,8 @@ pub struct Skillbase {
     /// Every path the application reads or writes hangs off this one value.
     pub(crate) roots: Roots,
     /// True when `SKILLBASE_HOME` pointed the application somewhere other than
-    /// the real home. Said out loud in the title bar, because every mutation
-    /// lands there.
+    /// the real home. Said out loud beside the application's name, because
+    /// every mutation lands there.
     pub(crate) home_overridden: bool,
     pub(crate) scan: ScanState,
     pub(crate) scope: Scope,
@@ -222,7 +219,7 @@ impl Skillbase {
     /// reading them means walking several hundred megabytes of transcript the
     /// first time, so this runs on a background thread and the list renders
     /// without it. Subsequent reads resume from a cache and take milliseconds.
-    fn count_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn count_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let roots = self.roots.clone();
         self._usage_task = Some(cx.spawn_in(window, async move |this, cx| {
             let usage = cx
@@ -368,111 +365,50 @@ impl Skillbase {
         .detach();
     }
 
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         cx.notify();
     }
 
-    /// The title bar carries the sidebar's colour and no bottom hairline, so it
-    /// and the sidebar read as one surface running under the traffic lights.
-    ///
-    /// It holds what belongs to the window rather than to any one pane: the
-    /// application's name, which is otherwise written down nowhere the user
-    /// can see; what the panes below are currently showing; and the two
-    /// commands whose scope is the whole machine rather than the visible list.
-    /// New skill and Refresh sat in the list header, which made them look like
-    /// list controls — Refresh re-scans every scope, and a new skill lands in
-    /// the store no matter which scope is selected.
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let home = self.roots.home().display().to_string();
-        let total = self.scan().map(|scan| scan.count(self.scope));
+    /// The way back to a hidden sidebar, offered by whichever column is
+    /// leftmost while it is gone.
+    pub(crate) fn sidebar_reopen(&self, cx: &mut Context<Self>) -> Option<SidebarToggleButton> {
+        self.sidebar_collapsed.then(|| {
+            SidebarToggleButton::new()
+                .collapsed(true)
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+        })
+    }
 
-        TitleBar::new()
-            .bg(cx.theme().title_bar)
-            .border_color(cx.theme().title_bar)
-            .child(
-                h_flex()
-                    .h_full()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        SidebarToggleButton::new()
-                            .collapsed(self.sidebar_collapsed)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                    )
-                    .child(div().text_sm().font_medium().child("Skillbase"))
-                    .child(
-                        // A hairline rather than a glyph: it separates identity
-                        // from location without adding a character to read.
-                        div()
-                            .flex_shrink_0()
-                            .w(px(1.))
-                            .h_3p5()
-                            .mx_1()
-                            .bg(cx.theme().border),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if self.showing_settings {
-                                "Settings"
-                            } else {
-                                self.scope.title()
-                            }),
-                    )
-                    .when(!self.showing_settings, |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(match total {
-                                    Some(total) => total.to_string(),
-                                    None => "—".to_string(),
-                                }),
-                        )
-                    })
-                    .child(div().flex_1().min_w_0())
-                    .when(self.home_overridden, |this| {
-                        // Every mutation lands under this directory, so it is
-                        // named rather than implied.
-                        this.child(
-                            div()
-                                .flex_shrink_0()
-                                .px_2()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().warning.opacity(0.15))
-                                .text_xs()
-                                .text_color(cx.theme().warning)
-                                .child(format!("SKILLBASE_HOME={home}")),
-                        )
-                    })
-                    .child(
-                        Button::new("new-skill")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Plus)
-                            .label("New skill")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_new_skill_dialog(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("refresh")
-                            .ghost()
-                            .small()
-                            .icon(IconName::RotateCw)
-                            .tooltip("Re-scan every scope")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.rescan(None, window, cx);
-                                // Cheap after the first read, which is
-                                // cached, and Refresh is the one gesture
-                                // that means "look at the machine again".
-                                this.count_usage(window, cx);
-                            })),
-                    ),
-            )
+    /// The first header band of a work-area column.
+    ///
+    /// With the sidebar hidden this column is the leftmost one, so its band has
+    /// to leave the macOS traffic lights their room. `TitleBar` already owns
+    /// that inset, along with the window drag and the double click that zooms,
+    /// so it stands in rather than a row that measures the same. Its bottom
+    /// hairline is painted in the column's own background because the band and
+    /// the row under it are one surface.
+    pub(crate) fn column_band(
+        &self,
+        id: &'static str,
+        row: impl IntoElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.sidebar_collapsed {
+            TitleBar::new()
+                .h(BAND_HEIGHT)
+                .bg(cx.theme().background)
+                .border_color(cx.theme().background)
+                .child(row)
+                .into_any_element()
+        } else {
+            drag_band(id, window, cx)
+                .flex_shrink_0()
+                .h(BAND_HEIGHT)
+                .child(row)
+                .into_any_element()
+        }
     }
 }
 
@@ -483,7 +419,6 @@ impl Render for Skillbase {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .text_sm()
-            .child(self.render_title_bar(cx))
             .child(
                 // `h_flex` centres its children, so every pane in this row asks
                 // for the full height explicitly.
@@ -491,7 +426,12 @@ impl Render for Skillbase {
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
-                    .child(self.render_sidebar(window, cx))
+                    // Collapsed, the sidebar column goes away rather than
+                    // shrinking to a rail: the traffic lights alone are wider
+                    // than the rail would be, and they would land on the list.
+                    .when(!self.sidebar_collapsed, |this| {
+                        this.child(self.render_sidebar(window, cx))
+                    })
                     .child(if self.showing_settings {
                         // Settings replaces the list and the detail pane
                         // together: it is a whole view of the machine, not a
@@ -501,7 +441,7 @@ impl Render for Skillbase {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(self.render_settings(cx))
+                            .child(self.render_settings(window, cx))
                     } else {
                         div().flex().flex_1().min_w_0().h_full().child(
                             h_resizable("panes")

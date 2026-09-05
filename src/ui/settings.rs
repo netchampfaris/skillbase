@@ -19,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
 };
 use skillbase_core::{Registry, UNSUPPORTED};
 
@@ -28,21 +28,29 @@ use crate::app::{ScanState, Skillbase};
 use super::model::{DirStatus, HOME_OVERRIDE_ENV, Preferences, display_path};
 
 impl Skillbase {
-    pub(crate) fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_settings(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let scan = self.scan();
+
+        // Settings takes the whole work area, so with the sidebar hidden this
+        // band is the leftmost one and has to leave the traffic lights room.
+        let title_row = h_flex()
+            .h_full()
+            .w_full()
+            .px_5()
+            .gap_2()
+            .items_center()
+            .children(self.sidebar_reopen(cx))
+            .child(div().text_base().font_medium().child("Settings"));
 
         v_flex()
             .size_full()
             .min_w_0()
             .bg(cx.theme().background)
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .h_12()
-                    .px_5()
-                    .items_center()
-                    .child(div().text_base().font_medium().child("Settings")),
-            )
+            .child(self.column_band("settings-band", title_row, window, cx))
             .child(
                 v_flex()
                     .id("settings-body")
