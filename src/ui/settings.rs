@@ -54,6 +54,7 @@ impl Skillbase {
                     .gap_6()
                     .child(self.directories_section(cx))
                     .child(self.sidebar_section(cx))
+                    .child(self.usage_section(cx))
                     .child(self.warnings_section(cx))
                     .child(self.unsupported_section(cx))
                     .child(self.about_section(cx))
@@ -181,6 +182,122 @@ impl Skillbase {
                 .into_any_element(),
             cx,
         )
+    }
+
+    /// Where the "Most used" ordering gets its numbers, and what it could not
+    /// read.
+    ///
+    /// The list's sort menu says which agents were counted in one line; this is
+    /// where the per-source figures and any unreadable session file are
+    /// reachable. Without it a count that is quietly missing a source looks
+    /// exactly like a skill nobody has run.
+    fn usage_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let home = self.roots.home().display().to_string();
+        let (caption, body) = match self.usage.as_ref() {
+            None => (
+                "Reading the session records…".to_string(),
+                div().into_any_element(),
+            ),
+            Some(usage) => {
+                let caption = if usage.is_empty() {
+                    "No agent on this machine keeps session records Skillbase can read, so \
+                     every skill counts zero."
+                        .to_string()
+                } else {
+                    format!(
+                        "{} invocation{} across {} file{}. Only agents that keep a session \
+                         transcript can be counted, and Claude Code prunes its own \
+                         after {} days, so this is recent history rather than a \
+                         lifetime total.",
+                        usage.total(),
+                        if usage.total() == 1 { "" } else { "s" },
+                        usage.files_read(),
+                        if usage.files_read() == 1 { "" } else { "s" },
+                        skillbase_core::CLAUDE_RETENTION_DAYS,
+                    )
+                };
+
+                let body = v_flex()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().group_box)
+                            .children(usage.sources().iter().map(|stat| {
+                                h_flex()
+                                    .id(ElementId::from((
+                                        ElementId::from("usage-source"),
+                                        stat.source.agent_id(),
+                                    )))
+                                    .w_full()
+                                    .px_3()
+                                    .py_2()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w_40()
+                                            .flex_shrink_0()
+                                            .text_sm()
+                                            .truncate()
+                                            .child(stat.source.display_name()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .truncate()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(display_path(
+                                                &stat.source.dir(&self.roots),
+                                                &self.roots,
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{} in {} file{}",
+                                                stat.invocations,
+                                                stat.files,
+                                                if stat.files == 1 { "" } else { "s" }
+                                            )),
+                                    )
+                            })),
+                    )
+                    .children(usage.warnings().iter().map(|warning| {
+                        h_flex()
+                            .id(ElementId::from((
+                                ElementId::from("usage-warning"),
+                                SharedString::from(warning.clone()),
+                            )))
+                            .w_full()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .xsmall()
+                                    .flex_shrink_0()
+                                    .text_color(cx.theme().warning),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(warning.replace(&home, "~")),
+                            )
+                    }))
+                    .into_any_element();
+                (caption, body)
+            }
+        };
+
+        section("Usage", caption, body, cx)
     }
 
     /// The last scan's warnings, in full, with their paths.

@@ -79,6 +79,7 @@ mod skill;
 mod slug;
 #[cfg(test)]
 mod test_fixture;
+mod usage;
 
 #[cfg(not(unix))]
 compile_error!(
@@ -106,6 +107,10 @@ pub use registry::{
 };
 pub use skill::{SKILL_FILE_NAME, Skill};
 pub use slug::{FALLBACK_SLUG, is_kebab_case, slugify};
+pub use usage::{
+    CLAUDE_RETENTION_DAYS, CLAUDE_TRANSCRIPT_DIR, COPILOT_SESSION_DIR, RECORDING_AGENT_IDS,
+    SourceStat, USAGE_CACHE_FILE, Usage, UsageSource,
+};
 
 /// Re-exported so callers can build and inspect frontmatter values without
 /// having to depend on the same `serde_yaml_ng` version themselves.

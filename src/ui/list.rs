@@ -1,12 +1,12 @@
-//! The middle pane: a search field over a scrolling list of skill rows, with
-//! New and Refresh in the header.
+//! The middle pane: a search field and the ordering control over a scrolling
+//! list of skill rows.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::{DialogClose, DialogFooter};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::label::Label;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::skeleton::Skeleton;
-use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
@@ -21,7 +21,7 @@ use skillbase_core::Installer;
 
 use crate::app::{ScanState, Skillbase};
 
-use super::model::{SkillView, agent_label};
+use super::model::{SkillSort, SkillView};
 use super::report;
 
 /// A comfortable default: long enough for a skill name plus a description
@@ -29,9 +29,6 @@ use super::report;
 pub const LIST_WIDTH: f32 = 320.;
 pub const LIST_MIN_WIDTH: f32 = 240.;
 pub const LIST_MAX_WIDTH: f32 = 460.;
-
-/// How many agent names a row shows before it starts counting.
-const BADGES: usize = 3;
 
 impl Skillbase {
     pub(crate) fn render_skill_list(
@@ -60,7 +57,18 @@ impl Skillbase {
                 .into_any_element(),
             ScanState::Failed(error) => empty_state("Could not scan", error.clone(), cx),
             ScanState::Ready(scan) => {
-                let matches = scan.filter(self.scope, &query);
+                let mut matches = scan.filter(self.scope, &query);
+                if self.preferences.sort == SkillSort::MostUsed {
+                    // Ties fall back to the name, so the order is stable rather
+                    // than whatever the filter happened to produce — and every
+                    // skill nothing has recorded is a tie at zero, which on a
+                    // typical machine is most of them.
+                    matches.sort_by(|a, b| {
+                        self.usage_count(&b.name)
+                            .cmp(&self.usage_count(&a.name))
+                            .then_with(|| a.name.cmp(&b.name))
+                    });
+                }
                 if matches.is_empty() {
                     empty_state(
                         "Nothing here",
@@ -72,11 +80,14 @@ impl Skillbase {
                         cx,
                     )
                 } else {
+                    // A count is shown only when it is what the order is based
+                    // on. Sorted by name it is a number with nothing to do.
+                    let counts = self.preferences.sort == SkillSort::MostUsed;
                     let rows: Vec<_> = matches
                         .into_iter()
                         .map(|skill| {
                             let selected = self.selected.as_ref() == Some(&skill.name);
-                            self.render_skill_row(skill, selected, cx)
+                            self.render_skill_row(skill, selected, counts, cx)
                         })
                         .collect();
                     v_flex().children(rows).into_any_element()
@@ -103,26 +114,7 @@ impl Skillbase {
                                 .prefix(Icon::new(IconName::Search).small()),
                         ),
                     )
-                    .child(
-                        Button::new("new-skill")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Plus)
-                            .tooltip("New skill")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_new_skill_dialog(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("refresh")
-                            .ghost()
-                            .small()
-                            .icon(IconName::RotateCw)
-                            .tooltip("Re-scan every scope")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.rescan(None, window, cx)),
-                            ),
-                    ),
+                    .child(self.sort_menu(cx)),
             )
             .child(
                 div()
@@ -173,14 +165,73 @@ impl Skillbase {
             })
     }
 
+    /// The ordering control.
+    ///
+    /// A menu rather than a pair of buttons: the two orderings are one choice,
+    /// and the menu can say where "most used" gets its numbers, which a button
+    /// cannot. Sorting is a property of the list, so it lives in the list's
+    /// header even though New and Refresh have gone up to the title bar.
+    fn sort_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.preferences.sort;
+        // Only Claude Code and Copilot CLI record skill invocations, and Claude
+        // Code prunes its transcripts, so the figure is a recent-history count
+        // over some agents rather than a lifetime total over all of them. The
+        // menu says so, because a number that quietly means less than it looks
+        // like is worse than no number.
+        let provenance: SharedString = match self.usage.as_ref() {
+            None => "Counting invocations…".into(),
+            Some(usage) if usage.is_empty() => {
+                "No agent on this machine records skill usage".into()
+            }
+            Some(usage) => {
+                let names: Vec<&str> = usage
+                    .sources()
+                    .iter()
+                    .filter(|stat| stat.invocations > 0)
+                    .map(|stat| stat.source.display_name())
+                    .collect();
+                if names.is_empty() {
+                    "No skill invocation recorded yet".into()
+                } else {
+                    format!("Counted from {} session records", names.join(" and ")).into()
+                }
+            }
+        };
+        let this = cx.entity().downgrade();
+
+        Button::new("sort")
+            .ghost()
+            .small()
+            .icon(IconName::SortDescending)
+            .tooltip("Sort the list")
+            .dropdown_menu(move |menu, _, _| {
+                let this = this.clone();
+                let provenance = provenance.clone();
+                let mut menu = menu.label("Sort by");
+                for sort in SkillSort::ALL {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(sort.label())
+                            .checked(sort == current)
+                            .on_click(move |_, window, cx| {
+                                this.update(cx, |this, cx| this.set_sort(sort, window, cx))
+                                    .ok();
+                            }),
+                    );
+                }
+                menu.separator()
+                    .item(PopupMenuItem::label(provenance.clone()))
+            })
+    }
+
     fn render_skill_row(
         &self,
         skill: &SkillView,
         selected: bool,
+        counts: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let name = skill.name.clone();
-        let agents: Vec<&'static str> = skill.visible_to.iter().copied().map(agent_label).collect();
         let invalid = skill.parse_error.is_some();
         let subtitle = if invalid {
             skill
@@ -239,6 +290,20 @@ impl Skillbase {
                                 .xsmall()
                                 .text_color(cx.theme().warning),
                         )
+                    })
+                    .when(counts, |this| {
+                        let used = self.usage_count(&skill.name);
+                        this.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if used == 0 {
+                                    SharedString::from("—")
+                                } else {
+                                    SharedString::from(used.to_string())
+                                }),
+                        )
                     }),
             )
             .child(
@@ -254,38 +319,12 @@ impl Skillbase {
                     })
                     .child(subtitle),
             )
-            .when(!agents.is_empty(), |this| {
-                // The row is a scanning surface, not a full report: name the
-                // first few agents and count the rest.
-                let overflow = agents.len().saturating_sub(BADGES);
-                this.child(
-                    h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_1()
-                        .overflow_hidden()
-                        .children(
-                            agents
-                                .into_iter()
-                                .take(BADGES)
-                                .map(|label| Tag::secondary().xsmall().child(label)),
-                        )
-                        .when(overflow > 0, |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("+{overflow}")),
-                            )
-                        }),
-                )
-            })
             .into_any_element()
     }
 
     /// Ask for a name and a description, then write a templated `SKILL.md`
     /// into the store and select what was created.
-    fn open_new_skill_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_new_skill_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_name
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.new_description

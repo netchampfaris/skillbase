@@ -41,15 +41,53 @@ pub fn resolve_roots() -> Result<(Roots, bool), SkillError> {
 /// throwaway home gets its own preferences and cannot rewrite the real ones.
 pub const SETTINGS_FILE: &str = ".skillbase/settings.json";
 
+/// How the skill list is ordered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SkillSort {
+    /// Alphabetical, which is the order a directory listing gives and the one
+    /// a reader can predict.
+    #[default]
+    Name,
+    /// Most-invoked first, from the session records agents leave behind.
+    MostUsed,
+}
+
+impl SkillSort {
+    /// Every ordering, in the order the menu lists them.
+    pub const ALL: [SkillSort; 2] = [SkillSort::Name, SkillSort::MostUsed];
+
+    /// What the menu calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            SkillSort::Name => "Name",
+            SkillSort::MostUsed => "Most used",
+        }
+    }
+
+    /// How it is spelled in the settings file.
+    fn key(self) -> &'static str {
+        match self {
+            SkillSort::Name => "name",
+            SkillSort::MostUsed => "most-used",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|sort| sort.key() == key)
+    }
+}
+
 /// The preferences Skillbase keeps between runs.
 ///
-/// One boolean today. It is written as JSON so the file is readable and can
-/// grow keys later without a format change.
+/// Written as JSON so the file is readable and can grow keys later without a
+/// format change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Preferences {
     /// Show every agent in the sidebar, including those with no directory on
     /// this machine. Off by default, per SPEC §5.1.
     pub show_all_agents: bool,
+    /// How the skill list is ordered.
+    pub sort: SkillSort,
 }
 
 impl Preferences {
@@ -67,6 +105,9 @@ impl Preferences {
         let text = fs::read_to_string(Self::path(roots)).unwrap_or_default();
         Self {
             show_all_agents: json_bool(&text, "show_all_agents").unwrap_or(false),
+            sort: json_string(&text, "sort")
+                .and_then(|value| SkillSort::from_key(&value))
+                .unwrap_or_default(),
         }
     }
 
@@ -80,22 +121,25 @@ impl Preferences {
         }
         fs::write(
             &path,
-            format!("{{\n  \"show_all_agents\": {}\n}}\n", self.show_all_agents),
+            format!(
+                "{{\n  \"show_all_agents\": {},\n  \"sort\": \"{}\"\n}}\n",
+                self.show_all_agents,
+                self.sort.key()
+            ),
         )?;
         Ok(path)
     }
 }
 
-/// Reads one top-level boolean out of the settings file.
+/// Reads one top-level value out of the settings file.
 ///
-/// Deliberately narrow: it understands exactly what [`Preferences::save`]
-/// writes — `"key": true` — and treats everything else as absent rather than
-/// as an error. A whole JSON parser would be a dependency bought for one
-/// boolean.
+/// Deliberately narrow: these two understand exactly what [`Preferences::save`]
+/// writes — `"key": true` and `"key": "value"` — and treat everything else as
+/// absent rather than as an error. A whole JSON parser would be a dependency
+/// bought for two settings, and a preference that fails to parse should fall
+/// back to the default rather than stop the application.
 fn json_bool(text: &str, key: &str) -> Option<bool> {
-    let quoted = format!("\"{key}\"");
-    let rest = text.split_once(&quoted)?.1;
-    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let rest = after_key(text, key)?;
     if rest.starts_with("true") {
         Some(true)
     } else if rest.starts_with("false") {
@@ -103,6 +147,19 @@ fn json_bool(text: &str, key: &str) -> Option<bool> {
     } else {
         None
     }
+}
+
+fn json_string(text: &str, key: &str) -> Option<String> {
+    let rest = after_key(text, key)?.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The text following `"key":`, with leading whitespace removed.
+fn after_key<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let quoted = format!("\"{key}\"");
+    let rest = text.split_once(&quoted)?.1;
+    Some(rest.trim_start().strip_prefix(':')?.trim_start())
 }
 
 /// One directory Skillbase reads, and whether it is there.

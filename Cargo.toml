@@ -26,6 +26,20 @@ gpui-kit = { version = "0.6", features = [
     "tree-sitter-toml",
 ] }
 anyhow = "1"
+rust-embed = "8"
+
+# Reading the system accent colour for the focus ring. Both crates are already
+# in the lock file by way of `gpui`; this only widens the feature set.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSAppearance",
+    "NSColor",
+    "NSColorSpace",
+    "NSResponder",
+    "objc2-core-foundation",
+] }
 
 [profile.dev]
 opt-level = 0

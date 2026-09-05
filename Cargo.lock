@@ -6343,7 +6343,10 @@ name = "skillbase"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "gpui-kit",
+ "objc2-app-kit 0.3.2",
+ "rust-embed",
  "skillbase-core",
 ]
 
@@ -6353,6 +6356,7 @@ version = "0.1.0"
 dependencies = [
  "dirs 6.0.0",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "tempfile",
  "thiserror 2.0.20",

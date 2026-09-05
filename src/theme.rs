@@ -12,10 +12,20 @@
 //! *resolved* colour, so the file stores the tint that composites to it —
 //! `#7D7D7D` at 20% over `#FFFFFF` is `#E5E5E5`, and `#A8A8B4` at 20% over
 //! `#181818` is `#2A2A2D`.
+//!
+//! The four roles that carry the interaction accent — `ring`, `selection`,
+//! `drag_border` and `drop_target` — are grey in the file and overwritten at
+//! runtime with the operating system's accent colour by [`follow_accent`]. The
+//! file therefore holds the fallback, which is what shows on a system with no
+//! such setting. macOS's own Graphite accent supplies the grey, so the
+//! fallback is a colour the platform already uses rather than an invention.
 
 use anyhow::{Context as _, Result};
 use gpui_kit::App;
 use gpui_kit::component::{Theme, ThemeRegistry};
+use gpui_kit::{Hsla, Rgba};
+
+use crate::accent;
 
 /// The theme set, compiled in so the application has its palette with no
 /// filesystem read at startup.
@@ -49,5 +59,31 @@ pub fn init(cx: &mut App) -> Result<()> {
     theme.dark_theme = dark;
 
     Theme::sync_system_appearance(None, cx);
+    follow_accent(cx);
     Ok(())
+}
+
+/// Point the interaction accent at the operating system's accent colour.
+///
+/// Must run after every `Theme::sync_system_appearance`, not only at startup:
+/// switching between light and dark re-applies the stored `ThemeConfig`, which
+/// restores the grey from the file. There is nothing to undo when the system
+/// has no accent to report — the grey is then the intended colour.
+pub fn follow_accent(cx: &mut App) {
+    let dark = Theme::global(cx).mode.is_dark();
+    let Some([r, g, b, a]) = accent::focus_ring(dark) else {
+        return;
+    };
+    let color: Hsla = Rgba { r, g, b, a }.into();
+
+    let theme = Theme::global_mut(cx);
+    // `ring` is the focus ring proper. The other three are the same accent
+    // doing the same job elsewhere — a drag's target edge, a drop target's
+    // wash, and selected text — and leaving them grey while the ring turns
+    // blue would read as two unrelated decisions.
+    theme.colors.ring = color;
+    theme.colors.selection = color;
+    theme.colors.drag_border = color;
+    theme.colors.drop_target = color.opacity(0.2);
+    Theme::sync_base(cx);
 }

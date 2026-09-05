@@ -7,21 +7,25 @@
 
 use std::rc::Rc;
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::sidebar::SidebarToggleButton;
-use gpui_kit::component::{ActiveTheme as _, Root, TitleBar, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, IconName, Root, Sizable as _, StyledExt as _, TitleBar, WindowExt as _,
+    h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
     Styled as _, Subscription, Task, Window, div, px,
 };
-use skillbase_core::Roots;
+use skillbase_core::{Roots, Usage};
 
 use crate::ui::detail::{DetailEvent, DetailPane};
 use crate::ui::list::{LIST_MAX_WIDTH, LIST_MIN_WIDTH, LIST_WIDTH};
-use crate::ui::model::{Library, Preferences, Scan, Scope, resolve_roots};
+use crate::ui::model::{Library, Preferences, Scan, Scope, SkillSort, resolve_roots};
 
 /// Where the scan has got to. A scan of every scope on a busy machine takes
 /// long enough that the first paint must not wait for it.
@@ -51,6 +55,10 @@ pub struct Skillbase {
     /// every change.
     pub(crate) preferences: Preferences,
     pub(crate) search: Entity<InputState>,
+    /// How many times each skill has been invoked, from the session records
+    /// the agents that keep them leave behind. `None` until the count lands,
+    /// which is a few hundred milliseconds after the window opens.
+    pub(crate) usage: Option<Rc<Usage>>,
     /// The New skill dialog's two fields. Held here rather than rebuilt each
     /// time the dialog opens, because the dialog's content builder is called on
     /// every frame it is on screen.
@@ -62,6 +70,7 @@ pub struct Skillbase {
     /// dropped rather than applied.
     generation: u64,
     _scan_task: Option<Task<()>>,
+    _usage_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -109,16 +118,21 @@ impl Skillbase {
             showing_settings: false,
             preferences,
             search,
+            usage: None,
             new_name,
             new_description,
             detail,
             panes,
             generation: 0,
             _scan_task: None,
+            _usage_task: None,
             _subscriptions: subscriptions,
         };
         match resolved {
-            Ok(_) => this.rescan(None, window, cx),
+            Ok(_) => {
+                this.rescan(None, window, cx);
+                this.count_usage(window, cx);
+            }
             Err(error) => this.scan = ScanState::Failed(error.to_string().into()),
         }
         this
@@ -192,6 +206,49 @@ impl Skillbase {
         match event {
             DetailEvent::Changed { select } => self.rescan(select.clone(), window, cx),
         }
+    }
+
+    /// How many times a skill has been invoked, or zero when nothing recorded
+    /// it. A skill with no record and a skill counted before the numbers
+    /// arrive are both zero, which is why the sort menu says where the figure
+    /// comes from rather than leaving the reader to guess.
+    pub(crate) fn usage_count(&self, name: &str) -> u32 {
+        self.usage.as_ref().map_or(0, |usage| usage.count(name))
+    }
+
+    /// Read the agents' session records and adopt the invocation counts.
+    ///
+    /// Only two of the fifteen agents record skill invocations at all, and
+    /// reading them means walking several hundred megabytes of transcript the
+    /// first time, so this runs on a background thread and the list renders
+    /// without it. Subsequent reads resume from a cache and take milliseconds.
+    fn count_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let roots = self.roots.clone();
+        self._usage_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let usage = cx
+                .background_spawn(async move { Usage::load(&roots) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.usage = Some(Rc::new(usage));
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Change the list's ordering and write the choice back.
+    pub(crate) fn set_sort(
+        &mut self,
+        sort: SkillSort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preferences.sort == sort {
+            return;
+        }
+        self.preferences.sort = sort;
+        self.save_preferences(window, cx);
+        cx.notify();
     }
 
     /// The scan, when one has landed.
@@ -284,7 +341,14 @@ impl Skillbase {
         }
         self.preferences.show_all_agents = on;
         cx.notify();
+        self.save_preferences(window, cx);
+    }
 
+    /// Write the preferences out on a background task.
+    ///
+    /// A failure is reported rather than swallowed, because a preference that
+    /// silently fails to stick is worse than one that is not offered.
+    fn save_preferences(&self, window: &mut Window, cx: &mut Context<Self>) {
         let preferences = self.preferences;
         let roots = self.roots.clone();
         cx.spawn_in(window, async move |_, cx| {
@@ -311,8 +375,17 @@ impl Skillbase {
 
     /// The title bar carries the sidebar's colour and no bottom hairline, so it
     /// and the sidebar read as one surface running under the traffic lights.
+    ///
+    /// It holds what belongs to the window rather than to any one pane: the
+    /// application's name, which is otherwise written down nowhere the user
+    /// can see; what the panes below are currently showing; and the two
+    /// commands whose scope is the whole machine rather than the visible list.
+    /// New skill and Refresh sat in the list header, which made them look like
+    /// list controls — Refresh re-scans every scope, and a new skill lands in
+    /// the store no matter which scope is selected.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let home = self.roots.home().display().to_string();
+        let total = self.scan().map(|scan| scan.count(self.scope));
 
         TitleBar::new()
             .bg(cx.theme().title_bar)
@@ -328,6 +401,17 @@ impl Skillbase {
                             .collapsed(self.sidebar_collapsed)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
                     )
+                    .child(div().text_sm().font_medium().child("Skillbase"))
+                    .child(
+                        // A hairline rather than a glyph: it separates identity
+                        // from location without adding a character to read.
+                        div()
+                            .flex_shrink_0()
+                            .w(px(1.))
+                            .h_3p5()
+                            .mx_1()
+                            .bg(cx.theme().border),
+                    )
                     .child(
                         div()
                             .text_sm()
@@ -338,11 +422,24 @@ impl Skillbase {
                                 self.scope.title()
                             }),
                     )
+                    .when(!self.showing_settings, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(match total {
+                                    Some(total) => total.to_string(),
+                                    None => "—".to_string(),
+                                }),
+                        )
+                    })
+                    .child(div().flex_1().min_w_0())
                     .when(self.home_overridden, |this| {
                         // Every mutation lands under this directory, so it is
                         // named rather than implied.
                         this.child(
                             div()
+                                .flex_shrink_0()
                                 .px_2()
                                 .rounded(cx.theme().radius)
                                 .bg(cx.theme().warning.opacity(0.15))
@@ -350,7 +447,31 @@ impl Skillbase {
                                 .text_color(cx.theme().warning)
                                 .child(format!("SKILLBASE_HOME={home}")),
                         )
-                    }),
+                    })
+                    .child(
+                        Button::new("new-skill")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("New skill")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_new_skill_dialog(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("refresh")
+                            .ghost()
+                            .small()
+                            .icon(IconName::RotateCw)
+                            .tooltip("Re-scan every scope")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.rescan(None, window, cx);
+                                // Cheap after the first read, which is
+                                // cached, and Refresh is the one gesture
+                                // that means "look at the machine again".
+                                this.count_usage(window, cx);
+                            })),
+                    ),
             )
     }
 }

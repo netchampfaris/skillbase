@@ -1,6 +1,8 @@
 //! Skillbase — manage Agent Skills across every coding agent on this machine.
 
+mod accent;
 mod app;
+mod assets;
 mod theme;
 mod ui;
 
@@ -16,7 +18,7 @@ const MIN_SIZE: (f32, f32) = (860., 520.);
 
 fn main() {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(crate::assets::Assets)
         .run(|cx: &mut App| {
             // Must come before anything that touches a component or a theme.
             gpui_kit::init(cx);
@@ -57,6 +59,10 @@ fn main() {
                         window
                             .observe_window_appearance(|window, cx| {
                                 Theme::sync_system_appearance(Some(window), cx);
+                                // Re-applying the theme config restores the
+                                // grey fallback, so the accent has to be put
+                                // back on top of it.
+                                theme::follow_accent(cx);
                             })
                             .detach();
                     })
