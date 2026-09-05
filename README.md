@@ -64,14 +64,43 @@ cargo run
 
 Rust 1.98 or newer. macOS and Linux.
 
-For a macOS `.app` bundle (needed for a Dock icon and a proper bundle identity):
+## Installing it as an application
+
+`cargo run` is fine while working on Skillbase, but it gives you a process, not
+an application: no icon, and nothing for Spotlight or a launcher to find. To
+install it properly:
 
 ```sh
-script/bundle-macos.sh
-open target/debug/Skillbase.app
+cargo build --release
+script/bundle-macos.sh release --install
 ```
 
-The bundle symlinks the binary, so a plain `cargo build` refreshes it.
+That builds `~/Applications/Skillbase.app`, which is one of the directories
+Spotlight and launchers such as Raycast and Alfred index, so "Skillbase" becomes
+something you can type. `--install` copies the binary into the bundle, so the
+application keeps working after `cargo clean` and after this repository moves.
+
+Without `--install` the bundle is written to `target/<profile>/Skillbase.app`
+and symlinks the binary instead, so a plain `cargo build` refreshes it. That is
+the one to use while developing — but nothing indexes `target/`, so it will not
+appear in a launcher.
+
+Re-run the same command to update an installed copy. A launcher that still shows
+a stale icon is caching it; the script re-registers the bundle, which usually
+settles it.
+
+## Application icon
+
+The mark on the bundle, as distinct from the interface icon set below.
+`assets/icon.png` is generated, not drawn by hand:
+
+```sh
+python3 script/make-icon.py
+```
+
+Edit the constants at the top of that script to change the mark, then re-run
+the bundle script to rebuild the `.icns`. The `.icns` itself is a build
+artifact and is not checked in.
 
 ## Testing against a throwaway home
 
