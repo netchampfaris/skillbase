@@ -10,7 +10,7 @@ use gpui_kit::{App, AppContext as _, WindowBounds, WindowOptions, px, size};
 use crate::app::Skillbase;
 
 /// Roomy enough for three panes at their comfortable widths.
-const DEFAULT_SIZE: (f32, f32) = (1100., 720.);
+const DEFAULT_SIZE: (f32, f32) = (1320., 860.);
 /// The narrowest window in which all three panes still do their job.
 const MIN_SIZE: (f32, f32) = (860., 520.);
 

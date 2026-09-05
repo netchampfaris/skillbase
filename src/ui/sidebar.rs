@@ -1,5 +1,5 @@
-//! The scope sidebar: a Library group, an Agents group, and Settings pinned
-//! to the bottom.
+//! The scope sidebar: a Library group, an Agents group listing only the agents
+//! that exist on this machine, and Settings pinned to the bottom.
 
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarFooter, SidebarGroup, SidebarItem as _, SidebarMenu,
@@ -10,7 +10,7 @@ use gpui_kit::{App, Context, Div, IntoElement, ParentElement as _, Styled as _, 
 
 use crate::app::Skillbase;
 
-use super::model::{AGENTS, Library, Scope, count};
+use super::model::{Library, Scope};
 
 /// Wide enough for the longest scope label, and visibly subordinate to the
 /// work area.
@@ -23,12 +23,12 @@ impl Skillbase {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let scope = self.scope;
-        let skills = &self.skills;
         let collapsed = self.sidebar_collapsed;
+        let scan = self.scan();
 
         let library = Library::ALL.map(|library| {
             let target = Scope::Library(library);
-            let total = count(skills, target);
+            let total = scan.map(|scan| scan.count(target));
             SidebarMenuItem::new(library.label())
                 .icon(library_icon(library))
                 .active(scope == target)
@@ -38,17 +38,24 @@ impl Skillbase {
                 )
         });
 
-        let agents = AGENTS.map(|agent| {
-            let target = Scope::Agent(agent.id);
-            let total = count(skills, target);
-            SidebarMenuItem::new(agent.label)
-                .icon(IconName::Bot)
-                .active(scope == target)
-                .suffix(move |_, cx| count_label(total, cx))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.select_scope(target, window, cx)),
-                )
-        });
+        // Only agents whose global directory exists. An agent that is not
+        // installed is hidden rather than greyed, per the specification.
+        let agents: Vec<_> =
+            scan.map(|scan| scan.installed.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|agent| {
+                    let target = Scope::Agent(agent.id);
+                    let total = scan.map(|scan| scan.count(target));
+                    SidebarMenuItem::new(agent.display_name)
+                        .icon(IconName::Bot)
+                        .active(scope == target)
+                        .suffix(move |_, cx| count_label(total, cx))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_scope(target, window, cx)
+                        }))
+                })
+                .collect();
 
         let settings = SidebarMenu::new()
             .child(
@@ -76,13 +83,18 @@ fn library_icon(library: Library) -> IconName {
         Library::Managed => IconName::CircleCheck,
         Library::Unmanaged => IconName::Folder,
         Library::Invalid => IconName::TriangleAlert,
+        Library::Conflicts => IconName::Copy,
     }
 }
 
-/// The count trailing a scope row. Neutral: it is metadata, not a state.
-fn count_label(total: usize, cx: &App) -> Div {
+/// The count trailing a scope row. Neutral: it is metadata, not a state. A
+/// dash stands in until the first scan lands, so the row does not claim zero.
+fn count_label(total: Option<usize>, cx: &App) -> Div {
     div()
         .text_xs()
         .text_color(cx.theme().muted_foreground)
-        .child(total.to_string())
+        .child(match total {
+            Some(total) => total.to_string(),
+            None => "—".to_string(),
+        })
 }

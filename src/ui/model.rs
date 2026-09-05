@@ -1,65 +1,36 @@
-//! Placeholder data for the application shell.
+//! The view model: one read-only scan of the filesystem, mapped into the shape
+//! the three panes render.
 //!
-//! Nothing here touches the filesystem. `skillbase-core` grows the real
-//! discovery and registry layers separately; this module exists so the three
-//! panes can be laid out, themed, and driven before that lands, and it is
-//! meant to be deleted when the two are wired together.
+//! Everything here is plain data and pure functions. The scan itself is the one
+//! function that touches the filesystem, and it is called from a background
+//! task, never from `render`.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::SharedString;
+use skillbase_core::{
+    AgentDef, DisableMode, DiscoveredSkill, Discovery, Location, LocationKind, Registry, Roots,
+    SHARED_ID, SkillError,
+};
 
-/// A coding agent Skillbase can make a skill visible to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Agent {
-    /// Stable identifier, used for element identity and for matching a skill's
-    /// visibility list. Never a display string.
-    pub id: &'static str,
-    /// The name shown to the user.
-    pub label: &'static str,
-    /// The plain-words consequence of turning this agent's switch on.
-    pub effect: &'static str,
-}
+/// Environment variable that points Skillbase at a different home directory.
+///
+/// Every path the application reads or writes is resolved from one [`Roots`],
+/// so setting this redirects discovery *and* every mutation together. It exists
+/// so that link, adopt, release and delete can be exercised against a throwaway
+/// tree instead of the user's real skills.
+pub const HOME_OVERRIDE_ENV: &str = "SKILLBASE_HOME";
 
-/// The agents detected on this machine. Hard-coded until discovery lands.
-pub const AGENTS: [Agent; 6] = [
-    Agent {
-        id: "claude-code",
-        label: "Claude Code",
-        effect: "Links into ~/.claude/skills",
-    },
-    Agent {
-        id: "codex",
-        label: "Codex",
-        effect: "Links into ~/.codex/skills",
-    },
-    Agent {
-        id: "cursor",
-        label: "Cursor",
-        effect: "Links into ~/.cursor/skills",
-    },
-    Agent {
-        id: "gemini-cli",
-        label: "Gemini CLI",
-        effect: "Links into ~/.gemini/skills",
-    },
-    Agent {
-        id: "opencode",
-        label: "opencode",
-        effect: "Links into ~/.config/opencode/skills",
-    },
-    Agent {
-        id: "goose",
-        label: "Goose",
-        effect: "Links into ~/.config/goose/skills",
-    },
-];
-
-/// Look up an agent's display label by id.
-pub fn agent_label(id: &str) -> &'static str {
-    AGENTS
-        .iter()
-        .find(|agent| agent.id == id)
-        .map(|agent| agent.label)
-        .unwrap_or("Unknown")
+/// The home directory Skillbase runs against, and whether it was overridden.
+///
+/// A `true` second element means the application is not looking at the real
+/// home, which the title bar says out loud.
+pub fn resolve_roots() -> Result<(Roots, bool), SkillError> {
+    match std::env::var_os(HOME_OVERRIDE_ENV) {
+        Some(home) if !home.is_empty() => Ok((Roots::new(PathBuf::from(home)), true)),
+        _ => Ok((Roots::discover()?, false)),
+    }
 }
 
 /// The rows of the sidebar's Library group.
@@ -70,15 +41,17 @@ pub enum Library {
     Managed,
     Unmanaged,
     Invalid,
+    Conflicts,
 }
 
 impl Library {
-    pub const ALL: [Library; 5] = [
+    pub const ALL: [Library; 6] = [
         Library::All,
         Library::Shared,
         Library::Managed,
         Library::Unmanaged,
         Library::Invalid,
+        Library::Conflicts,
     ];
 
     pub fn label(self) -> &'static str {
@@ -88,16 +61,22 @@ impl Library {
             Library::Managed => "Managed",
             Library::Unmanaged => "Unmanaged",
             Library::Invalid => "Invalid",
+            Library::Conflicts => "Conflicts",
         }
     }
 
-    fn matches(self, skill: &Skill) -> bool {
+    fn index(self) -> usize {
+        Library::ALL.iter().position(|l| *l == self).unwrap_or(0)
+    }
+
+    fn matches(self, skill: &SkillView) -> bool {
         match self {
             Library::All => true,
-            Library::Shared => skill.shared,
+            Library::Shared => skill.in_shared,
             Library::Managed => skill.managed,
             Library::Unmanaged => !skill.managed,
-            Library::Invalid => !skill.valid,
+            Library::Invalid => skill.parse_error.is_some(),
+            Library::Conflicts => !skill.conflicts.is_empty(),
         }
     }
 }
@@ -111,7 +90,7 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// The heading the skill list shows for this scope.
+    /// The heading the title bar shows for this scope.
     pub fn title(self) -> &'static str {
         match self {
             Scope::Library(library) => library.label(),
@@ -120,50 +99,102 @@ impl Scope {
     }
 
     /// Whether this scope lists the given skill.
-    pub fn shows(self, skill: &Skill) -> bool {
+    pub fn shows(self, skill: &SkillView) -> bool {
         match self {
             Scope::Library(library) => library.matches(skill),
-            Scope::Agent(id) => skill.sees(id),
+            Scope::Agent(id) => skill.visible_to.contains(&id),
         }
     }
 }
 
-/// One skill, grouped from every copy of it on disk.
-#[derive(Clone, Debug)]
-pub struct Skill {
-    pub name: SharedString,
-    pub description: SharedString,
-    /// Ids of the agents that can reach this skill through their own directory.
-    pub agents: Vec<&'static str>,
-    /// Whether a link exists in the vendor-neutral `~/.agents/skills`.
-    pub shared: bool,
-    /// Whether the origin sits inside the Skillbase store.
-    pub managed: bool,
-    /// Whether the frontmatter passes validation.
-    pub valid: bool,
-    /// The directory holding the actual bytes.
-    pub origin: SharedString,
-    /// The whole `SKILL.md`.
-    pub body: SharedString,
+/// An agent's display name, by id.
+pub fn agent_label(id: &str) -> &'static str {
+    Registry::get(id)
+        .map(|agent| agent.display_name)
+        .unwrap_or("Unknown")
 }
 
-impl Skill {
-    /// Whether the agent with this id can currently reach the skill, directly
-    /// or through the shared directory.
-    pub fn sees(&self, agent: &str) -> bool {
-        // Every agent in the placeholder set except Claude Code reads the
-        // shared directory as a fallback.
-        (self.shared && agent != "claude-code") || self.agents.contains(&agent)
+/// One validation finding, ready to render beside the field it concerns.
+#[derive(Clone, Debug)]
+pub struct Issue {
+    /// The frontmatter key it concerns, when it concerns one.
+    pub field: Option<&'static str>,
+    /// True when the finding makes the skill invalid rather than merely odd.
+    pub is_error: bool,
+    pub message: SharedString,
+}
+
+/// One skill, flattened from a [`DiscoveredSkill`] into what the panes need.
+///
+/// It carries its locations so that a delete plan can be recomputed from it
+/// without holding the whole scan.
+#[derive(Clone, Debug)]
+pub struct SkillView {
+    pub name: SharedString,
+    pub description: SharedString,
+    /// The real directory holding the bytes.
+    pub origin: PathBuf,
+    /// True when the origin is inside `~/.skillbase/store`.
+    pub managed: bool,
+    /// Why `SKILL.md` could not be parsed, when it could not.
+    pub parse_error: Option<SharedString>,
+    /// Validation problems, each tagged with the field that caused it.
+    pub issues: Vec<Issue>,
+    /// Other real directories claiming the same name.
+    pub conflicts: Vec<PathBuf>,
+    /// Every path this skill was found at.
+    pub locations: Vec<Location>,
+    /// True when `~/.codex/config.toml` switches this skill off.
+    pub codex_disabled: bool,
+    /// Ids of the agents that can currently reach this skill.
+    pub visible_to: Vec<&'static str>,
+    /// True when an active link sits in `~/.agents/skills`.
+    pub in_shared: bool,
+}
+
+impl SkillView {
+    /// True when this agent holds a location of its own, active or parked in
+    /// its disabled directory.
+    ///
+    /// This is *presence*, which for Claude Code and Codex is a different
+    /// question from whether the skill is switched on.
+    pub fn linked_to(&self, agent_id: &str) -> bool {
+        self.locations.iter().any(|l| l.agent_id == agent_id)
     }
 
-    /// The agent labels shown as badges under the skill's description, in the
-    /// order the sidebar lists them so the row reads as a stable lane.
-    pub fn visible_to(&self) -> Vec<&'static str> {
-        AGENTS
+    /// What this agent's own location is on disk, when it has one.
+    pub fn location_kind(&self, agent_id: &str) -> Option<&LocationKind> {
+        self.locations
             .iter()
-            .filter(|agent| self.sees(agent.id))
-            .map(|agent| agent.label)
-            .collect()
+            .find(|l| l.agent_id == agent_id)
+            .map(|l| &l.kind)
+    }
+
+    /// True when this agent's link is parked in its disabled directory.
+    pub fn parked_in(&self, agent_id: &str) -> bool {
+        self.locations
+            .iter()
+            .any(|l| l.agent_id == agent_id && matches!(l.kind, LocationKind::Disabled))
+    }
+
+    /// True when this agent reaches the skill only because it reads the shared
+    /// directory, without a link of its own.
+    pub fn via_shared(&self, agent: &AgentDef) -> bool {
+        agent.reads_shared && self.in_shared && !self.linked_to(agent.id)
+    }
+
+    /// Whether the skill is switched on for an agent that draws a distinction
+    /// between present and active.
+    ///
+    /// [`DisableMode::RemoveLink`] agents draw no such distinction, so for them
+    /// this is the same question as presence and the interface does not offer
+    /// a second switch.
+    pub fn enabled_for(&self, agent: &AgentDef) -> bool {
+        match agent.disable {
+            DisableMode::RemoveLink => self.linked_to(agent.id) || self.via_shared(agent),
+            DisableMode::MoveAside(_) => !self.parked_in(agent.id),
+            DisableMode::CodexConfig => !self.codex_disabled,
+        }
     }
 
     fn matches_query(&self, query: &str) -> bool {
@@ -176,150 +207,152 @@ impl Skill {
     }
 }
 
-/// The skills the shell displays until discovery is wired in.
-pub fn placeholder_skills() -> Vec<Skill> {
-    [
-        (
-            "code-review",
-            "Review a diff for correctness bugs and reuse cleanups before the change is opened.",
-            vec!["claude-code", "codex"],
-            true,
-            true,
-            true,
-            "~/.skillbase/store/code-review",
-        ),
-        (
-            "pdf-processing",
-            "Extract text and tables from PDF files. Use when the user mentions PDFs, forms, or scanned documents.",
-            vec![],
-            true,
-            true,
-            true,
-            "~/.skillbase/store/pdf-processing",
-        ),
-        (
-            "writing-style",
-            "House style for prose: plain statements, no metaphor, no filler.",
-            vec!["claude-code"],
-            false,
-            true,
-            true,
-            "~/.skillbase/store/writing-style",
-        ),
-        (
-            "release-notes",
-            "Turn a merged milestone into release notes grouped by what changed for the reader.",
-            vec!["codex", "cursor"],
-            false,
-            false,
-            true,
-            "~/.codex/skills/release-notes",
-        ),
-        (
-            "sql-explain",
-            "Read a slow query plan and name the index or rewrite that would fix it.",
-            vec!["gemini-cli"],
-            true,
-            true,
-            true,
-            "~/.skillbase/store/sql-explain",
-        ),
-        (
-            "terraform-review",
-            "Check a Terraform plan for destructive replacements and missing lifecycle rules.",
-            vec!["opencode", "goose"],
-            false,
-            false,
-            true,
-            "~/.config/opencode/skills/terraform-review",
-        ),
-        (
-            "api-docs",
-            "Draft reference documentation from a handler signature and its tests.",
-            vec![],
-            true,
-            false,
-            true,
-            "~/.agents/skills/api-docs",
-        ),
-        (
-            "incident-report",
-            "",
-            vec!["claude-code"],
-            false,
-            false,
-            false,
-            "~/.claude/skills/incident-report",
-        ),
-    ]
-    .into_iter()
-    .map(
-        |(name, description, agents, shared, managed, valid, origin)| Skill {
-            name: name.into(),
+/// True when an agent has a real "present but switched off" state, as opposed
+/// to one where disabling just means removing the link.
+pub fn has_disable_state(agent: &AgentDef) -> bool {
+    !matches!(agent.disable, DisableMode::RemoveLink)
+}
+
+/// One scan of the filesystem, mapped for display.
+///
+/// Built on a background thread by [`Scan::load`] and then shared by reference;
+/// nothing in it touches the filesystem again.
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub skills: Vec<SkillView>,
+    /// Everything discovery could not read, in the order it was noticed.
+    pub warnings: Vec<SharedString>,
+    /// Agents whose global directory exists on this machine, in registry
+    /// order, without the shared scope.
+    pub installed: Vec<&'static AgentDef>,
+    /// How many skills each agent can see, by id.
+    pub agent_counts: HashMap<&'static str, usize>,
+    /// How many skills each Library row lists, in [`Library::ALL`] order.
+    pub library_counts: [usize; Library::ALL.len()],
+}
+
+impl Scan {
+    /// Walks every scope under `roots` and maps the result.
+    ///
+    /// Blocking, and the only function in the application that reads the
+    /// filesystem for a list of skills. Call it from a background task.
+    pub fn load(roots: &Roots) -> Self {
+        let result = Discovery::new(roots.clone()).run();
+
+        let agent_counts: HashMap<&'static str, usize> =
+            result.counts_by_agent().into_iter().collect();
+        let installed = Registry::all()
+            .iter()
+            .filter(|agent| !agent.is_shared())
+            .filter(|agent| roots.agent_dir(agent).is_dir())
+            .collect::<Vec<_>>();
+
+        let skills: Vec<SkillView> = result
+            .skills
+            .iter()
+            .map(SkillView::from_discovered)
+            .collect();
+
+        let mut library_counts = [0usize; Library::ALL.len()];
+        for library in Library::ALL {
+            library_counts[library.index()] = skills.iter().filter(|s| library.matches(s)).count();
+        }
+
+        Self {
+            skills,
+            warnings: result.warnings.iter().map(SharedString::from).collect(),
+            installed,
+            agent_counts,
+            library_counts,
+        }
+    }
+
+    /// The skill with this name, if the last scan found it.
+    pub fn get(&self, name: &str) -> Option<&SkillView> {
+        self.skills.iter().find(|skill| skill.name == name)
+    }
+
+    /// How many skills a sidebar row lists.
+    pub fn count(&self, scope: Scope) -> usize {
+        match scope {
+            Scope::Library(library) => self.library_counts[library.index()],
+            Scope::Agent(id) => self.agent_counts.get(id).copied().unwrap_or(0),
+        }
+    }
+
+    /// The skills a scope shows, narrowed by the search query.
+    pub fn filter(&self, scope: Scope, query: &str) -> Vec<&SkillView> {
+        self.skills
+            .iter()
+            .filter(|skill| scope.shows(skill) && skill.matches_query(query))
+            .collect()
+    }
+}
+
+impl SkillView {
+    fn from_discovered(skill: &DiscoveredSkill) -> Self {
+        let description = skill.description().unwrap_or_default();
+        // A description is one line in the list, so a wrapped YAML scalar has
+        // to lose its newlines before it gets there.
+        let description: String = description.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let issues = skill
+            .doc
+            .as_ref()
+            .map(|doc| {
+                doc.validate()
+                    .into_iter()
+                    .map(|issue| Issue {
+                        field: issue.field,
+                        is_error: issue.is_error(),
+                        message: issue.error.to_string().into(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self {
+            name: skill.name.clone().into(),
             description: description.into(),
-            agents,
-            shared,
-            managed,
-            valid,
-            origin: origin.into(),
-            body: skill_body(name, description).into(),
-        },
-    )
-    .collect()
+            origin: skill.origin.clone(),
+            managed: skill.managed,
+            parse_error: skill
+                .parse_error
+                .as_ref()
+                .map(|e| SharedString::from(e.to_string())),
+            issues,
+            conflicts: skill.conflicts.clone(),
+            locations: skill.locations.clone(),
+            codex_disabled: skill.codex_disabled,
+            visible_to: skill.visible_to(),
+            in_shared: skill.is_present_in(SHARED_ID),
+        }
+    }
+
+    /// Rebuilds the discovery record a delete plan is computed from.
+    ///
+    /// [`skillbase_core::Installer::plan_delete`] reads only the origin and the
+    /// locations, both of which this view carries, so a plan can be recomputed
+    /// without keeping the whole scan alive.
+    pub fn as_discovered(&self) -> DiscoveredSkill {
+        DiscoveredSkill {
+            name: self.name.to_string(),
+            origin: self.origin.clone(),
+            locations: self.locations.clone(),
+            doc: None,
+            parse_error: None,
+            conflicts: self.conflicts.clone(),
+            managed: self.managed,
+            codex_disabled: self.codex_disabled,
+        }
+    }
 }
 
-/// Count the skills a scope would show.
-pub fn count(skills: &[Skill], scope: Scope) -> usize {
-    skills.iter().filter(|skill| scope.shows(skill)).count()
-}
-
-/// The skills a scope shows, narrowed by the search query.
-pub fn filter<'a>(skills: &'a [Skill], scope: Scope, query: &str) -> Vec<&'a Skill> {
-    skills
-        .iter()
-        .filter(|skill| scope.shows(skill) && skill.matches_query(query))
-        .collect()
-}
-
-fn skill_body(name: &str, description: &str) -> String {
-    let title = name
-        .split('-')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    format!(
-        "---\n\
-         name: {name}\n\
-         description: {description}\n\
-         license: Apache-2.0\n\
-         metadata:\n  \
-         version: \"1.0\"\n\
-         ---\n\
-         \n\
-         # {title}\n\
-         \n\
-         Instructions the agent reads when this skill fires.\n\
-         \n\
-         ## When to use\n\
-         \n\
-         - The user asks for {name} by name.\n\
-         - The work in front of you matches what the description covers.\n\
-         \n\
-         ## Steps\n\
-         \n\
-         1. Read the files the task names before changing any of them.\n\
-         2. Make the smallest change that answers the request.\n\
-         3. Run the checks that would catch a regression.\n\
-         \n\
-         ```bash\n\
-         cargo fmt && cargo clippy --all-targets -- -D warnings\n\
-         ```\n"
-    )
+/// Abbreviates a path under the home directory to `~/…`, so the interface can
+/// name a location without a 90-character prefix.
+pub fn display_path(path: &Path, roots: &Roots) -> SharedString {
+    match path.strip_prefix(roots.home()) {
+        Ok(rest) => format!("~/{}", rest.display()).into(),
+        Err(_) => path.display().to_string().into(),
+    }
 }
