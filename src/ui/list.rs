@@ -365,7 +365,7 @@ impl Skillbase {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 let outcome = created.map(|(_, outcome)| outcome);
-                if report("New skill", outcome, window, cx) {
+                if report("New skill", outcome, &this.roots, window, cx) {
                     this.rescan(Some(selected), window, cx);
                 }
             })

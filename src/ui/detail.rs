@@ -13,6 +13,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{
     Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
@@ -29,15 +30,18 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, EventEmitter, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, rems,
+    Styled as _, Subscription, Window, div, px, rems,
 };
 use skillbase_core::{
-    AgentDef, DeletePlan, DisableMode, InstallError, Installer, LocationKind, Outcome, Registry,
-    Roots, SKILL_FILE_NAME, Skill, SkillDoc, SkillError,
+    AgentDef, ConsolidatePlan, DeletePlan, DisableMode, Duplicate, InstallError, Installer,
+    LocationKind, Outcome, Registry, Roots, SKILL_FILE_NAME, STORE_ID, Skill, SkillDoc, SkillError,
 };
 
-use super::model::{Issue, Scan, SkillView, display_path, has_disable_state};
+use super::model::{Issue, Scan, SkillView, agent_label, display_path, has_disable_state};
 use super::report;
+
+/// How many differing paths a duplicate lists before it starts counting.
+const DIFF_PATHS: usize = 6;
 
 /// What this pane tells the root view.
 pub enum DetailEvent {
@@ -53,6 +57,18 @@ enum Source {
     Failed(SharedString),
 }
 
+/// Where the comparison of a skill's duplicate directories has got to.
+///
+/// Comparing eight copies of a skill file by file is filesystem work, so it
+/// happens on a background task and the pane renders whichever of these three
+/// states it is in.
+enum Duplicates {
+    /// This skill has no duplicate directories.
+    None,
+    Comparing,
+    Ready(ConsolidatePlan),
+}
+
 /// The right-hand pane.
 pub struct DetailPane {
     /// The one home every read and write resolves against.
@@ -66,6 +82,11 @@ pub struct DetailPane {
     loaded_description: SharedString,
     /// Top-level entries in the skill directory, `SKILL.md` excluded.
     bundled: Vec<SharedString>,
+    /// The skill's duplicate directories and how each compares to the origin.
+    duplicates: Duplicates,
+    /// Bumped on every comparison, so one that lands after the selection moved
+    /// on is dropped.
+    duplicates_generation: u64,
     name: Entity<InputState>,
     description: Entity<TextareaState>,
     body: Entity<EditorState>,
@@ -109,6 +130,8 @@ impl DetailPane {
             loaded_name: SharedString::default(),
             loaded_description: SharedString::default(),
             bundled: Vec::new(),
+            duplicates: Duplicates::None,
+            duplicates_generation: 0,
             name,
             description,
             body,
@@ -136,6 +159,11 @@ impl DetailPane {
         };
         self.scan = Some(scan);
         self.skill = skill;
+
+        // The duplicate comparison is against the disk, not against the
+        // editor, so it is refreshed on every show — including the one that
+        // follows a mutation, which is exactly when it has changed.
+        self.compare_duplicates(window, cx);
 
         // Re-reading the file under an unsaved edit would throw the edit away.
         // A mutation that only moved links leaves the bytes alone, so keep what
@@ -196,6 +224,61 @@ impl DetailPane {
             .ok();
         })
         .detach();
+    }
+
+    /// Compare the selected skill's duplicate directories against its origin.
+    ///
+    /// Reads only, on a background task. A skill with no duplicates costs
+    /// nothing: the comparison is not started at all.
+    fn compare_duplicates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.duplicates_generation += 1;
+        let generation = self.duplicates_generation;
+
+        let Some(skill) = self
+            .skill
+            .clone()
+            .filter(|skill| !skill.conflicts.is_empty())
+        else {
+            self.duplicates = Duplicates::None;
+            return;
+        };
+
+        self.duplicates = Duplicates::Comparing;
+        let discovered = skill.as_discovered();
+        let roots = self.roots.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let plan = cx
+                .background_spawn(
+                    async move { Installer::new(roots).plan_consolidate(&discovered) },
+                )
+                .await;
+            this.update_in(cx, |this, _, cx| {
+                if this.duplicates_generation != generation {
+                    return;
+                }
+                this.duplicates = Duplicates::Ready(plan);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Accept, or take back, losing one divergent duplicate's edits.
+    ///
+    /// Nothing happens on disk here. It only changes what the confirmation
+    /// will offer, and the confirmation still has to be accepted.
+    fn set_forced(&mut self, path: &Path, on: bool, cx: &mut Context<Self>) {
+        let Duplicates::Ready(plan) = &mut self.duplicates else {
+            return;
+        };
+        if on {
+            plan.force(path);
+        } else {
+            plan.unforce(path);
+        }
+        cx.notify();
     }
 
     /// Put the file into the editor and the two form fields.
@@ -351,7 +434,7 @@ impl DetailPane {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;
-                report(title, result, window, cx);
+                report(title, result, &this.roots, window, cx);
                 // Scan again either way: a refusal still means the interface
                 // should re-read what is actually there.
                 cx.emit(DetailEvent::Changed { select });
@@ -551,6 +634,149 @@ impl DetailPane {
                         );
                         // Nothing to land on: the skill is gone.
                         cx.emit(DetailEvent::Changed { select: None });
+                    })
+                    .ok();
+                    true
+                })
+        });
+    }
+
+    /// Confirm what consolidating would replace, naming every path.
+    ///
+    /// Consolidation removes real directories, so it confirms; and because the
+    /// counts come from a plan computed against the disk, the confirmation
+    /// states them rather than estimating them.
+    fn confirm_consolidate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Duplicates::Ready(plan) = &self.duplicates else {
+            return;
+        };
+        if self.busy || plan.replace_count() == 0 {
+            return;
+        }
+
+        let plan = plan.clone();
+        let roots = self.roots.clone();
+        let name = SharedString::from(plan.name().to_string());
+        let origin = display_path(plan.origin(), &roots);
+        let this = cx.entity().downgrade();
+
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let plan = plan.clone();
+            let roots = roots.clone();
+            let this = this.clone();
+
+            let replaced: Vec<SharedString> = plan
+                .duplicates()
+                .iter()
+                .filter(|duplicate| duplicate.will_be_replaced())
+                .map(|duplicate| display_path(duplicate.path(), &roots))
+                .collect();
+            let forced: Vec<SharedString> = plan
+                .differing()
+                .filter(|duplicate| duplicate.forced())
+                .map(|duplicate| {
+                    format!(
+                        "{} — {}",
+                        display_path(duplicate.path(), &roots),
+                        duplicate.diff().summary()
+                    )
+                    .into()
+                })
+                .collect();
+            let skipped: Vec<SharedString> = plan
+                .differing()
+                .filter(|duplicate| !duplicate.forced())
+                .map(|duplicate| {
+                    format!(
+                        "{} — {}",
+                        display_path(duplicate.path(), &roots),
+                        duplicate.diff().summary()
+                    )
+                    .into()
+                })
+                .collect();
+
+            let replace_count = plan.replace_count();
+            let description =
+                v_flex()
+                    .gap_3()
+                    .text_sm()
+                    .child(div().child(format!(
+                        "{replace_count} director{} will be deleted and replaced by a symlink to \
+                     {origin}. Nothing else on disk changes.",
+                        if replace_count == 1 { "y" } else { "ies" }
+                    )))
+                    .child(v_flex().gap_1().children(replaced.iter().map(|path| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(path.clone())
+                    })))
+                    .when(!forced.is_empty(), |this| {
+                        this.child(
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().danger.opacity(0.12))
+                            .child(div().text_xs().text_color(cx.theme().danger).child(format!(
+                                "{} of those you marked to replace anyway. Their differences \
+                                     are lost:",
+                                forced.len()
+                            )))
+                            .children(forced.iter().map(|line| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().danger)
+                                    .child(line.clone())
+                            })),
+                    )
+                    })
+                    .when(!skipped.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .p_2()
+                                .gap_1()
+                                .rounded(cx.theme().radius)
+                                .bg(cx.theme().warning.opacity(0.12))
+                                .child(div().text_xs().text_color(cx.theme().warning).child(
+                                    format!(
+                                        "{} cop{} left alone, because {} differ{} from the origin:",
+                                        skipped.len(),
+                                        if skipped.len() == 1 { "y" } else { "ies" },
+                                        if skipped.len() == 1 { "it" } else { "they" },
+                                        if skipped.len() == 1 { "s" } else { "" },
+                                    ),
+                                ))
+                                .children(skipped.iter().map(|line| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().warning)
+                                        .child(line.clone())
+                                })),
+                        )
+                    });
+
+            alert
+                .title(format!("Consolidate {name}?"))
+                .description(description)
+                .width(px(520.))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(format!("Replace {replace_count}"))
+                        .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        let plan = plan.clone();
+                        this.run(
+                            "Consolidated",
+                            move |installer| installer.consolidate(&plan),
+                            window,
+                            cx,
+                        );
                     })
                     .ok();
                     true
@@ -846,11 +1072,7 @@ impl DetailPane {
 
     fn location(&self, skill: &SkillView, cx: &mut Context<Self>) -> impl IntoElement {
         let origin = display_path(&skill.origin, &self.roots);
-        let conflicts: Vec<SharedString> = skill
-            .conflicts
-            .iter()
-            .map(|path| display_path(path, &self.roots))
-            .collect();
+        let conflicts = skill.conflicts.len();
 
         v_flex()
             .flex_shrink_0()
@@ -882,27 +1104,19 @@ impl DetailPane {
                                  moves it into ~/.skillbase/store and leaves a symlink behind."
                             }),
                     )
-                    .when(!conflicts.is_empty(), |this| {
+                    .when(conflicts > 0, |this| {
                         this.child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_xs().text_color(cx.theme().warning).child(
-                                    format!(
-                                        "{} other real director{} claim{} this name. Editing \
-                                             here does not change {}.",
-                                        conflicts.len(),
-                                        if conflicts.len() == 1 { "y" } else { "ies" },
-                                        if conflicts.len() == 1 { "s" } else { "" },
-                                        if conflicts.len() == 1 { "it" } else { "them" },
-                                    ),
-                                ))
-                                .children(conflicts.into_iter().map(|path| {
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .truncate()
-                                        .child(path)
-                                })),
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().warning)
+                                .child(format!(
+                                    "{conflicts} other real director{} claim{} this name. Editing \
+                                 here does not change {}. They are listed under Duplicate \
+                                 copies above.",
+                                    if conflicts == 1 { "y" } else { "ies" },
+                                    if conflicts == 1 { "s" } else { "" },
+                                    if conflicts == 1 { "it" } else { "them" },
+                                )),
                         )
                     })
                     .child(
@@ -946,6 +1160,218 @@ impl DetailPane {
             )
     }
 
+    /// Every real directory that duplicates this skill, and what it would take
+    /// to make them one skill again.
+    ///
+    /// A machine that has been through several agents ends up with the same
+    /// skill copied into eight directories. They are copies, not links, so
+    /// they drift: editing one changes nothing for the other seven. This
+    /// section names each of them and offers the fix.
+    fn duplicates_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let plan = match &self.duplicates {
+            Duplicates::None => return div().into_any_element(),
+            Duplicates::Comparing => {
+                return v_flex()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .child(section_title("Duplicate copies", cx))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Comparing the copies against the origin…"),
+                    )
+                    .into_any_element();
+            }
+            Duplicates::Ready(plan) => plan,
+        };
+
+        let origin = display_path(plan.origin(), &self.roots);
+        let copies = plan.duplicates().len();
+        let identical = plan.identical_count();
+        let differing = plan.differing_count();
+        let replace = plan.replace_count();
+
+        v_flex()
+            .flex_shrink_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .child(section_title("Duplicate copies", cx))
+                    .child(
+                        Button::new("consolidate")
+                            .primary()
+                            .small()
+                            .label(if replace == 1 {
+                                "Consolidate 1 copy".to_string()
+                            } else {
+                                format!("Consolidate {replace} copies")
+                            })
+                            .tooltip("Replace each copy with a symlink to the origin")
+                            .disabled(self.busy || replace == 0)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_consolidate(window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(duplicates_summary(copies, identical, differing, &origin)),
+            )
+            .child(
+                v_flex()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().group_box)
+                    .children(
+                        plan.duplicates()
+                            .iter()
+                            .map(|duplicate| self.duplicate_row(duplicate, cx)),
+                    ),
+            )
+            .when(!plan.skipped().is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} path{} sit outside every directory Skillbase manages and are not \
+                             touched.",
+                            plan.skipped().len(),
+                            if plan.skipped().len() == 1 { "" } else { "s" }
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn duplicate_row(&self, duplicate: &Duplicate, cx: &mut Context<Self>) -> AnyElement {
+        let path = duplicate.path().to_path_buf();
+        let id = SharedString::from(path.display().to_string());
+        let shown = display_path(&path, &self.roots);
+        let identical = duplicate.is_identical();
+        let forced = duplicate.forced();
+        // A divergent copy is the one thing on this screen that is about to be
+        // lost, so it carries the warning colour and the origin's colour is
+        // left alone.
+        let status_color = if identical {
+            cx.theme().muted_foreground
+        } else if forced {
+            cx.theme().danger
+        } else {
+            cx.theme().warning
+        };
+
+        v_flex()
+            .id(ElementId::from((ElementId::from("duplicate"), id.clone())))
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_1()
+            .when(!identical, |this| {
+                this.border_l_2().border_color(status_color)
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .w_40()
+                            .flex_shrink_0()
+                            .child(
+                                Icon::new(if identical {
+                                    IconName::Copy
+                                } else {
+                                    IconName::TriangleAlert
+                                })
+                                .xsmall()
+                                .text_color(status_color),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .truncate()
+                                    .child(scope_label(duplicate.agent_id())),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(shown),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(status_color)
+                            .child(if identical {
+                                "matches the origin".to_string()
+                            } else {
+                                duplicate.diff().summary()
+                            }),
+                    ),
+            )
+            .when(!identical, |this| {
+                // Name the files, then offer the only way to overwrite them.
+                // Not offering it would leave the user stuck; offering it
+                // without naming what goes would be worse than not offering it.
+                let paths: Vec<SharedString> = duplicate
+                    .diff()
+                    .paths()
+                    .take(DIFF_PATHS)
+                    .map(|path| SharedString::from(path.display().to_string()))
+                    .collect();
+                let more = duplicate.diff().total().saturating_sub(paths.len());
+
+                this.child(
+                    v_flex()
+                        .pl_6()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .children(
+                                    paths
+                                        .into_iter()
+                                        .map(|path| Tag::secondary().xsmall().child(path)),
+                                )
+                                .when(more > 0, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("+{more}")),
+                                    )
+                                }),
+                        )
+                        .child(
+                            Checkbox::new((ElementId::from("force"), id))
+                                .checked(forced)
+                                .disabled(self.busy)
+                                .label("Replace anyway, discarding these differences")
+                                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                                    this.set_forced(&path, *checked, cx)
+                                })),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
     fn bundled_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .flex_shrink_0()
@@ -987,6 +1413,18 @@ fn disable_effect(agent: &AgentDef, roots: &Roots) -> String {
             "{} has no separate off state; removing the link is the only way.",
             agent.display_name
         ),
+    }
+}
+
+/// What to call the scope a duplicate directory sits in.
+///
+/// A duplicate found through `conflicts` rather than through a location has no
+/// agent, which is worth saying rather than papering over.
+fn scope_label(agent_id: &str) -> &'static str {
+    match agent_id {
+        STORE_ID => "Skillbase store",
+        "" => "Unknown scope",
+        id => agent_label(id),
     }
 }
 
@@ -1159,8 +1597,56 @@ impl Render for DetailPane {
                             .child(Editor::new(&self.body).h(rems(20.))),
                     )
                     .child(self.bundled_files(cx))
+                    .child(self.duplicates_section(cx))
                     .child(self.location(&skill, cx)),
             )
             .into_any_element()
     }
+}
+
+/// The sentence above the duplicate rows, with the counts written out.
+///
+/// Three phrasings rather than one template: "0 have diverged and are left
+/// alone" is a sentence about nothing, and a reader has to stop and work out
+/// that it means everything is fine.
+fn duplicates_summary(
+    copies: usize,
+    identical: usize,
+    differing: usize,
+    origin: &SharedString,
+) -> String {
+    let opening = format!(
+        "{copies} separate director{} {} this skill besides the origin.",
+        if copies == 1 { "y" } else { "ies" },
+        if copies == 1 { "holds" } else { "hold" },
+    );
+    let rest = if differing == 0 {
+        format!(
+            " {} {origin} exactly.",
+            if identical == 1 {
+                "It matches"
+            } else {
+                "They all match"
+            }
+        )
+    } else if identical == 0 {
+        format!(
+            " {} diverged from {origin}, so {} left alone unless you say otherwise.",
+            if differing == 1 {
+                "It has"
+            } else {
+                "They have all"
+            },
+            if differing == 1 { "it is" } else { "they are" },
+        )
+    } else {
+        format!(
+            " {identical} {} {origin} exactly; {differing} {} diverged and {} left alone unless \
+             you say otherwise.",
+            if identical == 1 { "matches" } else { "match" },
+            if differing == 1 { "has" } else { "have" },
+            if differing == 1 { "is" } else { "are" },
+        )
+    };
+    opening + &rest
 }

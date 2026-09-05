@@ -96,7 +96,10 @@ pub use frontmatter::{
     KEY_ALLOWED_TOOLS, KEY_DESCRIPTION, KEY_LICENSE, KEY_METADATA, KEY_NAME, KEY_VERSION,
     SkillFrontmatter,
 };
-pub use install::{COPY_MARKER, Change, DeletePlan, InstallError, Installer, Outcome};
+pub use install::{
+    COPY_MARKER, Change, ConsolidatePlan, ContentDiff, DeletePlan, Duplicate, InstallError,
+    Installer, Outcome,
+};
 pub use registry::{
     AgentDef, DisableMode, GlobalDir, LinkMode, Registry, Roots, SHARED_ID, SHARED_SKILLS_DIR,
     STORE_DIR, STORE_ID, UNSUPPORTED, home_dir,

@@ -3,12 +3,13 @@
 pub mod detail;
 pub mod list;
 pub mod model;
+pub mod settings;
 pub mod sidebar;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{App, Window};
-use skillbase_core::{InstallError, Outcome};
+use skillbase_core::{InstallError, Outcome, Roots};
 
 /// Report what an operation did, or why it did nothing.
 ///
@@ -19,20 +20,22 @@ use skillbase_core::{InstallError, Outcome};
 pub fn report(
     title: &str,
     result: Result<Outcome, InstallError>,
+    roots: &Roots,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
     match result {
         Ok(outcome) if outcome.is_noop() => {
             window.push_notification(
-                Notification::info(outcome.describe()).title(title.to_string()),
+                Notification::info(outcome.describe_under(roots.home())).title(title.to_string()),
                 cx,
             );
             false
         }
         Ok(outcome) => {
             window.push_notification(
-                Notification::success(outcome.describe()).title(title.to_string()),
+                Notification::success(outcome.describe_under(roots.home()))
+                    .title(title.to_string()),
                 cx,
             );
             true

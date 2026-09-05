@@ -22,7 +22,9 @@
 //! The roots come in as a [`Roots`], so tests run against a temporary home and
 //! can never touch the user's own.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 
@@ -176,26 +178,50 @@ pub enum Change {
     },
 }
 
-impl std::fmt::Display for Change {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Change {
+    /// The change as one line, with `home` written as `~`.
+    ///
+    /// A notification that spells out `/Users/someone/.claude/skills/x` eight
+    /// times is not read. The abbreviation is presentation, so it lives here
+    /// rather than in the paths themselves.
+    pub fn describe_under(&self, home: &Path) -> String {
+        let mut out = String::new();
+        // Writing into a String cannot fail.
+        let _ = self.write(&mut out, Some(home));
+        out
+    }
+
+    fn write(&self, f: &mut impl std::fmt::Write, home: Option<&Path>) -> std::fmt::Result {
+        let p = |path: &Path| match home {
+            Some(home) => abbreviate(path, home),
+            None => path.display().to_string(),
+        };
         match self {
             Self::CreatedSymlink { path, target } => {
-                write!(f, "linked {} -> {}", path.display(), target.display())
+                write!(f, "linked {} -> {}", p(path), target.display())
             }
-            Self::RemovedSymlink { path } => write!(f, "removed the link {}", path.display()),
-            Self::Copied { from, to } => {
-                write!(f, "copied {} to {}", from.display(), to.display())
-            }
-            Self::RemovedDirectory { path } => write!(f, "deleted {}", path.display()),
-            Self::Moved { from, to } => {
-                write!(f, "moved {} to {}", from.display(), to.display())
-            }
-            Self::CreatedDirectory { path } => write!(f, "created {}", path.display()),
-            Self::WroteFile { path } => write!(f, "wrote {}", path.display()),
-            Self::NoChange { path, reason } => {
-                write!(f, "{} was already {reason}", path.display())
-            }
+            Self::RemovedSymlink { path } => write!(f, "removed the link {}", p(path)),
+            Self::Copied { from, to } => write!(f, "copied {} to {}", p(from), p(to)),
+            Self::RemovedDirectory { path } => write!(f, "deleted {}", p(path)),
+            Self::Moved { from, to } => write!(f, "moved {} to {}", p(from), p(to)),
+            Self::CreatedDirectory { path } => write!(f, "created {}", p(path)),
+            Self::WroteFile { path } => write!(f, "wrote {}", p(path)),
+            Self::NoChange { path, reason } => write!(f, "{} was already {reason}", p(path)),
         }
+    }
+}
+
+impl std::fmt::Display for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write(f, None)
+    }
+}
+
+/// Writes `home` as `~`, leaving any path outside it alone.
+fn abbreviate(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
     }
 }
 
@@ -234,6 +260,32 @@ impl Outcome {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    /// The same, with `home` written as `~` and a long list cut short.
+    ///
+    /// Consolidating eight copies produces sixteen changes. A notification
+    /// listing all of them is a wall of text nobody reads, so past
+    /// [`Self::MAX_DESCRIBED`] lines it names the first few and counts the
+    /// rest.
+    pub fn describe_under(&self, home: &Path) -> String {
+        let mut lines: Vec<String> = self
+            .changes
+            .iter()
+            .take(Self::MAX_DESCRIBED)
+            .map(|change| change.describe_under(home))
+            .collect();
+        let remaining = self.changes.len().saturating_sub(Self::MAX_DESCRIBED);
+        if remaining > 0 {
+            lines.push(format!(
+                "and {remaining} more change{}",
+                if remaining == 1 { "" } else { "s" }
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// How many changes a description names before it starts counting.
+    const MAX_DESCRIBED: usize = 6;
 }
 
 /// What a delete would remove, counted before anything is removed.
@@ -269,6 +321,249 @@ impl DeletePlan {
     pub fn total(&self) -> usize {
         self.links.len() + self.copies.len() + usize::from(self.origin.is_some())
     }
+}
+
+/// How one duplicate directory's content compares to the origin's.
+///
+/// The comparison covers the whole skill directory, not just `SKILL.md`:
+/// bundled scripts, references and assets count, because a duplicate that
+/// carries a different `scripts/run.sh` is just as divergent as one with a
+/// different description.
+///
+/// Every path is relative to the skill directory. A file that cannot be read
+/// on either side is listed under [`ContentDiff::differing`] rather than
+/// assumed equal, so an unreadable duplicate is never replaced by default.
+///
+/// The one thing left out of the comparison is [`COPY_MARKER`], the file
+/// Skillbase writes into copies it makes itself. It is bookkeeping, not
+/// content, and counting it would make every copy Skillbase made look
+/// divergent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentDiff {
+    /// Paths both directories have, holding different bytes — or a file on one
+    /// side and a directory or symlink on the other.
+    pub differing: Vec<PathBuf>,
+    /// Paths the duplicate has and the origin does not.
+    pub extra: Vec<PathBuf>,
+    /// Paths the origin has and the duplicate does not.
+    pub missing: Vec<PathBuf>,
+}
+
+impl ContentDiff {
+    /// True when the two directories hold exactly the same bytes.
+    pub fn is_identical(&self) -> bool {
+        self.differing.is_empty() && self.extra.is_empty() && self.missing.is_empty()
+    }
+
+    /// How many paths differ in any way.
+    pub fn total(&self) -> usize {
+        self.differing.len() + self.extra.len() + self.missing.len()
+    }
+
+    /// Every path involved, differing first, each relative to the skill
+    /// directory.
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.differing
+            .iter()
+            .chain(&self.extra)
+            .chain(&self.missing)
+            .map(PathBuf::as_path)
+    }
+
+    /// One line naming the counts, for a confirmation that has to be specific.
+    pub fn summary(&self) -> String {
+        if self.is_identical() {
+            return "identical".to_string();
+        }
+        let mut parts = Vec::new();
+        if !self.differing.is_empty() {
+            let n = self.differing.len();
+            parts.push(format!(
+                "{n} file{} differ{}",
+                plural(n),
+                if n == 1 { "s" } else { "" }
+            ));
+        }
+        if !self.extra.is_empty() {
+            parts.push(format!(
+                "{} extra file{}",
+                self.extra.len(),
+                plural(self.extra.len())
+            ));
+        }
+        if !self.missing.is_empty() {
+            parts.push(format!(
+                "{} missing file{}",
+                self.missing.len(),
+                plural(self.missing.len())
+            ));
+        }
+        parts.join(", ")
+    }
+}
+
+/// One real directory that duplicates a skill's origin.
+///
+/// The fields are private on purpose. A duplicate whose content differs from
+/// the origin is only ever replaced when [`ConsolidatePlan::force`] has been
+/// called for its path, and keeping the flag out of reach of a struct literal
+/// is what makes "forced by accident" impossible rather than merely unlikely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Duplicate {
+    path: PathBuf,
+    agent_id: &'static str,
+    diff: ContentDiff,
+    forced: bool,
+}
+
+impl Duplicate {
+    /// The duplicate directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The scope it sits in: an agent id, or [`STORE_ID`].
+    ///
+    /// [`STORE_ID`]: crate::registry::STORE_ID
+    pub fn agent_id(&self) -> &'static str {
+        self.agent_id
+    }
+
+    /// How its content compares to the origin's.
+    pub fn diff(&self) -> &ContentDiff {
+        &self.diff
+    }
+
+    /// True when it holds exactly what the origin holds.
+    pub fn is_identical(&self) -> bool {
+        self.diff.is_identical()
+    }
+
+    /// True when the caller has explicitly accepted losing this duplicate's
+    /// differences.
+    pub fn forced(&self) -> bool {
+        self.forced
+    }
+
+    /// True when [`Installer::consolidate`] would replace it with a link.
+    pub fn will_be_replaced(&self) -> bool {
+        self.is_identical() || self.forced
+    }
+}
+
+/// What consolidating a skill would replace, worked out before anything is
+/// replaced.
+///
+/// Consolidation is destructive — it removes a real directory — so the plan is
+/// computed first and every count in the confirmation comes from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsolidatePlan {
+    name: String,
+    origin: PathBuf,
+    duplicates: Vec<Duplicate>,
+    skipped: Vec<PathBuf>,
+}
+
+impl ConsolidatePlan {
+    /// The skill being consolidated.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The directory that keeps the bytes. Every link will point here.
+    pub fn origin(&self) -> &Path {
+        &self.origin
+    }
+
+    /// Every duplicate directory, in registry order.
+    pub fn duplicates(&self) -> &[Duplicate] {
+        &self.duplicates
+    }
+
+    /// Paths left alone because they sit outside every directory Skillbase
+    /// manages.
+    pub fn skipped(&self) -> &[PathBuf] {
+        &self.skipped
+    }
+
+    /// The duplicates that match the origin byte for byte.
+    pub fn identical(&self) -> impl Iterator<Item = &Duplicate> {
+        self.duplicates.iter().filter(|d| d.is_identical())
+    }
+
+    /// The duplicates that have diverged. These are skipped unless forced.
+    pub fn differing(&self) -> impl Iterator<Item = &Duplicate> {
+        self.duplicates.iter().filter(|d| !d.is_identical())
+    }
+
+    /// How many duplicates match the origin.
+    pub fn identical_count(&self) -> usize {
+        self.identical().count()
+    }
+
+    /// How many duplicates have diverged.
+    pub fn differing_count(&self) -> usize {
+        self.differing().count()
+    }
+
+    /// How many divergent duplicates the caller has explicitly forced.
+    pub fn forced_count(&self) -> usize {
+        self.differing().filter(|d| d.forced()).count()
+    }
+
+    /// How many duplicates would become links.
+    pub fn replace_count(&self) -> usize {
+        self.duplicates
+            .iter()
+            .filter(|d| d.will_be_replaced())
+            .count()
+    }
+
+    /// How many duplicates would be left alone because they differ.
+    pub fn skipped_count(&self) -> usize {
+        self.differing().filter(|d| !d.forced()).count()
+    }
+
+    /// True when there is nothing to consolidate.
+    pub fn is_empty(&self) -> bool {
+        self.duplicates.is_empty()
+    }
+
+    /// Accept losing one divergent duplicate's differences.
+    ///
+    /// This is the only way to replace a duplicate whose content is not the
+    /// origin's, and it names one path at a time: there is deliberately no
+    /// "force everything" switch, because the whole point of the refusal is
+    /// that each divergence is a decision the user has to look at.
+    ///
+    /// Returns true when a duplicate with that path was found.
+    pub fn force(&mut self, path: &Path) -> bool {
+        self.set_forced(path, true)
+    }
+
+    /// Take back a [`ConsolidatePlan::force`].
+    pub fn unforce(&mut self, path: &Path) -> bool {
+        self.set_forced(path, false)
+    }
+
+    /// True when this path has been forced.
+    pub fn is_forced(&self, path: &Path) -> bool {
+        self.duplicates.iter().any(|d| d.path == path && d.forced)
+    }
+
+    fn set_forced(&mut self, path: &Path, forced: bool) -> bool {
+        match self.duplicates.iter_mut().find(|d| d.path == path) {
+            Some(duplicate) => {
+                duplicate.forced = forced;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Creates, moves and removes the links that make a skill visible.
@@ -544,6 +839,143 @@ impl Installer {
         for path in plan.copies.iter().chain(plan.origin.iter()) {
             let path = self.ensure_in_scope(path)?;
             outcome.changes.extend(self.remove_real_dir(&path)?.changes);
+        }
+        Ok(outcome)
+    }
+
+    /// Works out what consolidating this skill would replace, without
+    /// replacing anything.
+    ///
+    /// A *duplicate* is a real directory, other than the origin, holding the
+    /// same skill. The machines this exists for have up to eight of them per
+    /// skill — one per agent that got a copy instead of a link — and they
+    /// drift, because editing one changes nothing for the other seven.
+    ///
+    /// Each duplicate is compared against the origin file by file, so the
+    /// caller can tell an exact copy (safe to replace with a link) from one
+    /// that has been edited since (not safe, and refused by
+    /// [`Installer::consolidate`] unless [`ConsolidatePlan::force`] says
+    /// otherwise).
+    ///
+    /// Reads only. Anything outside the managed scopes lands in
+    /// [`ConsolidatePlan::skipped`] and is never looked at again.
+    pub fn plan_consolidate(&self, skill: &DiscoveredSkill) -> ConsolidatePlan {
+        let mut plan = ConsolidatePlan {
+            name: skill.name.clone(),
+            ..ConsolidatePlan::default()
+        };
+        let Ok(origin) = self.ensure_in_scope(&skill.origin) else {
+            // Without an origin inside a scope there is nothing to point links
+            // at, so every location is left alone.
+            plan.skipped = skill.locations.iter().map(|l| l.path.clone()).collect();
+            return plan;
+        };
+        plan.origin = origin.clone();
+
+        // Locations first, because they carry the agent each path belongs to.
+        // `conflicts` is the same set of directories without that label, so it
+        // only contributes anything a location did not already cover.
+        let paths = skill
+            .locations
+            .iter()
+            .map(|location| (location.path.clone(), location.agent_id))
+            .chain(skill.conflicts.iter().map(|path| (path.clone(), "")));
+
+        for (path, agent_id) in paths {
+            let Ok(path) = self.ensure_in_scope(&path) else {
+                if !plan.skipped.contains(&path) {
+                    plan.skipped.push(path);
+                }
+                continue;
+            };
+            if path == origin || plan.duplicates.iter().any(|d| d.path == path) {
+                continue;
+            }
+            // Only a real directory is a duplicate. A symlink already points at
+            // the origin, or at something else this operation has no business
+            // rewriting.
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.file_type().is_symlink() && meta.is_dir() => {}
+                _ => continue,
+            }
+            plan.duplicates.push(Duplicate {
+                diff: compare_dirs(&origin, &path),
+                path,
+                agent_id,
+                forced: false,
+            });
+        }
+        plan
+    }
+
+    /// Carries out a plan from [`Installer::plan_consolidate`]: every duplicate
+    /// directory becomes a relative symlink to the origin.
+    ///
+    /// # What it refuses
+    ///
+    /// - A duplicate whose content differs from the origin is **skipped**, not
+    ///   removed, unless [`ConsolidatePlan::force`] named its path. Replacing
+    ///   it would throw away edits the user made and cannot get back.
+    /// - The comparison is run again here rather than trusted from the plan, so
+    ///   a duplicate edited between the confirmation and the click is still
+    ///   caught.
+    /// - Every path goes through [`Installer::ensure_in_scope`] first.
+    /// - A symlink is never followed and never removed as if it were a copy: a
+    ///   duplicate that is already a link is a no-op.
+    /// - The origin is never a candidate for removal, even if a caller lists
+    ///   it.
+    ///
+    /// Each replacement removes the duplicate and then links it, in that order,
+    /// so a failure leaves at worst a missing copy whose bytes are still at the
+    /// origin — never a link pointing at nothing.
+    pub fn consolidate(&self, plan: &ConsolidatePlan) -> Result<Outcome, InstallError> {
+        let origin = self.ensure_in_scope(plan.origin())?;
+        require_dir(&origin)?;
+
+        let mut outcome = Outcome::default();
+        for duplicate in plan.duplicates() {
+            let path = self.ensure_in_scope(duplicate.path())?;
+            if path == origin || origin.starts_with(&path) {
+                outcome.push(Change::NoChange {
+                    path,
+                    reason: "the origin itself",
+                });
+                continue;
+            }
+
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    outcome.push(Change::NoChange {
+                        path,
+                        reason: "a link, not a copy",
+                    });
+                    continue;
+                }
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(InstallError::NotALink { path, kind: "file" });
+                }
+                Err(_) => {
+                    outcome.push(Change::NoChange {
+                        path,
+                        reason: "not there",
+                    });
+                    continue;
+                }
+            }
+
+            if !duplicate.forced() && !compare_dirs(&origin, &path).is_identical() {
+                outcome.push(Change::NoChange {
+                    path,
+                    reason: "different from the origin, so it was left alone",
+                });
+                continue;
+            }
+
+            outcome.changes.extend(self.remove_real_dir(&path)?.changes);
+            outcome
+                .changes
+                .extend(self.place_symlink(&path, &origin)?.changes);
         }
         Ok(outcome)
     }
@@ -855,6 +1287,121 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// What a single path in a skill directory is, for the purpose of comparing
+/// two of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryKind {
+    Dir,
+    File,
+    /// A symlink, compared by the target it was written with rather than by
+    /// what the target holds.
+    Link(PathBuf),
+    /// Something that could not be read. Never equal to anything, including
+    /// another unreadable entry, so an unreadable duplicate is reported as
+    /// divergent rather than quietly replaced.
+    Unreadable,
+}
+
+/// Compares two skill directories file by file.
+///
+/// Follows nothing: a symlink inside either tree is compared by its target as
+/// written. [`COPY_MARKER`] is ignored, because it is Skillbase's own
+/// bookkeeping rather than part of the skill.
+fn compare_dirs(origin: &Path, other: &Path) -> ContentDiff {
+    let mut left = BTreeMap::new();
+    let mut right = BTreeMap::new();
+    walk_entries(origin, Path::new(""), &mut left);
+    walk_entries(other, Path::new(""), &mut right);
+
+    let mut diff = ContentDiff::default();
+    for (relative, kind) in &left {
+        match right.get(relative) {
+            None => diff.missing.push(relative.clone()),
+            Some(theirs) if theirs != kind || *kind == EntryKind::Unreadable => {
+                diff.differing.push(relative.clone())
+            }
+            Some(_) if *kind == EntryKind::File => {
+                if !files_equal(&origin.join(relative), &other.join(relative)) {
+                    diff.differing.push(relative.clone());
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    for relative in right.keys() {
+        if !left.contains_key(relative) {
+            diff.extra.push(relative.clone());
+        }
+    }
+    diff
+}
+
+/// Records every path under `dir` by its path relative to the skill root.
+fn walk_entries(dir: &Path, prefix: &Path, out: &mut BTreeMap<PathBuf, EntryKind>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        // An unreadable directory is a difference, not an equality: record it
+        // under its own name so the comparison can never call it identical.
+        if !prefix.as_os_str().is_empty() {
+            out.insert(prefix.to_path_buf(), EntryKind::Unreadable);
+        }
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == COPY_MARKER {
+            continue;
+        }
+        let relative = prefix.join(&name);
+        let path = entry.path();
+        let kind = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                EntryKind::Link(fs::read_link(&path).unwrap_or_default())
+            }
+            Ok(meta) if meta.is_dir() => EntryKind::Dir,
+            Ok(_) => EntryKind::File,
+            Err(_) => EntryKind::Unreadable,
+        };
+        let recurse = kind == EntryKind::Dir;
+        out.insert(relative.clone(), kind);
+        if recurse {
+            walk_entries(&path, &relative, out);
+        }
+    }
+}
+
+/// True when two files hold the same bytes.
+///
+/// Compares in chunks so that a large bundled asset does not have to be held in
+/// memory twice. A file that cannot be read is never equal to anything.
+fn files_equal(left: &Path, right: &Path) -> bool {
+    let (Ok(left_meta), Ok(right_meta)) = (fs::metadata(left), fs::metadata(right)) else {
+        return false;
+    };
+    if left_meta.len() != right_meta.len() {
+        return false;
+    }
+    let (Ok(left_file), Ok(right_file)) = (fs::File::open(left), fs::File::open(right)) else {
+        return false;
+    };
+    let mut left_reader = BufReader::new(left_file);
+    let mut right_reader = BufReader::new(right_file);
+    loop {
+        let (Ok(left_chunk), Ok(right_chunk)) = (left_reader.fill_buf(), right_reader.fill_buf())
+        else {
+            return false;
+        };
+        if left_chunk.is_empty() || right_chunk.is_empty() {
+            return left_chunk.is_empty() && right_chunk.is_empty();
+        }
+        let len = left_chunk.len().min(right_chunk.len());
+        if left_chunk[..len] != right_chunk[..len] {
+            return false;
+        }
+        left_reader.consume(len);
+        right_reader.consume(len);
+    }
+}
+
 /// Resolves `.` and `..` textually, without touching the filesystem.
 ///
 /// Returns `None` for a relative path: every path this crate writes to is
@@ -904,7 +1451,7 @@ fn relative_from(from_dir: &Path, to: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::LocationKind;
+    use crate::discovery::{Location, LocationKind};
     use crate::registry::Registry;
     use crate::test_fixture::{Fixture, listing};
 
@@ -1474,6 +2021,485 @@ mod tests {
             Err(InstallError::NotALink { .. })
         ));
         assert!(fx.agent("claude-code").join("claude-only").is_dir());
+    }
+
+    // -- consolidate ----------------------------------------------------------
+
+    const FANNED: &str =
+        "---\nname: fanned-out\ndescription: Copied everywhere.\n---\n\n# fanned-out\n";
+
+    /// One skill fanned out as four independent real directories: the origin in
+    /// the shared directory, two exact copies, and one edited after it was
+    /// copied. This is the shape consolidation exists for, and the shape the
+    /// machine this was written on actually has.
+    fn fan_out(fx: &Fixture) {
+        for dir in [
+            ".agents/skills/fanned-out",
+            ".claude/skills/fanned-out",
+            ".cursor/skills/fanned-out",
+            ".gemini/skills/fanned-out",
+        ] {
+            fx.write_file(&format!("{dir}/SKILL.md"), FANNED);
+            fx.write_file(&format!("{dir}/scripts/run.sh"), "echo one\n");
+        }
+        // Gemini's copy has been edited since. Those bytes are the user's, and
+        // no default action may throw them away.
+        fx.write_file(
+            ".gemini/skills/fanned-out/SKILL.md",
+            &FANNED.replace("Copied everywhere.", "Edited here, and only here."),
+        );
+    }
+
+    fn plan_for(fx: &Fixture, name: &str) -> ConsolidatePlan {
+        let result = fx.scan();
+        fx.installer()
+            .plan_consolidate(result.get(name).expect("the skill was discovered"))
+    }
+
+    #[test]
+    fn plan_consolidate_separates_exact_copies_from_edited_ones() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        let plan = plan_for(&fx, "fanned-out");
+
+        assert_eq!(plan.origin(), fx.shared().join("fanned-out"));
+        assert_eq!(plan.duplicates().len(), 3);
+        assert_eq!(plan.identical_count(), 2);
+        assert_eq!(plan.differing_count(), 1);
+        assert_eq!(plan.replace_count(), 2, "only the exact copies by default");
+        assert_eq!(plan.skipped_count(), 1);
+        assert!(plan.skipped().is_empty());
+
+        let paths: Vec<_> = plan.duplicates().iter().map(Duplicate::path).collect();
+        assert_eq!(
+            paths,
+            [
+                fx.agent("claude-code").join("fanned-out"),
+                fx.agent("cursor").join("fanned-out"),
+                fx.agent("gemini-cli").join("fanned-out"),
+            ],
+            "registry order, and each labelled with its own agent"
+        );
+        assert_eq!(
+            plan.duplicates()
+                .iter()
+                .map(Duplicate::agent_id)
+                .collect::<Vec<_>>(),
+            ["claude-code", "cursor", "gemini-cli"]
+        );
+
+        let edited = plan.differing().next().unwrap();
+        assert_eq!(edited.path(), fx.agent("gemini-cli").join("fanned-out"));
+        assert_eq!(edited.diff().differing, [PathBuf::from("SKILL.md")]);
+        assert_eq!(edited.diff().summary(), "1 file differs");
+        assert!(!edited.forced(), "nothing is forced until it is asked for");
+        assert!(!edited.will_be_replaced());
+    }
+
+    #[test]
+    fn consolidate_replaces_exact_copies_with_relative_symlinks() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        let plan = plan_for(&fx, "fanned-out");
+        let outcome = fx.installer().consolidate(&plan).unwrap();
+
+        for agent in ["claude-code", "cursor"] {
+            let link = fx.agent(agent).join("fanned-out");
+            let meta = fs::symlink_metadata(&link).unwrap();
+            assert!(meta.file_type().is_symlink(), "{agent} is now a link");
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                Path::new("../../.agents/skills/fanned-out"),
+                "and a relative one"
+            );
+            assert_eq!(
+                fs::read_to_string(link.join(SKILL_FILE_NAME)).unwrap(),
+                FANNED,
+                "the link resolves to the origin's bytes"
+            );
+        }
+        assert_eq!(
+            outcome
+                .changes
+                .iter()
+                .filter(|c| matches!(c, Change::CreatedSymlink { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            outcome
+                .changes
+                .iter()
+                .filter(|c| matches!(c, Change::RemovedDirectory { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn consolidate_refuses_the_edited_copy_and_leaves_it_exactly_as_it_was() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        let edited = fx.agent("gemini-cli").join("fanned-out");
+        let before = listing(&edited);
+
+        let outcome = fx
+            .installer()
+            .consolidate(&plan_for(&fx, "fanned-out"))
+            .unwrap();
+
+        assert!(
+            !fs::symlink_metadata(&edited)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "still a real directory"
+        );
+        assert_eq!(before, listing(&edited), "byte for byte as it was");
+        assert!(
+            fs::read_to_string(edited.join(SKILL_FILE_NAME))
+                .unwrap()
+                .contains("Edited here, and only here."),
+            "the divergent edit survives"
+        );
+        assert!(
+            outcome.changes.contains(&Change::NoChange {
+                path: edited,
+                reason: "different from the origin, so it was left alone",
+            }),
+            "and the refusal is reported, not swallowed: {}",
+            outcome.describe()
+        );
+    }
+
+    #[test]
+    fn a_difference_in_a_bundled_file_is_detected() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        // Same SKILL.md, different script: still a divergence.
+        fx.write_file(".claude/skills/fanned-out/scripts/run.sh", "echo two\n");
+        // An extra file on one side, and a missing one on the other.
+        fx.write_file(".cursor/skills/fanned-out/references/notes.md", "extra\n");
+        fs::remove_file(fx.agent("gemini-cli").join("fanned-out/scripts/run.sh")).unwrap();
+
+        let plan = plan_for(&fx, "fanned-out");
+        assert_eq!(plan.identical_count(), 0);
+        assert_eq!(plan.replace_count(), 0);
+
+        let by_agent = |id: &str| {
+            plan.duplicates()
+                .iter()
+                .find(|d| d.agent_id() == id)
+                .unwrap()
+                .diff()
+                .clone()
+        };
+        assert_eq!(
+            by_agent("claude-code").differing,
+            [PathBuf::from("scripts/run.sh")]
+        );
+        assert_eq!(
+            by_agent("cursor").extra,
+            [
+                PathBuf::from("references"),
+                PathBuf::from("references/notes.md")
+            ]
+        );
+        assert_eq!(by_agent("cursor").summary(), "2 extra files");
+        assert_eq!(
+            by_agent("gemini-cli").missing,
+            [PathBuf::from("scripts/run.sh")]
+        );
+
+        let before = listing(fx.home());
+        assert!(fx.installer().consolidate(&plan).unwrap().is_noop());
+        assert_eq!(before, listing(fx.home()), "nothing was touched");
+    }
+
+    #[test]
+    fn an_identical_copy_that_carries_the_copy_marker_still_counts_as_identical() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        // Skillbase's own bookkeeping is not part of the skill.
+        fx.write_file(".claude/skills/fanned-out/.skillbase-copy", "/somewhere\n");
+        let plan = plan_for(&fx, "fanned-out");
+        assert_eq!(plan.identical_count(), 2);
+    }
+
+    #[test]
+    fn forcing_one_duplicate_replaces_that_one_and_no_other() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        // Edit a second copy so there are two divergences and only one is forced.
+        fx.write_file(".cursor/skills/fanned-out/scripts/run.sh", "echo three\n");
+
+        let mut plan = plan_for(&fx, "fanned-out");
+        assert_eq!(plan.differing_count(), 2);
+        assert!(
+            !plan.force(Path::new("/nowhere")),
+            "an unknown path forces nothing"
+        );
+        assert_eq!(plan.forced_count(), 0);
+
+        let gemini = fx.agent("gemini-cli").join("fanned-out");
+        assert!(plan.force(&gemini));
+        assert!(plan.is_forced(&gemini));
+        assert_eq!(plan.forced_count(), 1);
+        assert_eq!(
+            plan.replace_count(),
+            2,
+            "the exact copy plus the forced one"
+        );
+        assert_eq!(plan.skipped_count(), 1);
+
+        fx.installer().consolidate(&plan).unwrap();
+        assert!(
+            fs::symlink_metadata(&gemini)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the forced copy was replaced"
+        );
+        assert!(
+            fx.agent("cursor")
+                .join("fanned-out/scripts/run.sh")
+                .is_file(),
+            "the copy that was not forced kept its own bytes"
+        );
+        assert!(
+            !fs::symlink_metadata(fx.agent("cursor").join("fanned-out"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        plan.unforce(&gemini);
+        assert!(!plan.is_forced(&gemini));
+    }
+
+    #[test]
+    fn consolidating_a_duplicate_that_is_already_a_link_does_nothing() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        let installer = fx.installer();
+        let plan = plan_for(&fx, "fanned-out");
+        installer.consolidate(&plan).unwrap();
+
+        let after_first = listing(fx.home());
+        let again = installer.consolidate(&plan).unwrap();
+        assert!(again.is_noop(), "{}", again.describe());
+        assert!(again.changes.contains(&Change::NoChange {
+            path: fx.agent("cursor").join("fanned-out"),
+            reason: "a link, not a copy",
+        }));
+        assert_eq!(after_first, listing(fx.home()));
+    }
+
+    #[test]
+    fn consolidate_never_removes_the_origin_even_when_it_is_listed() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        let origin = fx.shared().join("fanned-out");
+        let plan = ConsolidatePlan {
+            name: "fanned-out".into(),
+            origin: origin.clone(),
+            duplicates: vec![Duplicate {
+                path: origin.clone(),
+                agent_id: "shared",
+                diff: ContentDiff::default(),
+                forced: true,
+            }],
+            skipped: Vec::new(),
+        };
+        let outcome = fx.installer().consolidate(&plan).unwrap();
+        assert!(outcome.is_noop());
+        assert!(origin.join(SKILL_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn consolidate_refuses_every_path_outside_the_managed_scopes() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        let before = listing(fx.home());
+        let outside = fx.home().join("Documents/secret");
+
+        // A duplicate outside every scope.
+        let plan = ConsolidatePlan {
+            name: "fanned-out".into(),
+            origin: fx.shared().join("fanned-out"),
+            duplicates: vec![Duplicate {
+                path: outside.clone(),
+                agent_id: "claude-code",
+                diff: ContentDiff::default(),
+                forced: true,
+            }],
+            skipped: Vec::new(),
+        };
+        assert!(matches!(
+            fx.installer().consolidate(&plan),
+            Err(InstallError::OutsideScope { .. })
+        ));
+
+        // An origin outside every scope, which would otherwise become the
+        // target of every link written.
+        let plan = ConsolidatePlan {
+            name: "fanned-out".into(),
+            origin: outside.clone(),
+            duplicates: vec![Duplicate {
+                path: fx.agent("cursor").join("fanned-out"),
+                agent_id: "cursor",
+                diff: ContentDiff::default(),
+                forced: true,
+            }],
+            skipped: Vec::new(),
+        };
+        assert!(matches!(
+            fx.installer().consolidate(&plan),
+            Err(InstallError::OutsideScope { .. })
+        ));
+
+        assert_eq!(before, listing(fx.home()), "a refusal changes nothing");
+        assert!(outside.join("keep-me.txt").is_file());
+    }
+
+    #[test]
+    fn plan_consolidate_skips_a_location_outside_every_scope() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        let outside = fx.home().join("Documents/secret");
+        let skill = DiscoveredSkill {
+            name: "fanned-out".into(),
+            origin: fx.shared().join("fanned-out"),
+            locations: vec![
+                Location {
+                    agent_id: "cursor",
+                    path: fx.agent("cursor").join("fanned-out"),
+                    kind: LocationKind::Copy,
+                },
+                Location {
+                    agent_id: "cursor",
+                    path: outside.clone(),
+                    kind: LocationKind::Copy,
+                },
+            ],
+            doc: None,
+            parse_error: None,
+            conflicts: vec![outside.clone()],
+            managed: false,
+            codex_disabled: false,
+        };
+
+        let plan = fx.installer().plan_consolidate(&skill);
+        assert_eq!(
+            plan.skipped(),
+            std::slice::from_ref(&outside),
+            "named once, not twice"
+        );
+        assert_eq!(plan.duplicates().len(), 1);
+        assert_eq!(
+            plan.duplicates()[0].path(),
+            fx.agent("cursor").join("fanned-out")
+        );
+        assert!(outside.join("keep-me.txt").is_file());
+    }
+
+    #[test]
+    fn consolidate_then_re_discover_shows_one_origin_and_links_to_it() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        let installer = fx.installer();
+
+        let before = fx.scan();
+        let skill = before.get("fanned-out").unwrap();
+        assert_eq!(skill.conflicts.len(), 3, "three real directories drifting");
+
+        installer
+            .consolidate(&installer.plan_consolidate(skill))
+            .unwrap();
+
+        let after = fx.scan();
+        let skill = after.get("fanned-out").unwrap();
+        assert_eq!(skill.origin, fx.shared().join("fanned-out"));
+        assert_eq!(
+            skill.conflicts,
+            [fx.agent("gemini-cli").join("fanned-out")],
+            "only the copy that was refused is still a conflict"
+        );
+        let kinds: Vec<_> = skill
+            .locations
+            .iter()
+            .map(|l| (l.agent_id, l.kind.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("shared", LocationKind::Origin),
+                (
+                    "claude-code",
+                    LocationKind::Symlink {
+                        target: fx.shared().join("fanned-out")
+                    }
+                ),
+                (
+                    "cursor",
+                    LocationKind::Symlink {
+                        target: fx.shared().join("fanned-out")
+                    }
+                ),
+                ("gemini-cli", LocationKind::Copy),
+            ]
+        );
+        assert!(skill.visible_to().contains(&"claude-code"));
+    }
+
+    #[test]
+    fn describe_under_writes_home_as_a_tilde_and_counts_the_rest() {
+        let home = Path::new("/Users/someone");
+        let mut outcome = Outcome::default();
+        for n in 0..9 {
+            outcome.push(Change::RemovedDirectory {
+                path: home.join(format!(".claude/skills/skill-{n}")),
+            });
+        }
+
+        let described = outcome.describe_under(home);
+        let lines: Vec<&str> = described.lines().collect();
+
+        assert_eq!(lines.len(), Outcome::MAX_DESCRIBED + 1);
+        assert_eq!(lines[0], "deleted ~/.claude/skills/skill-0");
+        assert_eq!(lines[Outcome::MAX_DESCRIBED], "and 3 more changes");
+        assert!(!described.contains("/Users/someone"));
+    }
+
+    #[test]
+    fn describe_under_leaves_a_path_outside_home_alone() {
+        let outcome = Outcome::one(Change::RemovedDirectory {
+            path: PathBuf::from("/opt/skills/thing"),
+        });
+
+        assert_eq!(
+            outcome.describe_under(Path::new("/Users/someone")),
+            "deleted /opt/skills/thing"
+        );
+    }
+
+    #[test]
+    fn consolidate_leaves_a_skill_with_no_duplicates_alone() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+        let result = fx.scan();
+        let plan = fx
+            .installer()
+            .plan_consolidate(result.get("shared-one").unwrap());
+        assert!(plan.is_empty());
+        assert!(
+            fx.installer()
+                .consolidate(&plan)
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        assert_eq!(before, listing(fx.home()));
     }
 
     // -- create ---------------------------------------------------------------

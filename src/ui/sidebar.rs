@@ -7,6 +7,7 @@ use gpui_kit::component::sidebar::{
 };
 use gpui_kit::component::{ActiveTheme as _, Collapsible as _, IconName};
 use gpui_kit::{App, Context, Div, IntoElement, ParentElement as _, Styled as _, Window, div, px};
+use skillbase_core::{AgentDef, Registry};
 
 use crate::app::Skillbase;
 
@@ -24,6 +25,7 @@ impl Skillbase {
     ) -> impl IntoElement {
         let scope = self.scope;
         let collapsed = self.sidebar_collapsed;
+        let in_settings = self.showing_settings;
         let scan = self.scan();
 
         let library = Library::ALL.map(|library| {
@@ -31,26 +33,45 @@ impl Skillbase {
             let total = scan.map(|scan| scan.count(target));
             SidebarMenuItem::new(library.label())
                 .icon(library_icon(library))
-                .active(scope == target)
+                .active(!in_settings && scope == target)
                 .suffix(move |_, cx| count_label(total, cx))
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.select_scope(target, window, cx)),
                 )
         });
 
-        // Only agents whose global directory exists. An agent that is not
-        // installed is hidden rather than greyed, per the specification.
+        // Only agents whose global directory exists, unless Settings says
+        // otherwise. An agent that is not installed is hidden rather than
+        // greyed, per SPEC §5.1; the "Show all agents" preference reveals the
+        // rest, and each one still says how many skills it would see.
+        let installed = scan.map(|scan| scan.installed.clone()).unwrap_or_default();
+        let listed: Vec<&'static AgentDef> = if self.preferences.show_all_agents {
+            Registry::all().iter().filter(|a| !a.is_shared()).collect()
+        } else {
+            installed.clone()
+        };
         let agents: Vec<_> =
-            scan.map(|scan| scan.installed.clone())
-                .unwrap_or_default()
+            listed
                 .into_iter()
                 .map(|agent| {
                     let target = Scope::Agent(agent.id);
                     let total = scan.map(|scan| scan.count(target));
+                    // An agent with no directory is shown in the muted weight the
+                    // counts use, so the row does not claim the agent is here.
+                    let absent = scan.is_some() && !installed.contains(&agent);
                     SidebarMenuItem::new(agent.display_name)
                         .icon(IconName::Bot)
-                        .active(scope == target)
-                        .suffix(move |_, cx| count_label(total, cx))
+                        .active(!in_settings && scope == target)
+                        .suffix(move |_, cx| {
+                            if absent {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("not installed")
+                            } else {
+                                count_label(total, cx)
+                            }
+                        })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.select_scope(target, window, cx)
                         }))
@@ -61,7 +82,8 @@ impl Skillbase {
             .child(
                 SidebarMenuItem::new("Settings")
                     .icon(IconName::Settings)
-                    .on_click(|_, _, _| {}),
+                    .active(in_settings)
+                    .on_click(cx.listener(|this, _, _, cx| this.show_settings(cx))),
             )
             .collapsed(collapsed)
             .render("settings", window, cx);

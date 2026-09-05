@@ -8,9 +8,10 @@
 use std::rc::Rc;
 
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::sidebar::SidebarToggleButton;
-use gpui_kit::component::{ActiveTheme as _, Root, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Root, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
@@ -20,7 +21,7 @@ use skillbase_core::Roots;
 
 use crate::ui::detail::{DetailEvent, DetailPane};
 use crate::ui::list::{LIST_MAX_WIDTH, LIST_MIN_WIDTH, LIST_WIDTH};
-use crate::ui::model::{Library, Scan, Scope, resolve_roots};
+use crate::ui::model::{Library, Preferences, Scan, Scope, resolve_roots};
 
 /// Where the scan has got to. A scan of every scope on a busy machine takes
 /// long enough that the first paint must not wait for it.
@@ -42,6 +43,13 @@ pub struct Skillbase {
     pub(crate) scope: Scope,
     pub(crate) selected: Option<SharedString>,
     pub(crate) sidebar_collapsed: bool,
+    /// True while the Settings pane has the work area. The scope and the
+    /// selection are left as they were, so closing Settings comes back to the
+    /// same skill.
+    pub(crate) showing_settings: bool,
+    /// What the user chose last time. Read once at startup and written back on
+    /// every change.
+    pub(crate) preferences: Preferences,
     pub(crate) search: Entity<InputState>,
     /// The New skill dialog's two fields. Held here rather than rebuilt each
     /// time the dialog opens, because the dialog's content builder is called on
@@ -66,6 +74,11 @@ impl Skillbase {
             Ok((roots, overridden)) => (roots.clone(), *overridden),
             Err(_) => (Roots::new(std::path::PathBuf::from("/")), false),
         };
+
+        // One small file, read once, before the first paint. A background hop
+        // would make the sidebar's first frame disagree with the preference and
+        // then jump.
+        let preferences = Preferences::load(&roots);
 
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search skills"));
         let new_name = cx.new(|cx| InputState::new(window, cx).placeholder("my-new-skill"));
@@ -93,6 +106,8 @@ impl Skillbase {
             scope: Scope::Library(Library::All),
             selected: None,
             sidebar_collapsed: false,
+            showing_settings: false,
+            preferences,
             search,
             new_name,
             new_description,
@@ -195,7 +210,11 @@ impl Skillbase {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let was_showing_settings = std::mem::take(&mut self.showing_settings);
         if self.scope == scope {
+            if was_showing_settings {
+                cx.notify();
+            }
             return;
         }
         self.scope = scope;
@@ -240,6 +259,51 @@ impl Skillbase {
         cx.notify();
     }
 
+    /// Give the work area to Settings.
+    pub(crate) fn show_settings(&mut self, cx: &mut Context<Self>) {
+        if self.showing_settings {
+            return;
+        }
+        self.showing_settings = true;
+        cx.notify();
+    }
+
+    /// Turn the "Show all agents" preference on or off and write it back.
+    ///
+    /// The sidebar changes immediately; the write is a background task, and a
+    /// failure is reported rather than swallowed, because a preference that
+    /// silently fails to stick is worse than one that is not offered.
+    pub(crate) fn set_show_all_agents(
+        &mut self,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preferences.show_all_agents == on {
+            return;
+        }
+        self.preferences.show_all_agents = on;
+        cx.notify();
+
+        let preferences = self.preferences;
+        let roots = self.roots.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let written = cx
+                .background_spawn(async move { preferences.save(&roots) })
+                .await;
+            if let Err(error) = written {
+                cx.update(|window, cx| {
+                    window.push_notification(
+                        Notification::error(error.to_string()).title("Could not save the setting"),
+                        cx,
+                    );
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         cx.notify();
@@ -268,7 +332,11 @@ impl Skillbase {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(self.scope.title()),
+                            .child(if self.showing_settings {
+                                "Settings"
+                            } else {
+                                self.scope.title()
+                            }),
                     )
                     .when(self.home_overridden, |this| {
                         // Every mutation lands under this directory, so it is
@@ -303,7 +371,17 @@ impl Render for Skillbase {
                     .min_h_0()
                     .items_stretch()
                     .child(self.render_sidebar(window, cx))
-                    .child(
+                    .child(if self.showing_settings {
+                        // Settings replaces the list and the detail pane
+                        // together: it is a whole view of the machine, not a
+                        // property of the selected skill.
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.render_settings(cx))
+                    } else {
                         div().flex().flex_1().min_w_0().h_full().child(
                             h_resizable("panes")
                                 .with_state(&self.panes)
@@ -315,8 +393,8 @@ impl Render for Skillbase {
                                         .child(self.render_skill_list(window, cx)),
                                 )
                                 .child(resizable_panel().h_full().child(self.detail.clone())),
-                        ),
-                    ),
+                        )
+                    }),
             )
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))

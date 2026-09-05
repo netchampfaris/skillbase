@@ -6,12 +6,13 @@
 //! task, never from `render`.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::SharedString;
 use skillbase_core::{
     AgentDef, DisableMode, DiscoveredSkill, Discovery, Location, LocationKind, Registry, Roots,
-    SHARED_ID, SkillError,
+    SHARED_ID, STORE_ID, SkillError,
 };
 
 /// Environment variable that points Skillbase at a different home directory.
@@ -31,6 +32,92 @@ pub fn resolve_roots() -> Result<(Roots, bool), SkillError> {
         Some(home) if !home.is_empty() => Ok((Roots::new(PathBuf::from(home)), true)),
         _ => Ok((Roots::discover()?, false)),
     }
+}
+
+/// The file the "Show all agents" preference is kept in.
+///
+/// It sits beside the store rather than in the platform's configuration
+/// directory, so that it travels with [`HOME_OVERRIDE_ENV`]: a run against a
+/// throwaway home gets its own preferences and cannot rewrite the real ones.
+pub const SETTINGS_FILE: &str = ".skillbase/settings.json";
+
+/// The preferences Skillbase keeps between runs.
+///
+/// One boolean today. It is written as JSON so the file is readable and can
+/// grow keys later without a format change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Preferences {
+    /// Show every agent in the sidebar, including those with no directory on
+    /// this machine. Off by default, per SPEC §5.1.
+    pub show_all_agents: bool,
+}
+
+impl Preferences {
+    /// Where the file lives under this home.
+    pub fn path(roots: &Roots) -> PathBuf {
+        roots.home().join(SETTINGS_FILE)
+    }
+
+    /// Reads the preferences, falling back to the defaults for anything the
+    /// file does not say.
+    ///
+    /// A missing, unreadable or malformed file is not an error worth
+    /// interrupting the user for: it means "no preference expressed".
+    pub fn load(roots: &Roots) -> Self {
+        let text = fs::read_to_string(Self::path(roots)).unwrap_or_default();
+        Self {
+            show_all_agents: json_bool(&text, "show_all_agents").unwrap_or(false),
+        }
+    }
+
+    /// Writes the preferences, creating `~/.skillbase` if it is missing.
+    ///
+    /// Blocking. Call it from a background task.
+    pub fn save(&self, roots: &Roots) -> std::io::Result<PathBuf> {
+        let path = Self::path(roots);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            &path,
+            format!("{{\n  \"show_all_agents\": {}\n}}\n", self.show_all_agents),
+        )?;
+        Ok(path)
+    }
+}
+
+/// Reads one top-level boolean out of the settings file.
+///
+/// Deliberately narrow: it understands exactly what [`Preferences::save`]
+/// writes — `"key": true` — and treats everything else as absent rather than
+/// as an error. A whole JSON parser would be a dependency bought for one
+/// boolean.
+fn json_bool(text: &str, key: &str) -> Option<bool> {
+    let quoted = format!("\"{key}\"");
+    let rest = text.split_once(&quoted)?.1;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// One directory Skillbase reads, and whether it is there.
+///
+/// This is the "where does all this actually live" answer the Settings pane
+/// gives. The `exists` flag is read once, on the scan's background thread,
+/// because `render` may not touch the filesystem.
+#[derive(Clone, Debug)]
+pub struct DirStatus {
+    /// The scope id: [`STORE_ID`], or an agent id.
+    pub id: &'static str,
+    /// What to call it on screen.
+    pub label: SharedString,
+    pub path: PathBuf,
+    pub exists: bool,
 }
 
 /// The rows of the sidebar's Library group.
@@ -225,6 +312,9 @@ pub struct Scan {
     /// Agents whose global directory exists on this machine, in registry
     /// order, without the shared scope.
     pub installed: Vec<&'static AgentDef>,
+    /// Every directory the scan looked in, and whether it is there: the store
+    /// first, then the shared directory, then one row per agent.
+    pub dirs: Vec<DirStatus>,
     /// How many skills each agent can see, by id.
     pub agent_counts: HashMap<&'static str, usize>,
     /// How many skills each Library row lists, in [`Library::ALL`] order.
@@ -247,6 +337,23 @@ impl Scan {
             .filter(|agent| roots.agent_dir(agent).is_dir())
             .collect::<Vec<_>>();
 
+        let store = roots.store_dir();
+        let mut dirs = vec![DirStatus {
+            id: STORE_ID,
+            label: "Skillbase store".into(),
+            exists: store.is_dir(),
+            path: store,
+        }];
+        dirs.extend(Registry::all().iter().map(|agent| {
+            let path = roots.agent_dir(agent);
+            DirStatus {
+                id: agent.id,
+                label: agent.display_name.into(),
+                exists: path.is_dir(),
+                path,
+            }
+        }));
+
         let skills: Vec<SkillView> = result
             .skills
             .iter()
@@ -262,6 +369,7 @@ impl Scan {
             skills,
             warnings: result.warnings.iter().map(SharedString::from).collect(),
             installed,
+            dirs,
             agent_counts,
             library_counts,
         }
@@ -354,5 +462,38 @@ pub fn display_path(path: &Path, roots: &Roots) -> SharedString {
     match path.strip_prefix(roots.home()) {
         Ok(rest) => format!("~/{}", rest.display()).into(),
         Err(_) => path.display().to_string().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_settings_reader_understands_what_the_writer_writes() {
+        let written = format!("{{\n  \"show_all_agents\": {}\n}}\n", true);
+        assert_eq!(json_bool(&written, "show_all_agents"), Some(true));
+        let written = format!("{{\n  \"show_all_agents\": {}\n}}\n", false);
+        assert_eq!(json_bool(&written, "show_all_agents"), Some(false));
+    }
+
+    #[test]
+    fn a_missing_or_malformed_setting_reads_as_no_preference() {
+        for text in [
+            "",
+            "{}",
+            "not json at all",
+            "{\"show_all_agents\": \"yes\"}",
+            "{\"show_all_agents\":}",
+            "{\"other\": true}",
+        ] {
+            assert_eq!(json_bool(text, "show_all_agents"), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn whitespace_around_the_colon_does_not_matter() {
+        assert_eq!(json_bool("{\"a\"   :   true}", "a"), Some(true));
+        assert_eq!(json_bool("{\"a\":true}", "a"), Some(true));
     }
 }
