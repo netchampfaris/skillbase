@@ -515,19 +515,25 @@ bundles, but resolves the bytes behind each name through whatever `AssetSource`
 the application registered, and there is one source per application with no
 chaining. `src/assets.rs` therefore registers a source that serves
 `assets/icons/**` and delegates anything it does not hold to
-`gpui_kit::assets::Assets`. That directory holds a Phosphor icon
-(`@phosphor-icons/core` 2.1.1, MIT) under every one of those 101 names, so the
-enum keeps Lucide's vocabulary — `Search`, `TriangleAlert` — while the artwork
-is Phosphor throughout, and no call site changed.
+`gpui_kit::assets::Assets`. That directory holds a HugeIcons glyph
+(`@hugeicons/core-free-icons` 4.3.0, MIT) under every one of those 101 names, so
+the enum keeps Lucide's vocabulary — `Search`, `TriangleAlert` — while the
+artwork is HugeIcons throughout, and no call site changed.
 
-The weight is duotone, and it survives GPUI's SVG pipeline. GPUI rasterises an
-SVG to an alpha mask and tints it with one colour, discarding every hue in the
-file; Phosphor's duotone weight is one
-colour at two opacities, so the secondary path's `opacity="0.2"` comes through
-the mask as 20% alpha of the theme colour, in light and dark alike. Ten names
-have no Phosphor equivalent and are drawn by hand in Phosphor's geometry.
-`assets/icons/SOURCES.md` records every mapping, every deliberate deviation, and
-every hand-drawn file.
+The variant is stroke-rounded, and it survives GPUI's SVG pipeline. GPUI
+rasterises an SVG to an alpha mask and tints it with one colour, discarding every
+hue in the file, so a set works here only if its shapes carry no colour of their
+own. Every path in this one is `fill="none"` with a `stroke="currentColor"` at
+1.5 units on a 24-unit grid, which reaches the mask as an opaque stroke on a
+transparent ground and is painted in the theme colour, light and dark alike. The
+package ships ES modules rather than SVG files, so each file was generated from
+its module with the attribute names rewritten to SVG's; the geometry is
+verbatim. Every one of the 101 names has a real glyph, so unlike the Phosphor set
+this replaces, nothing is hand-drawn. `assets/icons/SOURCES.md` records every
+mapping and every deliberate deviation — chiefly `panel-left-open` and
+`panel-left-close`, where HugeIcons attaches the two names to the opposite
+chevrons and the artwork is matched to the Lucide name rather than the HugeIcons
+one.
 
 Agent brand marks are separate. They live in `assets/icons/agents/<id>.svg`, are
 not part of the generated enum, and are reached by path through

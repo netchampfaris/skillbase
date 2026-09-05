@@ -129,12 +129,12 @@ filesystem behaviour can be exercised without a window.
 
 ## Icons
 
-The Lucide set bundled with `gpui-kit` is replaced wholesale by Phosphor duotone
-(`@phosphor-icons/core` 2.1.1, MIT). Skillbase registers its own `AssetSource`,
-which serves `assets/icons` and hands anything it does not hold to the
-framework's; the 101 file names match one for one, so no code changed. Ten
-glyphs have no Phosphor equivalent and are drawn by hand in the same geometry.
-`assets/icons/SOURCES.md` records the mapping.
+The Lucide set bundled with `gpui-kit` is replaced wholesale by HugeIcons in its
+stroke-rounded variant (`@hugeicons/core-free-icons` 4.3.0, MIT). Skillbase
+registers its own `AssetSource`, which serves `assets/icons` and hands anything
+it does not hold to the framework's; the 101 file names match one for one, so no
+code changed. `assets/icons/SOURCES.md` records the mapping, including the few
+places where the two sets disagree about which name goes with which glyph.
 
 The agent logos in `assets/icons/agents` are SVG files from Simple Icons (CC0)
 and lobe-icons (MIT), but the logos themselves are trademarks of their owners

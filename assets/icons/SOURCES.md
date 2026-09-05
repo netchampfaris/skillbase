@@ -7,163 +7,156 @@ name here must match a file name in
 
 ## Upstream
 
-- **Phosphor Icons**, `@phosphor-icons/core` version **2.1.1**, *duotone* weight
-  (one file, `star-fill.svg`, uses the *fill* weight instead).
-- Fetched from `https://cdn.jsdelivr.net/npm/@phosphor-icons/core@2.1.1/assets/duotone/<name>-duotone.svg`.
-- Licence: **MIT** — <https://github.com/phosphor-icons/core/blob/main/LICENSE>
-- Project: <https://phosphoricons.com>
+- **HugeIcons**, `@hugeicons/core-free-icons` version **4.3.0**, the
+  *stroke-rounded* variant, which is the package's default export.
+- Licence: **MIT** — <https://github.com/hugeicons/hugeicons-react/blob/main/LICENSE>
+- Project: <https://hugeicons.com>
 
-Phosphor artwork is copied verbatim: `viewBox="0 0 256 256"`, `fill="currentColor"`,
-one path at `opacity="0.2"` and one solid path. No `width`/`height` attributes, no
-hex colours, no `<style>`, no `url(...)`.
+The package ships icons as ES modules — arrays of `[tag, attributes]` pairs — not
+as SVG files, so each file here was generated from its module: the attributes are
+rewritten from React's camelCase to SVG's kebab-case and wrapped in
+`<svg viewBox="0 0 24 24" fill="none">`. The geometry is copied verbatim.
+Every path is `stroke="currentColor"` at `stroke-width="1.5"` with round caps and
+joins. No `width`/`height` attributes, no hex colours, no `<style>`, no `url(...)`.
+
+One file deviates: `star-fill.svg` is `Star` with `fill="currentColor"` added,
+because the free set has no solid star and the slot exists to sit beside `star`
+as its filled counterpart.
+
+Every one of the 101 names has a real HugeIcons glyph. Nothing here is
+hand-authored, which was not true of the Phosphor set this replaces.
 
 ## Name mapping
 
 `gpui-kit` names are Lucide names; the file name is what `icons/<name>.svg`
-resolves to at runtime.
+resolves to at runtime. HugeIcons names are the module's, minus the `Icon`
+suffix.
 
-| gpui-kit / Lucide name | Phosphor icon |
-| --- | --- |
-| `a-large-small` | `text-aa` |
-| `arrow-down` | `arrow-down` |
-| `arrow-left` | `arrow-left` |
-| `arrow-right` | `arrow-right` |
-| `arrow-up` | `arrow-up` |
-| `asterisk` | `asterisk` |
-| `battery` | `battery-empty` |
-| `battery-charging` | `battery-charging` |
-| `battery-full` | `battery-full` |
-| `battery-low` | `battery-low` |
-| `battery-medium` | `battery-medium` |
-| `battery-warning` | `battery-warning` |
-| `bell` | `bell` |
-| `book-open` | `book-open` |
-| `bot` | `robot` |
-| `building-2` | `buildings` |
-| `calendar` | `calendar-blank` |
-| `case-sensitive` | `text-aa` |
-| `chart-pie` | `chart-pie-slice` |
-| `check` | `check` |
-| `chevron-down` | `caret-down` |
-| `chevron-left` | `caret-left` |
-| `chevron-right` | `caret-right` |
-| `chevron-up` | `caret-up` |
-| `chevrons-up-down` | `caret-up-down` |
-| `circle-check` | `check-circle` |
-| `circle-user` | `user-circle` |
-| `circle-x` | `x-circle` |
-| `close` | `x` |
-| `copy` | `copy` |
-| `cpu` | `cpu` |
-| `dash` | `minus` |
-| `delete` | `trash` |
-| `ellipsis` | `dots-three` |
-| `ellipsis-vertical` | `dots-three-vertical` |
-| `external-link` | `arrow-square-out` |
-| `eye` | `eye` |
-| `eye-off` | `eye-slash` |
-| `file` | `file` |
-| `file-text` | `file-text` |
-| `folder` | `folder` |
-| `folder-closed` | `folder` |
-| `folder-open` | `folder-open` |
-| `frame` | `frame-corners` |
-| `gallery-vertical-end` | `stack` |
-| `github` | `github-logo` |
-| `globe` | `globe` |
-| `hard-drive` | `hard-drive` |
-| `heart` | `heart` |
-| `heart-off` | `heart-break` |
-| `inbox` | `tray` |
-| `info` | `info` |
-| `layout-dashboard` | `squares-four` |
-| `loader` | `spinner-gap` |
-| `loader-circle` | `circle-notch` |
-| `map` | `map-trifold` |
-| `maximize` | `corners-out` |
-| `memory-stick` | `memory` |
-| `menu` | `list` |
-| `minimize` | `corners-in` |
-| `minus` | `minus` |
-| `moon` | `moon` |
-| `network` | `network` |
-| `palette` | `palette` |
-| `panel-left` | `sidebar-simple` |
-| `pause` | `pause` |
-| `play` | `play` |
-| `plus` | `plus` |
-| `redo` | `arrow-arc-right` |
-| `redo-2` | `arrow-u-up-right` |
-| `replace` | `swap` |
-| `rotate-cw` | `arrow-clockwise` |
-| `search` | `magnifying-glass` |
-| `settings` | `gear` |
-| `settings-2` | `sliders-horizontal` |
-| `sort-ascending` | `sort-ascending` |
-| `sort-descending` | `sort-descending` |
-| `square-terminal` | `terminal-window` |
-| `star` | `star` |
-| `star-fill` | `star (fill weight)` |
-| `sun` | `sun` |
-| `thumbs-down` | `thumbs-down` |
-| `thumbs-up` | `thumbs-up` |
-| `triangle-alert` | `warning` |
-| `undo` | `arrow-arc-left` |
-| `undo-2` | `arrow-u-up-left` |
-| `user` | `user` |
-| `window-close` | `x` |
-| `window-maximize` | `square` |
-| `window-minimize` | `minus` |
-| `window-restore` | `copy` |
-| `inspector` | *hand-authored* |
-| `panel-bottom` | *hand-authored* |
-| `panel-bottom-open` | *hand-authored* |
-| `panel-left-close` | *hand-authored* |
-| `panel-left-open` | *hand-authored* |
-| `panel-right` | *hand-authored* |
-| `panel-right-close` | *hand-authored* |
-| `panel-right-open` | *hand-authored* |
-| `resize-corner` | *hand-authored* |
-| `star-off` | *hand-authored* |
+| gpui-kit / Lucide name | HugeIcons icon | Note |
+| --- | --- | --- |
+| `a-large-small` | `ALargeSmall` | |
+| `arrow-down` | `ArrowDown02` | `…01` is a chevron; the arrows are the `…02` family |
+| `arrow-left` | `ArrowLeft02` | |
+| `arrow-right` | `ArrowRight02` | |
+| `arrow-up` | `ArrowUp02` | |
+| `asterisk` | `Asterisk02` | bare `Asterisk` wraps it in a badge |
+| `battery` | `BatteryEmpty` | shares its body and terminal with the other five |
+| `battery-charging` | `BatteryCharging01` | |
+| `battery-full` | `BatteryFull` | |
+| `battery-low` | `BatteryLow` | |
+| `battery-medium` | `BatteryMedium01` | two bars, between Low's one and Full's three |
+| `battery-warning` | `BatteryWarning` | |
+| `bell` | `Bell` | |
+| `book-open` | `BookOpen01` | |
+| `bot` | `Bot` | |
+| `building-2` | `Building` | a main block with a lower annex, so it reads as plural |
+| `calendar` | `Calendar04` | the only variant with a blank interior |
+| `case-sensitive` | `CaseSensitive` | |
+| `chart-pie` | `PieChart` | |
+| `check` | `Check` | |
+| `chevron-down` | `ChevronDown` | |
+| `chevron-left` | `ChevronLeft` | |
+| `chevron-right` | `ChevronRight` | |
+| `chevron-up` | `ChevronUp` | |
+| `chevrons-up-down` | `UnfoldMore` | |
+| `circle-check` | `CircleCheck` | |
+| `circle-user` | `UserCircle` | |
+| `circle-x` | `CircleX` | |
+| `close` | `Cancel01` | two crossing strokes; `X` draws four from the centre |
+| `copy` | `Copy` | |
+| `cpu` | `Cpu` | |
+| `dash` | `Minus` | |
+| `delete` | `Delete02` | |
+| `ellipsis` | `Ellipsis` | |
+| `ellipsis-vertical` | `EllipsisVertical` | |
+| `external-link` | `ExternalLink` | |
+| `eye` | `Eye` | |
+| `eye-off` | `EyeOff` | |
+| `file` | `FileEmpty02` | same outline as `FileText`; `…01` folds the other corner |
+| `file-text` | `FileText` | |
+| `folder` | `Folder01` | |
+| `folder-closed` | `FolderClosed` | |
+| `folder-open` | `FolderOpen` | |
+| `frame` | `Frame` | Lucide's `#`, not the corner brackets Phosphor used |
+| `gallery-vertical-end` | `GalleryVerticalEnd` | |
+| `github` | `Github` | |
+| `globe` | `Globe02` | bare `Globe` sits on a desk stand |
+| `hard-drive` | `HardDrive` | |
+| `heart` | `Heart` | |
+| `heart-off` | `HeartOff` | |
+| `inbox` | `Inbox` | |
+| `info` | `Info` | |
+| `inspector` | `SquareDashedMousePointer` | |
+| `layout-dashboard` | `LayoutDashboard` | |
+| `loader` | `Loader` | |
+| `loader-circle` | `LoaderCircle` | |
+| `map` | `Map` | |
+| `maximize` | `ArrowExpand01` | |
+| `memory-stick` | `MemoryStick` | |
+| `menu` | `Menu01` | bare `Menu` boxes the lines in |
+| `minimize` | `ArrowShrink02` | |
+| `minus` | `Minus` | |
+| `moon` | `Moon02` | the crescent; bare `Moon` is a cratered sphere |
+| `network` | `Network` | |
+| `palette` | `Palette` | |
+| `panel-bottom` | `PanelBottom` | |
+| `panel-bottom-open` | `PanelBottomOpen` | |
+| `panel-left` | `PanelLeft` | |
+| `panel-left-close` | `PanelLeftOpen` | swapped; see below |
+| `panel-left-open` | `PanelLeftClose` | swapped; see below |
+| `panel-right` | `PanelRight` | |
+| `panel-right-close` | `PanelRightClose` | |
+| `panel-right-open` | `PanelRightOpen` | |
+| `pause` | `Pause` | |
+| `play` | `Play` | |
+| `plus` | `Plus` | |
+| `redo` | `Redo02` | the arc; bare `Redo` closes into a refresh circle |
+| `redo-2` | `Redo03` | the u-turn |
+| `replace` | `Replace` | |
+| `resize-corner` | `ResizeField` | `Resize01`/`Resize02` are hand gestures |
+| `rotate-cw` | `Refresh` | `RotateCw` and `RotateClockwise` are half-dashed |
+| `search` | `Search01` | |
+| `settings` | `Settings01` | |
+| `settings-2` | `SlidersHorizontal` | |
+| `sort-ascending` | `ArrowUpNarrowWide` | |
+| `sort-descending` | `ArrowDownWideNarrow` | |
+| `square-terminal` | `SquareTerminal` | |
+| `star` | `Star` | |
+| `star-fill` | `Star` | filled; see above |
+| `star-off` | `StarOff` | |
+| `sun` | `Sun03` | straight rays; `Sun01` uses dots, `Sun02` flourishes |
+| `thumbs-down` | `ThumbsDown` | |
+| `thumbs-up` | `ThumbsUp` | |
+| `triangle-alert` | `TriangleAlert` | |
+| `undo` | `Undo02` | |
+| `undo-2` | `Undo03` | |
+| `user` | `User` | |
+| `window-close` | `Cancel01` | |
+| `window-maximize` | `Square` | |
+| `window-minimize` | `Minus` | |
+| `window-restore` | `Copy01` | |
 
-### Deliberate deviations from a literal Lucide match
+### Deliberate deviations from a literal name match
 
-- `delete` — Lucide's `delete` glyph is a backspace key. Phosphor `trash` is used
-  instead, because `IconName::Delete` is what application code reaches for when it
-  wants a destructive-delete affordance and this set has no other trash glyph.
-- `a-large-small` and `case-sensitive` both map to `text-aa`; Phosphor has no
-  second "Aa" variant that keeps the meaning.
-- `folder` and `folder-closed` both map to `folder`.
-- `close` and `window-close` both map to `x`; `dash` and `minus` both map to `minus`.
-- `sort-ascending` / `sort-descending` use Phosphor's own glyphs, which show the
-  arrow pointing the opposite way to the Lucide chevrons they replace. This is
-  Phosphor's convention for those words and it is kept.
-
-## Hand-authored files
-
-Ten files have no Phosphor equivalent. All are drawn in Phosphor's geometry:
-`viewBox="0 0 256 256"`, a 16-unit line weight, 8-unit corner radii on the
-duotone layer, `currentColor` throughout. Carets and free strokes are drawn as
-`stroke-width="16"` round-capped paths so their weight matches the filled Phosphor
-outlines exactly.
-
-- **`inspector.svg`** — Phosphor `selection` (dashed frame) with the `cursor` fill-weight pointer scaled to 46% and centred inside it.
-- **`panel-bottom.svg`** — `sidebar-simple` window redrawn with a horizontal divider at y=160 and the bottom band filled at 0.2.
-- **`panel-bottom-open.svg`** — panel-bottom plus an upward caret in the main region.
-- **`panel-left-close.svg`** — Phosphor `sidebar-simple` plus a left-pointing caret in the main region.
-- **`panel-left-open.svg`** — Phosphor `sidebar-simple` plus a right-pointing caret in the main region.
-- **`panel-right.svg`** — Phosphor `sidebar-simple` mirrored about x=128 (coordinates rewritten, arc sweep flags flipped).
-- **`panel-right-close.svg`** — Mirrored `sidebar-simple` plus a right-pointing caret in the main region.
-- **`panel-right-open.svg`** — Mirrored `sidebar-simple` plus a left-pointing caret in the main region.
-- **`resize-corner.svg`** — Three parallel diagonal strokes in the bottom-right corner, 16-unit round-capped, no 0.2 layer.
-- **`star-off.svg`** — Phosphor `star` duotone with a 16-unit slash from (48,40) to (208,216), matching the angle of Phosphor `eye-slash`.
-
-The eight `panel-*` files are one visually consistent family: the same rounded
-window outline from Phosphor `sidebar-simple`, the panel edge filled at
-`opacity="0.2"`, and a caret on the `-open` / `-close` variants pointing the way
-the panel will move.
-
-`window-close`, `window-minimize`, `window-maximize` and `window-restore` are not
-hand-drawn: real Phosphor icons (`x`, `minus`, `square`, `copy`) are already the
-correct title-bar glyphs. They are never rendered on macOS, which uses native
-traffic lights, but the files must exist so no icon path 404s.
+- **`panel-left-close` and `panel-left-open` take HugeIcons' opposite names.**
+  HugeIcons' `PanelLeftOpen` draws a left-pointing chevron and its
+  `PanelLeftClose` a right-pointing one, which is the reverse of Lucide. The
+  chevron is what the user reads, so the artwork is matched to the Lucide name
+  and the HugeIcons names are crossed. The right-hand pair agrees with Lucide
+  and is not crossed.
+- **`maximize` is `ArrowExpand01` but `minimize` is `ArrowShrink02`.** HugeIcons
+  numbers the two families in opposite order: `ArrowExpand01` and
+  `ArrowShrink02` share the top-right/bottom-left diagonal, and `…02` with `…01`
+  share the other. Making both `01` would give a pair whose arrows run on
+  different diagonals.
+- **`delete` is a bin, not Lucide's backspace key.** `IconName::Delete` is what
+  application code reaches for when it wants a destructive-delete affordance,
+  and this set has no other bin glyph.
+- **`arrow-*` uses the `…02` family.** `ArrowDown01` and the rest of the `…01`
+  family are byte-identical to the chevrons, so using them would leave the app
+  with no arrow at all.
+- `close` and `window-close` share `Cancel01`; `dash`, `minus` and
+  `window-minimize` share `Minus`; `star` and `star-fill` share `Star` at
+  different fills. Lucide draws each of those pairs the same way too.
+- `sort-ascending` and `sort-descending` use HugeIcons' arrow-plus-bars glyphs,
+  which carry the sort direction in the bar widths as well as the arrow.

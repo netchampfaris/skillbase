@@ -6,16 +6,17 @@
 //! is exactly one source per application and no chaining, so overriding the
 //! icon set means owning the source and delegating.
 //!
-//! `assets/icons` therefore holds a Phosphor duotone icon under every one of
-//! those 101 Lucide filenames. The enum keeps Lucide's vocabulary — `Search`,
-//! `TriangleAlert` — and the artwork is Phosphor throughout.
+//! `assets/icons` therefore holds a HugeIcons glyph under every one of those
+//! 101 Lucide filenames. The enum keeps Lucide's vocabulary — `Search`,
+//! `TriangleAlert` — and the artwork is HugeIcons throughout, in its
+//! stroke-rounded variant.
 //!
-//! Two things make duotone work here. GPUI rasterises an SVG to an *alpha
-//! mask* and tints it with one colour, discarding every hue in the file; and
-//! Phosphor's duotone weight is a single colour at two opacities. The
-//! secondary path's `opacity="0.2"` survives the mask as 20% alpha, so the
-//! icon reads as duotone in whatever the theme's foreground happens to be, in
-//! light and dark alike.
+//! GPUI rasterises an SVG to an *alpha mask* and tints it with one colour,
+//! discarding every hue in the file, so an icon set survives the pipeline only
+//! if its shapes carry no colour of their own. These do: every path is
+//! `fill="none"` with a `stroke="currentColor"` at 1.5 units, which arrives as
+//! a fully opaque stroke on a transparent ground and comes out in whatever the
+//! theme's foreground happens to be, light and dark alike.
 //!
 //! `assets/icons/agents` holds the brand marks the sidebar uses, which are not
 //! part of the generated enum and are addressed by path.
