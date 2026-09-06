@@ -14,11 +14,13 @@ use gpui_kit::component::sidebar::SidebarToggleButton;
 use gpui_kit::component::{ActiveTheme as _, Root, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, Task, Window, div, px,
+    AnyElement, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window,
+    div, px,
 };
 use skillbase_core::{Roots, Usage};
 
+use crate::menus::{FindSkill, NewSkill, ReloadSkills, ShowSettings, ToggleSidebar};
 use crate::ui::detail::{DetailEvent, DetailPane};
 use crate::ui::list::{LIST_MAX_WIDTH, LIST_MIN_WIDTH, LIST_WIDTH};
 use crate::ui::model::{Library, Preferences, Scan, Scope, SkillSort, resolve_roots};
@@ -63,6 +65,17 @@ pub struct Skillbase {
     pub(crate) new_description: Entity<TextareaState>,
     detail: Entity<DetailPane>,
     panes: Entity<ResizableState>,
+    /// Focus for the window as a whole, held so the menu bar's commands have
+    /// somewhere to land.
+    ///
+    /// An action handler is only reachable along the path from the dispatch
+    /// tree's root to whatever has focus. With nothing focused that path is
+    /// the root alone, every menu item that resolves to this view is drawn
+    /// greyed out, and its shortcut does nothing. Focusing the outermost
+    /// element puts this view on the path from the first frame, and it stays
+    /// there afterwards because everything else that takes focus sits inside
+    /// it.
+    focus: FocusHandle,
     /// Bumped on every scan so a result that arrives after a newer request is
     /// dropped rather than applied.
     generation: u64,
@@ -95,6 +108,9 @@ impl Skillbase {
         let detail = cx.new(|cx| DetailPane::new(roots.clone(), window, cx));
         let panes = cx.new(|_| ResizableState::default());
 
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+
         let subscriptions = vec![
             // Typing in the search field changes what the list shows.
             cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
@@ -120,6 +136,7 @@ impl Skillbase {
             new_description,
             detail,
             panes,
+            focus,
             generation: 0,
             _scan_task: None,
             _usage_task: None,
@@ -365,6 +382,19 @@ impl Skillbase {
         .detach();
     }
 
+    /// Put the caret in the search field.
+    ///
+    /// Find in a list-shaped application means the list's own filter, not the
+    /// framework's in-document search, which answers only once a text control
+    /// already has focus and so cannot be the way into one.
+    pub(crate) fn find_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The field lives in the list column, which is behind the settings
+        // sheet while that is up.
+        self.showing_settings = false;
+        self.search.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         cx.notify();
@@ -419,6 +449,23 @@ impl Render for Skillbase {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .text_sm()
+            .track_focus(&self.focus)
+            // The menu bar's own commands. They hang off the outermost element
+            // so that they are reachable whatever has focus, including from
+            // inside a dialog, and each one does exactly what the control that
+            // already offers it does.
+            .on_action(
+                cx.listener(|this, _: &NewSkill, window, cx| {
+                    this.open_new_skill_dialog(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ShowSettings, _, cx| this.show_settings(cx)))
+            .on_action(cx.listener(|this, _: &ReloadSkills, window, cx| {
+                this.rescan(None, window, cx);
+                this.count_usage(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &FindSkill, window, cx| this.find_skill(window, cx)))
             .child(
                 // `h_flex` centres its children, so every pane in this row asks
                 // for the full height explicitly.

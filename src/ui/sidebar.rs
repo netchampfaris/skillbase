@@ -115,13 +115,23 @@ impl Skillbase {
             .border_color(cx.theme().sidebar_border)
             .child(self.sidebar_identity_band(cx))
             .child(self.sidebar_name_band(cx))
+            // New skill sits above the scope list rather than inside it as a
+            // headingless first group. It is a command, not a destination, so
+            // it should not scroll away from the column it acts on — and out
+            // here it is spaced by this padding rather than by the padding the
+            // list puts around a section, which left it stranded between two
+            // gaps wider than the row itself.
+            .child(
+                div()
+                    .px_3()
+                    .child(scope_menu().child(new_skill).render("new", window, cx)),
+            )
             .child(
                 div().flex().flex_1().min_h_0().child(
                     Sidebar::new("scopes")
                         .w_full()
                         .border_r_0()
-                        .child(ScopeGroup::leading(vec![new_skill]))
-                        .child(ScopeGroup::new("Library", library))
+                        .child(ScopeGroup::new("Library", library).leading())
                         .child(ScopeGroup::new("Agents", agents))
                         // Settings goes into the footer as a bare menu rather
                         // than wrapped in `SidebarFooter`. That wrapper adds its
@@ -231,8 +241,6 @@ fn scope_menu() -> SidebarMenu {
 /// which the run of commands at the top does not want.
 #[derive(Clone)]
 struct ScopeGroup {
-    /// `None` for the group of commands at the top, which is short enough and
-    /// distinct enough that a heading would only name what the row says.
     label: Option<SharedString>,
     items: Vec<SidebarMenuItem>,
     /// True for the group at the top, which needs no space above it.
@@ -250,13 +258,11 @@ impl ScopeGroup {
         }
     }
 
-    fn leading(items: Vec<SidebarMenuItem>) -> Self {
-        Self {
-            label: None,
-            items,
-            leading: true,
-            collapsed: false,
-        }
+    /// Mark the group as the first one, which needs no space above it: the
+    /// list already pads its first item.
+    fn leading(mut self) -> Self {
+        self.leading = true;
+        self
     }
 }
 
@@ -294,7 +300,7 @@ impl SidebarItem for ScopeGroup {
                         .flex()
                         .items_center()
                         .flex_shrink_0()
-                        .h_7()
+                        .h_6()
                         .px_2()
                         .text_xs()
                         .text_color(cx.theme().sidebar_foreground.opacity(0.7))

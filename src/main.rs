@@ -3,6 +3,7 @@
 mod accent;
 mod app;
 mod assets;
+mod menus;
 mod theme;
 mod ui;
 
@@ -30,6 +31,8 @@ fn main() {
                 // is worth reporting but not worth refusing to start over.
                 eprintln!("skillbase: {error:#}");
             }
+
+            menus::init(cx);
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(

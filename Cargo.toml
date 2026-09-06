@@ -32,9 +32,11 @@ rust-embed = "8"
 # in the lock file by way of `gpui`; this only widens the feature set.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
+objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSAppearance",
+    "NSApplication",
     "NSColor",
     "NSColorSpace",
     "NSResponder",

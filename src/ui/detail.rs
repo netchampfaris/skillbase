@@ -12,16 +12,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::input::{
-    Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
-};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -31,8 +29,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, EventEmitter, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px, rems,
+    IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, rems,
 };
 use skillbase_core::{
     AgentDef, ConsolidatePlan, DeletePlan, DisableMode, Duplicate, InstallError, Installer,
@@ -149,15 +147,17 @@ pub struct DetailPane {
     scan: Option<Rc<Scan>>,
     skill: Option<SkillView>,
     source: Source,
-    /// The frontmatter values as they were when the file was read, so that a
+    /// The frontmatter description as it was when the file was read, so that a
     /// form field can be told apart from one the user has not touched.
-    loaded_name: SharedString,
     loaded_description: SharedString,
     /// Everything in the skill directory, flattened depth-first. The rows the
     /// user clicks to open a file.
     tree: Vec<FileNode>,
     /// Which tab is showing.
     showing: Showing,
+    /// The tab strip's horizontal scroll, so that a tab the user has just
+    /// opened can be brought back into view when it lands past the right edge.
+    tab_scroll: ScrollHandle,
     /// The bundled files the user has opened, one editor each. `SKILL.md` is
     /// not among them: it has its own editor and its own save path.
     open: Vec<OpenFile>,
@@ -169,7 +169,6 @@ pub struct DetailPane {
     /// Bumped on every comparison, so one that lands after the selection moved
     /// on is dropped.
     duplicates_generation: u64,
-    name: Entity<InputState>,
     description: Entity<TextareaState>,
     body: Entity<EditorState>,
     dirty: bool,
@@ -185,7 +184,6 @@ impl EventEmitter<DetailEvent> for DetailPane {}
 
 impl DetailPane {
     pub fn new(roots: Roots, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder("kebab-case-name"));
         let description = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("What the skill does, and when an agent should load it.")
@@ -193,9 +191,6 @@ impl DetailPane {
         let body = cx.new(|cx| EditorState::new(window, cx).language("markdown"));
 
         let subscriptions = vec![
-            cx.subscribe(&name, |this, _, event: &InputEvent, cx| {
-                this.mark_edited(event, cx)
-            }),
             cx.subscribe(&description, |this, _, event: &InputEvent, cx| {
                 this.mark_edited(event, cx)
             }),
@@ -209,15 +204,14 @@ impl DetailPane {
             scan: None,
             skill: None,
             source: Source::Empty,
-            loaded_name: SharedString::default(),
             loaded_description: SharedString::default(),
             tree: Vec::new(),
             showing: Showing::Overview,
+            tab_scroll: ScrollHandle::new(),
             open: Vec::new(),
             duplicates: Duplicates::None,
             duplicates_generation: 0,
             visibility_open: false,
-            name,
             description,
             body,
             dirty: false,
@@ -255,6 +249,7 @@ impl DetailPane {
             // pane comes back to the Overview.
             self.open.clear();
             self.showing = Showing::Overview;
+            self.tab_scroll.scroll_to_item(0);
         }
 
         // The duplicate comparison is against the disk, not against the
@@ -285,7 +280,7 @@ impl DetailPane {
         let Some(skill) = self.skill.clone() else {
             self.source = Source::Empty;
             self.tree.clear();
-            self.set_fields("", "", "", window, cx);
+            self.set_fields("", "", window, cx);
             cx.notify();
             return;
         };
@@ -313,7 +308,7 @@ impl DetailPane {
                     Err(error) => {
                         this.tree.clear();
                         this.source = Source::Failed(error.to_string().into());
-                        this.set_fields("", "", "", window, cx);
+                        this.set_fields("", "", window, cx);
                         cx.notify();
                     }
                 }
@@ -378,31 +373,22 @@ impl DetailPane {
         cx.notify();
     }
 
-    /// Put the file into the editor and the two form fields.
+    /// Put the file into the editor and the Description field.
     fn adopt_source(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let parsed = SkillDoc::parse(text).ok();
-        let name = parsed
-            .as_ref()
-            .and_then(|doc| doc.frontmatter.name())
-            .unwrap_or_default()
-            .to_string();
-        let description = parsed
-            .as_ref()
-            .and_then(|doc| doc.frontmatter.description())
-            .unwrap_or_default()
-            .to_string();
+        let description = SkillDoc::parse(text)
+            .ok()
+            .and_then(|doc| doc.frontmatter.description().map(str::to_string))
+            .unwrap_or_default();
 
-        self.loaded_name = name.clone().into();
         self.loaded_description = description.clone().into();
         self.source = Source::Loaded;
         self.dirty = false;
-        self.set_fields(&name, &description, text, window, cx);
+        self.set_fields(&description, text, window, cx);
         cx.notify();
     }
 
     fn set_fields(
         &mut self,
-        name: &str,
         description: &str,
         body: &str,
         window: &mut Window,
@@ -410,9 +396,6 @@ impl DetailPane {
     ) {
         // `set_value` does not emit a change event, so loading never marks the
         // pane dirty.
-        self.name.update(cx, |state, cx| {
-            state.set_value(name.to_string(), window, cx)
-        });
         self.description.update(cx, |state, cx| {
             state.set_value(description.to_string(), window, cx)
         });
@@ -447,9 +430,7 @@ impl DetailPane {
         };
 
         let text = self.body.read(cx).value().to_string();
-        let name_field = self.name.read(cx).value().trim().to_string();
         let description_field = self.description.read(cx).value().to_string();
-        let name_edited = name_field != self.loaded_name.as_ref();
         let description_edited = description_field != self.loaded_description.as_ref();
         let dir = skill.origin.clone();
         let roots = self.roots.clone();
@@ -461,9 +442,6 @@ impl DetailPane {
             let written = cx
                 .background_spawn(async move {
                     let mut doc = SkillDoc::parse(&text)?;
-                    if name_edited {
-                        doc.frontmatter.set_name(&name_field);
-                    }
                     if description_edited {
                         doc.frontmatter.set_description(&description_field);
                     }
@@ -1559,12 +1537,11 @@ impl DetailPane {
                     .into_any_element()
             } else {
                 v_flex()
-                    // A skill with thirty reference files would otherwise push
-                    // everything below it off the tab. Past about a dozen rows
-                    // the list scrolls in place instead.
-                    .id("file-tree")
-                    .max_h(rems(19.))
-                    .overflow_y_scroll()
+                    // No height cap and no scrolling of its own. The tab around
+                    // it is already a scroll container, and a second one nested
+                    // inside means the wheel moves whichever of the two the
+                    // pointer happens to be over, which is not something the
+                    // user can predict.
                     .py_1()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().group_box)
@@ -1686,8 +1663,7 @@ impl DetailPane {
     /// skill is selected, and re-reading it would throw away an unsaved edit.
     fn open_file(&mut self, rel: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         if rel == SKILL_FILE_NAME || self.open.iter().any(|file| file.rel == rel) {
-            self.showing = Showing::File(rel);
-            cx.notify();
+            self.show_tab(Showing::File(rel), cx);
             return;
         }
         let Some(skill) = self.skill.clone() else {
@@ -1724,8 +1700,7 @@ impl DetailPane {
             error: None,
             _subscription: subscription,
         });
-        self.showing = Showing::File(rel.clone());
-        cx.notify();
+        self.show_tab(Showing::File(rel.clone()), cx);
 
         cx.spawn_in(window, async move |this, cx| {
             let read = cx
@@ -1799,6 +1774,10 @@ impl DetailPane {
             // is, so it is where the user goes next either way.
             self.showing = Showing::Overview;
         }
+        // Every tab to the right of the one that closed has moved a place, so
+        // the one still showing is put back in view.
+        self.tab_scroll
+            .scroll_to_item(self.tab_index(&self.showing));
         cx.notify();
     }
 
@@ -1863,6 +1842,14 @@ impl DetailPane {
     /// `SKILL.md` has a permanent tab because every skill has that file and
     /// editing it is what the pane is mostly for. The rest are opened from the
     /// Overview's file list and can be closed again.
+    ///
+    /// A row of ghost buttons rather than a `TabBar`. All this band has to say
+    /// is which tab is current, and a ghost button already says exactly that in
+    /// the same language as every other control in the pane: transparent until
+    /// it is hovered or selected, and a grey surface when it is. Every `TabBar`
+    /// variant insists on more than that — a trough behind the row, or a rule
+    /// under it — which would draw a second boundary immediately below the
+    /// header for no gain.
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut labels: Vec<(Showing, SharedString, bool, bool)> = vec![
             (Showing::Overview, "Overview".into(), self.dirty, false),
@@ -1882,81 +1869,101 @@ impl DetailPane {
             )
         }));
 
-        let selected = labels
-            .iter()
-            .position(|(showing, ..)| showing == &self.showing)
-            .unwrap_or(0);
-        let order: Vec<Showing> = labels.iter().map(|(showing, ..)| showing.clone()).collect();
-        let this = cx.entity().downgrade();
-
-        TabBar::new("detail-tabs")
-            // Segmented rather than the boxed default: the boxed variant marks
-            // the selected tab by weight alone against this theme, and the
-            // segmented one's trough gives this second band a shape of its own
-            // under the header without a rule between the two.
-            .segmented()
-            // Enough open files to overflow the pane get a dropdown rather
-            // than being clipped off the right edge. The trigger is drawn
-            // unconditionally, though, and inside the segmented trough it
-            // reads as a select rather than as an overflow, so it is asked for
-            // only once there are enough tabs to be worth one.
-            .menu(labels.len() > 4)
-            .selected_index(selected)
+        h_flex()
+            // Enough open files to overrun the pane scroll rather than being
+            // clipped off the right edge. The row carries no visible scrollbar,
+            // because a bar under a 24-pixel strip is thicker than the thing it
+            // measures; the tabs that are cut off are their own affordance.
+            .id("detail-tabs")
+            .track_scroll(&self.tab_scroll)
+            .flex_1()
+            .min_w_0()
+            .overflow_x_scroll()
+            .gap_1()
             .children(labels.into_iter().map(|(showing, label, dirty, closable)| {
-                Tab::new().label(label).suffix(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        // A fixed lane, so a tab does not resize when its dot
-                        // appears and the strip does not shuffle under the
-                        // pointer as the user types.
-                        .when(dirty, |this| {
-                            this.child(
-                                div()
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(cx.theme().muted_foreground),
-                            )
-                        })
-                        .when(closable, |this| {
-                            let Showing::File(rel) = showing.clone() else {
-                                return this;
-                            };
-                            this.child(
-                                div()
-                                    .id(ElementId::from((
-                                        ElementId::from("close-tab"),
-                                        rel.clone(),
-                                    )))
-                                    .flex_shrink_0()
-                                    .rounded(cx.theme().radius)
-                                    .hover(|this| this.bg(cx.theme().list_hover))
-                                    .child(
-                                        Icon::new(IconName::Close)
-                                            .xsmall()
-                                            .text_color(cx.theme().muted_foreground),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        // Without this the tab strip would also
-                                        // read the click and select the tab
-                                        // that is on its way out.
-                                        cx.stop_propagation();
-                                        this.close_file(rel.clone(), window, cx);
-                                    })),
-                            )
-                        }),
-                )
+                self.tab(showing, label, dirty, closable, cx)
             }))
-            .on_click(move |index, _, cx| {
-                let Some(showing) = order.get(*index).cloned() else {
-                    return;
+    }
+
+    /// One tab in the strip.
+    fn tab(
+        &self,
+        showing: Showing,
+        label: SharedString,
+        dirty: bool,
+        closable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = match &showing {
+            Showing::Overview => ElementId::from("detail-tab-overview"),
+            Showing::File(rel) => ElementId::from((ElementId::from("detail-tab"), rel.clone())),
+        };
+        let selected = self.showing == showing;
+        let target = showing.clone();
+
+        Button::new(id)
+            .ghost()
+            .small()
+            .selected(selected)
+            .label(label)
+            .child(
+                // A lane the dot sits in whether or not it is showing, so a tab
+                // does not resize the moment the user types and the strip does
+                // not shuffle under the pointer.
+                div().flex_shrink_0().size_1p5().when(dirty, |this| {
+                    this.rounded_full().bg(cx.theme().muted_foreground)
+                }),
+            )
+            .when(closable, |this| {
+                let Showing::File(rel) = showing else {
+                    return this;
                 };
-                this.update(cx, |this, cx| {
-                    this.showing = showing;
-                    cx.notify();
-                })
-                .ok();
+                this.child(
+                    div()
+                        .id(ElementId::from((ElementId::from("close-tab"), rel.clone())))
+                        .flex_shrink_0()
+                        .rounded(cx.theme().radius)
+                        .hover(|this| this.bg(cx.theme().list_hover))
+                        .child(
+                            Icon::new(IconName::Close)
+                                .xsmall()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // Without this the tab itself would also read the
+                            // click and select the tab that is on its way out.
+                            cx.stop_propagation();
+                            this.close_file(rel.clone(), window, cx);
+                        })),
+                )
             })
+            .on_click(cx.listener(move |this, _, _, cx| this.show_tab(target.clone(), cx)))
+            .into_any_element()
+    }
+
+    /// Show `showing`, bringing its tab into view.
+    ///
+    /// A file opened from the Overview's list gets its tab at the end of a
+    /// strip that may already be wider than the pane, and a selected tab the
+    /// user cannot see reads as nothing having happened.
+    fn show_tab(&mut self, showing: Showing, cx: &mut Context<Self>) {
+        self.tab_scroll.scroll_to_item(self.tab_index(&showing));
+        self.showing = showing;
+        cx.notify();
+    }
+
+    /// Where a tab sits in the strip. The Overview leads, `SKILL.md` follows,
+    /// and the opened files come after in the order they were opened.
+    fn tab_index(&self, showing: &Showing) -> usize {
+        match showing {
+            Showing::Overview => 0,
+            Showing::File(rel) if rel == SKILL_FILE_NAME => 1,
+            Showing::File(rel) => self
+                .open
+                .iter()
+                .position(|file| &file.rel == rel)
+                .map_or(0, |index| index + 2),
+        }
     }
 
     /// What a file's tab is called.
@@ -2274,7 +2281,6 @@ impl DetailPane {
     /// bottom of a column that had to be scrolled past the description, the
     /// switches and the duplicate list to reach. It now has a tab of its own.
     fn overview(&self, skill: &SkillView, cx: &mut Context<Self>) -> AnyElement {
-        let loading = matches!(self.source, Source::Loading);
         let read_error = match &self.source {
             Source::Failed(error) => Some(error.clone()),
             _ => None,
@@ -2314,8 +2320,8 @@ impl DetailPane {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
-                                    "The Name and Description fields stay empty until the \
-                                     frontmatter parses. Fix it in the SKILL.md tab and save.",
+                                    "The Description field stays empty until the frontmatter \
+                                     parses. Fix it in the SKILL.md tab and save.",
                                 ),
                         ),
                 )
@@ -2328,8 +2334,24 @@ impl DetailPane {
                         v_flex()
                             .gap_2()
                             .child(Label::new("Name"))
-                            .child(Input::new(&self.name).small().disabled(loading))
-                            .children(issue_lines(issues_for(&skill.issues, "name"), cx)),
+                            // Shown, not edited. Renaming a skill here would
+                            // write a `name:` that the directory around it no
+                            // longer agrees with, and a skill whose two names
+                            // disagree is the thing this pane spends the rest
+                            // of its length reporting. The SKILL.md tab still
+                            // edits the frontmatter for anyone who means it.
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(div().text_sm().truncate().child(skill.name.clone()))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("Rename it in the SKILL.md tab."),
+                                    )
+                                    .children(issue_lines(issues_for(&skill.issues, "name"), cx)),
+                            ),
                     )
                     .child(
                         v_flex()
