@@ -56,7 +56,7 @@ is an edit somebody made; overriding it takes one checkbox per directory.
 **Counts what you actually use.** The list sorts by name or by how often a
 skill has been invoked, and the choice sticks between runs. Only Claude Code
 and GitHub Copilot CLI leave a machine-readable record of an invocation — the
-other thirteen agents record nothing, so a zero there means "not measurable"
+other twelve agents record nothing, so a zero there means "not measurable"
 rather than "unused" — and Claude Code prunes its transcripts after 30 days, so
 the figure is recent history rather than a lifetime total. The sort menu says
 which agents were counted; Settings gives the per-source numbers and the
@@ -72,6 +72,8 @@ Skillbase will not fight it.
 ## Build
 
 ```sh
+git clone https://github.com/netchampfaris/skillbase.git
+cd skillbase
 cargo run
 ```
 
@@ -164,16 +166,20 @@ back something stale; switch to the Space holding the window, or set
 
 ## Layout
 
-| Path                | What it holds                                              |
-| ------------------- | ---------------------------------------------------------- |
-| `crates/core`       | Discovery, the agent registry, install operations, `SKILL.md` parsing. No GPUI. |
-| `src`               | The interface: sidebar, list, detail pane, settings.        |
-| `docs/SPEC.md`      | The design contract, including the full agent table.        |
-| `assets/themes`     | Light and dark theme definitions.                           |
-| `assets/icons`      | The icon set and the agent brand marks, each with a `SOURCES.md`. |
+| Path            | What it holds                                                                   |
+| --------------- | ------------------------------------------------------------------------------- |
+| `crates/core`   | Discovery, the agent registry, install operations, `SKILL.md` parsing. No GPUI. |
+| `src`           | The interface: sidebar, list, detail pane, settings.                            |
+| `docs/SPEC.md`  | The design contract, including the full agent table.                            |
+| `assets/themes` | Light and dark theme definitions.                                               |
+| `assets/icons`  | The icon set and the agent brand marks, each with a `SOURCES.md`.               |
 
 `crates/core` carries the tests. It has no dependency on the UI, so the
-filesystem behaviour can be exercised without a window.
+filesystem behaviour can be exercised without a window. Run them with:
+
+```sh
+cargo test --workspace
+```
 
 ## Icons
 
