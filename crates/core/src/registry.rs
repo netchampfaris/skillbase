@@ -18,20 +18,34 @@ use crate::error::SkillError;
 /// The vendor-neutral shared directory, relative to the home directory.
 pub const SHARED_SKILLS_DIR: &str = ".agents/skills";
 
-/// Skillbase's own store, relative to the home directory.
+/// Skillbase's store, relative to the home directory.
 ///
-/// A skill whose origin lives here is *managed*: Skillbase owns the bytes and
-/// may add or remove links to it freely.
-pub const STORE_DIR: &str = ".skillbase/store";
+/// The same directory as [`SHARED_SKILLS_DIR`], named twice because it is used
+/// for two things. As the store it is where Skillbase keeps the bytes of the
+/// skills it owns; as the shared directory it is what fourteen agents read. A
+/// skill whose origin lives here is *managed* and every agent that reads
+/// `~/.agents/skills` already sees it, with no link in between.
+pub const STORE_DIR: &str = SHARED_SKILLS_DIR;
+
+/// Where Skillbase keeps the origin of a skill hidden from the agents, relative
+/// to the home directory.
+///
+/// A managed skill whose Shared switch is off has its origin here instead of in
+/// [`STORE_DIR`]. Nothing reads this directory except Skillbase, so the skill
+/// is reachable only through the links agents hold to it.
+pub const PRIVATE_DIR: &str = ".skillbase/private";
 
 /// The id of the shared scope, which is the `~/.agents/skills` directory itself
 /// rather than an agent that reads it.
+///
+/// It is also the id a location in the store carries, because the store and the
+/// shared directory are one directory.
 pub const SHARED_ID: &str = "shared";
 
-/// The id used for locations found in Skillbase's own store.
+/// The id used for locations found in the private directory.
 ///
 /// It is not an agent id; no [`AgentDef`] carries it.
-pub const STORE_ID: &str = "store";
+pub const PRIVATE_ID: &str = "private";
 
 /// How an agent's global skills directory is derived from the home directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -406,14 +420,29 @@ impl Roots {
         &self.home
     }
 
-    /// `~/.agents/skills`.
+    /// `~/.agents/skills`, the vendor-neutral directory agents read.
+    ///
+    /// The same directory as [`Roots::store_dir`]. Call it this way when the
+    /// question is which agents can reach a skill.
     pub fn shared_dir(&self) -> PathBuf {
         self.home.join(SHARED_SKILLS_DIR)
     }
 
-    /// `~/.skillbase/store`.
+    /// `~/.agents/skills`, the directory Skillbase keeps the bytes in.
+    ///
+    /// The same directory as [`Roots::shared_dir`]. Call it this way when the
+    /// question is whether Skillbase owns the origin and may move it.
     pub fn store_dir(&self) -> PathBuf {
         self.home.join(STORE_DIR)
+    }
+
+    /// `~/.skillbase/private`, where the origin of a hidden skill sits.
+    ///
+    /// Skillbase owns this directory too, so a skill whose origin is here is
+    /// managed; it is simply out of the way of the agents that read
+    /// [`Roots::shared_dir`].
+    pub fn private_dir(&self) -> PathBuf {
+        self.home.join(PRIVATE_DIR)
     }
 
     /// `~/.codex/config.toml`.
@@ -433,11 +462,14 @@ impl Roots {
     }
 
     /// Every directory a destructive operation is allowed to touch: the store,
-    /// each agent's global directory, and each disabled directory.
+    /// the private directory, each agent's global directory, and each disabled
+    /// directory.
     ///
-    /// Deduplicated and in registry order, with the store first.
+    /// Deduplicated and in registry order, with the store first. The store is
+    /// also the shared scope's directory, so the shared entry adds nothing and
+    /// is dropped by the deduplication.
     pub fn scope_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![self.store_dir()];
+        let mut roots = vec![self.store_dir(), self.private_dir()];
         for agent in Registry::all() {
             let dir = self.agent_dir(agent);
             if !roots.contains(&dir) {
@@ -550,16 +582,28 @@ mod tests {
     }
 
     #[test]
+    fn the_store_is_the_shared_directory_and_private_sits_beside_it() {
+        let roots = Roots::new("/fake/home");
+        assert_eq!(roots.store_dir(), roots.shared_dir());
+        assert_eq!(roots.store_dir(), Path::new("/fake/home/.agents/skills"));
+        assert_eq!(
+            roots.private_dir(),
+            Path::new("/fake/home/.skillbase/private")
+        );
+    }
+
+    #[test]
     fn scope_roots_are_deduplicated_and_include_the_store_and_disabled_dirs() {
         let roots = Roots::new("/fake/home");
         let paths = roots.scope_roots();
-        assert_eq!(paths[0], Path::new("/fake/home/.skillbase/store"));
+        assert_eq!(paths[0], Path::new("/fake/home/.agents/skills"));
+        assert_eq!(paths[1], Path::new("/fake/home/.skillbase/private"));
         assert!(paths.contains(&PathBuf::from("/fake/home/.claude/skills-disabled")));
         let shared = PathBuf::from("/fake/home/.agents/skills");
         assert_eq!(
             paths.iter().filter(|p| **p == shared).count(),
             1,
-            "shared and Zed resolve to one directory, listed once"
+            "the store, the shared scope and Zed are one directory, listed once"
         );
         let mut sorted = paths.clone();
         sorted.sort();

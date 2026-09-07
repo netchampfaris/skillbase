@@ -24,6 +24,8 @@ gpui-kit = { version = "0.6", features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-toml",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
 ] }
 anyhow = "1"
 rust-embed = "8"

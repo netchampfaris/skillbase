@@ -12,20 +12,25 @@
 //! Nothing here reads the filesystem. Whether a directory exists comes from
 //! the scan, which runs on a background thread.
 
+use gpui_kit::component::button::Button;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use skillbase_core::{Registry, UNSUPPORTED};
+use skillbase_core::{GITHUB_TOKEN_ENV, Registry, TokenSource, UNSUPPORTED};
 
-use crate::app::{ScanState, Skillbase};
+use crate::app::{ScanState, Skillbase, UpdateState};
 
-use super::model::{DirStatus, HOME_OVERRIDE_ENV, Preferences, display_path};
+use super::PAGE_MAX_WIDTH;
+use super::model::{DirStatus, HOME_OVERRIDE_ENV, Preferences, display_path, in_words};
 
 impl Skillbase {
     pub(crate) fn render_settings(
@@ -56,31 +61,43 @@ impl Skillbase {
                     .id("settings-body")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .px_5()
-                    .pb_8()
-                    .gap_6()
-                    .child(self.directories_section(cx))
-                    .child(self.sidebar_section(cx))
-                    .child(self.usage_section(cx))
-                    .child(self.warnings_section(cx))
-                    .child(self.unsupported_section(cx))
-                    .child(self.about_section(cx))
-                    // A scan that has not landed yet leaves the two sections
-                    // above it empty, so say so rather than show blanks.
-                    .when(scan.is_none(), |this| {
-                        this.child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(match &self.scan {
-                                    ScanState::Failed(error) => {
-                                        SharedString::from(format!("The last scan failed: {error}"))
-                                    }
-                                    _ => "Scanning…".into(),
-                                }),
-                        )
-                    }),
+                    .w_full()
+                    .items_center()
+                    .overflow_y_scrollbar()
+                    .child(
+                        v_flex()
+                            // Full width up to the cap rather than a fixed
+                            // width: at the 860px minimum window the work
+                            // area is narrower than PAGE_MAX_WIDTH, and a
+                            // fixed w() would overflow it.
+                            .w_full()
+                            .max_w(px(PAGE_MAX_WIDTH))
+                            .px_5()
+                            .pb_8()
+                            .gap_6()
+                            .child(self.directories_section(cx))
+                            .child(self.sidebar_section(cx))
+                            .child(self.usage_section(cx))
+                            .child(self.updates_section(cx))
+                            .child(self.warnings_section(cx))
+                            .child(self.unsupported_section(cx))
+                            .child(self.about_section(cx))
+                            // A scan that has not landed yet leaves the two sections
+                            // above it empty, so say so rather than show blanks.
+                            .when(scan.is_none(), |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(match &self.scan {
+                                            ScanState::Failed(error) => SharedString::from(
+                                                format!("The last scan failed: {error}"),
+                                            ),
+                                            _ => "Scanning…".into(),
+                                        }),
+                                )
+                            }),
+                    ),
             )
     }
 
@@ -111,6 +128,7 @@ impl Skillbase {
 
     fn dir_row(&self, dir: &DirStatus, cx: &mut Context<Self>) -> AnyElement {
         let path = display_path(&dir.path, &self.roots);
+        let full = path.clone();
         h_flex()
             .id(ElementId::from((ElementId::from("settings-dir"), dir.id)))
             .w_full()
@@ -119,6 +137,10 @@ impl Skillbase {
             .gap_3()
             .items_center()
             .justify_between()
+            // Truncation clips the end of the path, which is the part that
+            // says which directory this is. The row is what Settings exists
+            // to answer, so the whole path stays reachable.
+            .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
             .child(
                 h_flex()
                     .gap_2()
@@ -126,8 +148,12 @@ impl Skillbase {
                     .w_40()
                     .flex_shrink_0()
                     .child(
+                        // Presence, not approval. A tick is what the sidebar
+                        // uses for "Managed", and this row is answering a
+                        // different question: whether the directory is there.
+                        // The drive reads as the "on disk" the row says.
                         Icon::new(if dir.exists {
-                            IconName::CircleCheck
+                            IconName::HardDrive
                         } else {
                             IconName::CircleX
                         })
@@ -170,6 +196,7 @@ impl Skillbase {
                 .gap_1()
                 .child(
                     Switch::new("show-all-agents")
+                        .small()
                         .checked(show_all)
                         .label("Show all agents")
                         .on_click(cx.listener(|this, checked: &bool, window, cx| {
@@ -195,10 +222,10 @@ impl Skillbase {
     /// Where the "Most used" ordering gets its numbers, and what it could not
     /// read.
     ///
-    /// The list's sort menu says which agents were counted in one line; this is
-    /// where the per-source figures and any unreadable session file are
-    /// reachable. Without it a count that is quietly missing a source looks
-    /// exactly like a skill nobody has run.
+    /// The list header's help names the groups; this is where the per-source
+    /// figures and any unreadable session file are reachable. Without it a
+    /// count that is quietly missing a source looks exactly like a skill
+    /// nobody has run.
     fn usage_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let home = self.roots.home().display().to_string();
         let (caption, body) = match self.usage.as_ref() {
@@ -232,6 +259,8 @@ impl Skillbase {
                             .rounded(cx.theme().radius)
                             .bg(cx.theme().group_box)
                             .children(usage.sources().iter().map(|stat| {
+                                let path = display_path(&stat.source.dir(&self.roots), &self.roots);
+                                let full = path.clone();
                                 h_flex()
                                     .id(ElementId::from((
                                         ElementId::from("usage-source"),
@@ -242,6 +271,11 @@ impl Skillbase {
                                     .py_2()
                                     .gap_3()
                                     .items_center()
+                                    // The truncated end of the path is the part
+                                    // that identifies the directory.
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(full.clone()).build(window, cx)
+                                    })
                                     .child(
                                         div()
                                             .w_40()
@@ -257,10 +291,7 @@ impl Skillbase {
                                             .text_sm()
                                             .truncate()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(display_path(
-                                                &stat.source.dir(&self.roots),
-                                                &self.roots,
-                                            )),
+                                            .child(path),
                                     )
                                     .child(
                                         div()
@@ -306,6 +337,104 @@ impl Skillbase {
         };
 
         section("Usage", caption, body, cx)
+    }
+
+    /// What the update check costs and what it last found.
+    ///
+    /// GitHub allows sixty requests an hour without a token, which a few dozen
+    /// repositories fit inside exactly once. That makes the budget worth
+    /// showing rather than leaving the user to discover it as a check that
+    /// quietly stops working.
+    fn updates_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let checking = matches!(self.updates, UpdateState::Checking);
+        let caption = match self.token_source {
+            TokenSource::Environment => format!(
+                "{GITHUB_TOKEN_ENV} is set, so GitHub allows 5000 requests an hour. A check asks \
+                 once per repository and only walks a repository that has moved."
+            ),
+            TokenSource::GitHubCli => {
+                "Using the token from GitHub CLI, so GitHub allows 5000 requests an hour. The \
+                 token stays in memory and is not written to disk. A check asks once per \
+                 repository and only walks a repository that has moved."
+                    .to_string()
+            }
+            TokenSource::None => format!(
+                "No token, so GitHub allows 60 requests an hour. A check asks once per \
+                 repository and only walks a repository that has moved. Set {GITHUB_TOKEN_ENV}, \
+                 or log in with gh, to raise the limit to 5000."
+            ),
+        };
+
+        let budget: SharedString = match self.rate_limit {
+            Some(limit) => format!(
+                "{} of {} requests left, resetting in {}",
+                limit.remaining,
+                limit.limit,
+                in_words(limit.wait_from(std::time::SystemTime::now()).as_secs())
+            )
+            .into(),
+            None => "GitHub has not been asked yet, so there is no figure for the budget".into(),
+        };
+
+        let found: SharedString = match &self.updates {
+            UpdateState::Idle => "No check has run yet".into(),
+            UpdateState::Checking => "Checking…".into(),
+            UpdateState::Ready(report) => {
+                let updatable = report.updatable().count();
+                format!(
+                    "{} repositor{} checked in {} request{}; {} skill{} behind upstream",
+                    report.repos_checked(),
+                    if report.repos_checked() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    report.requests(),
+                    if report.requests() == 1 { "" } else { "s" },
+                    updatable,
+                    if updatable == 1 { "" } else { "s" },
+                )
+                .into()
+            }
+        };
+
+        section(
+            "Updates",
+            caption,
+            v_flex()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().group_box)
+                        .child(fact_row(
+                            "token",
+                            "GitHub token",
+                            match self.token_source {
+                                TokenSource::Environment => "found in the environment",
+                                TokenSource::GitHubCli => "using GitHub CLI",
+                                TokenSource::None => "not set",
+                            },
+                            cx,
+                        ))
+                        .child(fact_row("budget", "Rate limit", budget, cx))
+                        .child(fact_row("last-check", "Last check", found, cx)),
+                )
+                .child(
+                    h_flex().child(
+                        Button::new("check-updates")
+                            .outline()
+                            .small()
+                            .label("Check for updates now")
+                            .disabled(checking)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.check_for_updates(window, cx)
+                            })),
+                    ),
+                )
+                .into_any_element(),
+            cx,
+        )
     }
 
     /// The last scan's warnings, in full, with their paths.
@@ -433,6 +562,40 @@ impl Skillbase {
     }
 }
 
+/// One labelled fact, on the same two lanes the directory rows use so the two
+/// lists read as one column.
+fn fact_row(
+    id: &'static str,
+    label: &'static str,
+    value: impl Into<SharedString>,
+    cx: &mut Context<Skillbase>,
+) -> AnyElement {
+    h_flex()
+        .id(ElementId::from((ElementId::from("settings-fact"), id)))
+        .w_full()
+        .px_3()
+        .py_2()
+        .gap_3()
+        .items_center()
+        .child(
+            div()
+                .w_40()
+                .flex_shrink_0()
+                .text_sm()
+                .truncate()
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(value.into()),
+        )
+        .into_any_element()
+}
+
 /// A titled section: a heading, a line of explanation, and its content.
 fn section(
     title: &'static str,
@@ -446,6 +609,10 @@ fn section(
         .child(
             div()
                 .text_xs()
+                // The caption directly under it is a step larger and the same
+                // colour, so without the weight the heading is the quieter of
+                // the two lines and stops reading as a heading at all.
+                .font_medium()
                 .text_color(cx.theme().muted_foreground)
                 .child(title),
         )

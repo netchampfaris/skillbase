@@ -33,6 +33,18 @@ fn main() {
             }
 
             menus::init(cx);
+            // The skill list's own keys — move the selection, open what is
+            // selected — are bound once here rather than in the view, because
+            // `bind_keys` registers against the application and a view that is
+            // rebuilt on every frame would register them again each time.
+            ui::list::init(cx);
+
+            // Screenshot mode. `script/preview.sh` needs the window rendered,
+            // not in front: someone is usually working in another application
+            // while it runs. `focus: false` makes AppKit order the window in
+            // without making it key, and the activation below is skipped, so
+            // nothing takes the keyboard.
+            let quiet = std::env::var_os("SKILLBASE_NO_ACTIVATE").is_some();
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(
@@ -43,9 +55,10 @@ fn main() {
                 titlebar: Some(TitlebarOptions {
                     title: None,
                     appears_transparent: true,
-                    // 18 = (48 - 12) / 2: a 12pt control centred in the 48pt
-                    // header band the leftmost column opens with, so the lights
-                    // sit on that band's centre line rather than above it.
+                    // 18pt from the container's AppKit origin, which is the
+                    // bottom of a 48pt band when the lights are 12pt tall:
+                    // padding above equals padding below, so they sit on the
+                    // same centre line as the 24pt sidebar toggle.
                     traffic_light_position: Some(point(px(16.), px(18.))),
                 }),
                 // The header bands draw themselves and move the window with
@@ -54,6 +67,7 @@ fn main() {
                 // clicks a second time and delay every click while it waits to
                 // see whether one is coming.
                 app_owns_titlebar_drag: true,
+                focus: !quiet,
                 ..Default::default()
             };
 
@@ -68,7 +82,10 @@ fn main() {
                 window
                     .update(cx, |_, window, cx| {
                         window.set_window_title("Skillbase");
-                        cx.activate(true);
+
+                        if !quiet {
+                            cx.activate(true);
+                        }
 
                         // Follow the operating system when the user switches
                         // between light and dark.

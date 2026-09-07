@@ -16,6 +16,19 @@ you maintain by hand.
 locations, including the vendor-neutral `~/.agents/skills` that most agents now
 read natively. Nothing moves until you ask for it.
 
+**Installs from GitHub, and says when there is an update.** Search skills.sh,
+or point Skillbase at a repository and a directory inside it. What comes down
+is pinned to an exact commit, and where it came from is written into the
+skill's own `SKILL.md` under `metadata` — the same four keys `gh skill install`
+writes, so the two tools understand each other. Skills that `npx skills`
+installed are picked up too, by reading its lockfile.
+
+Checking for updates compares the tree sha of one subdirectory rather than the
+repository's last commit, so a skill is only out of date when the skill itself
+changed. Checks batch by repository, and a repository that has not moved costs
+a few hundred bytes. If you have edited a skill locally and it also changed
+upstream, Skillbase says so and refuses until you choose which to keep.
+
 **Edits skills in place.** The detail pane is a set of tabs. `SKILL.md` has one
 of its own, a syntax-highlighted editor over the whole file, and the Overview
 tab has its frontmatter as name and description fields; both save through the
@@ -114,6 +127,41 @@ SKILLBASE_HOME=/tmp/fakehome cargo run
 The title bar shows an orange badge naming the override, so a screenshot always
 says which tree is live. Use this for anything destructive.
 
+## Screenshots without stealing focus
+
+Driving the application on screen to see a change interrupts whoever is at the
+keyboard: the window comes to the front and takes the keyboard from whatever
+they were doing. `script/preview.sh` builds, restarts and screenshots Skillbase
+without ever doing that:
+
+```sh
+script/preview.sh                  # a PNG under $TMPDIR, path printed
+script/preview.sh shots/list.png   # or a path you choose
+script/preview.sh --stop           # shut the preview copy down
+```
+
+Three things keep it quiet. `SKILLBASE_NO_ACTIVATE=1` makes the window open with
+`focus: false`, so AppKit orders it in without making it key, and the
+`cx.activate` call is skipped. `open -g` launches it behind everything else.
+`screencapture -l` then reads that window's own backing buffer, which works
+while the window is behind others, on another Space, or never activated at all.
+
+The preview copy is a separate process from any Skillbase you have open, and
+each run replaces the one before it. It needs Screen Recording permission for
+the terminal, granted once in System Settings.
+
+One limit is worth knowing, because it is silent otherwise. macOS stops
+compositing windows on an inactive Space, and a fullscreen application puts you
+on a Space of its own — so while you are in one, the preview window is not being
+drawn, and `screencapture` returns the last frame it painted rather than the
+current one. That frame can be minutes old and still show a loading state that
+finished long ago. Both scripts refuse to capture in that case rather than hand
+back something stale; switch to the Space holding the window, or set
+`SCREENSHOT_ALLOW_STALE=1` if an old frame is what you actually want.
+
+`script/screenshot.sh` captures an already-running window on its own, and
+`script/window-id.swift` prints the window id it uses.
+
 ## Layout
 
 | Path                | What it holds                                              |
@@ -144,5 +192,4 @@ installed. `assets/icons/agents/SOURCES.md` has the per-file detail.
 
 ## Not in v1
 
-Project-scoped skills, installing from a remote registry, versioning, and
-Windows.
+Project-scoped skills, publishing to a registry, and Windows.

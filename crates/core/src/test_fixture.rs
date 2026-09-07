@@ -2,11 +2,14 @@
 //!
 //! Every test in this crate that touches the filesystem runs against a
 //! [`Fixture`], never the real home. [`Fixture::realistic`] reproduces the
-//! shapes a machine actually has: skills that live in the shared directory and
-//! are symlinked into Claude Code, a skill adopted into the store, a copy
-//! fan-out into another agent, a link parked in `skills-disabled`, a broken
-//! link, a directory without a `SKILL.md`, a skill whose frontmatter disagrees
-//! with its directory name, and a Codex config that switches one skill off.
+//! shapes a machine actually has: skills whose origin is the store, which is
+//! the shared directory `~/.agents/skills`, one of them symlinked into Claude
+//! Code as well; a managed skill hidden from the agents, with its origin in the
+//! private directory and a link from Claude Code; an unmanaged skill owned by
+//! Claude Code; a copy fan-out into another agent; a link parked in
+//! `skills-disabled`; a broken link; a directory without a `SKILL.md`; a skill
+//! whose frontmatter disagrees with its directory name; and a Codex config that
+//! switches one skill off.
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -39,8 +42,10 @@ impl Fixture {
     pub fn realistic() -> Self {
         let fx = Self::empty();
 
-        // Skills that live in the shared directory.
+        // Skills whose origin is the store, which is the shared directory. Every
+        // agent that reads `~/.agents/skills` reaches them with no link.
         fx.skill(".agents/skills/shared-one", "shared-one");
+        fx.skill(".agents/skills/shared-two", "shared-two");
         fx.skill(".agents/skills/copied-around", "copied-around");
         fx.skill(".agents/skills/disabled-here", "disabled-here");
         // A directory name that disagrees with the frontmatter name.
@@ -59,14 +64,16 @@ impl Fixture {
         )
         .expect("dangling symlink");
 
-        // A skill adopted into the store, reached through the shared directory.
-        fx.skill(".skillbase/store/shared-two", "shared-two");
+        // A managed skill hidden from the agents that read the shared
+        // directory: its origin sits in the private directory, and only the
+        // link Claude Code holds reaches it.
+        fx.skill(".skillbase/private/hidden-one", "hidden-one");
         fx.link_rel(
-            ".agents/skills/shared-two",
-            "../../.skillbase/store/shared-two",
+            ".claude/skills/hidden-one",
+            "../../.skillbase/private/hidden-one",
         );
 
-        // Claude Code: one link into shared, one skill of its own.
+        // Claude Code: one link into the store, one skill of its own.
         fx.dir(".claude/skills");
         fx.link_rel(
             ".claude/skills/shared-one",
@@ -126,14 +133,20 @@ impl Fixture {
         Discovery::new(self.roots()).run()
     }
 
-    /// `~/.agents/skills`.
+    /// `~/.agents/skills`, seen as the directory agents read.
     pub fn shared(&self) -> PathBuf {
         self.roots().shared_dir()
     }
 
-    /// `~/.skillbase/store`.
+    /// `~/.agents/skills`, seen as the directory Skillbase owns the bytes in.
+    /// The same path as [`Fixture::shared`].
     pub fn store(&self) -> PathBuf {
         self.roots().store_dir()
+    }
+
+    /// `~/.skillbase/private`.
+    pub fn private(&self) -> PathBuf {
+        self.roots().private_dir()
     }
 
     /// One agent's global skills directory.
@@ -168,6 +181,65 @@ impl Fixture {
         )
         .expect("write SKILL.md");
         dir
+    }
+
+    /// Creates a skill that carries the provenance `gh skill install` and
+    /// Skillbase both write: the four `github-*` keys, nested under `metadata`.
+    ///
+    /// `source` is an `owner/repo` slug, `path` the skill's subdirectory in
+    /// that repository.
+    pub fn installed_skill(
+        &self,
+        relative: &str,
+        name: &str,
+        source: &str,
+        path: &str,
+        tree_sha: &str,
+    ) -> PathBuf {
+        let dir = self.dir(relative);
+        fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\n\
+                 name: {name}\n\
+                 description: The {name} skill.\n\
+                 metadata:\n  \
+                   github-repo: https://github.com/{source}\n  \
+                   github-ref: main\n  \
+                   github-tree-sha: {tree_sha}\n  \
+                   github-path: {path}\n\
+                 ---\n\n# {name}\n"
+            ),
+        )
+        .expect("write SKILL.md");
+        dir
+    }
+
+    /// Writes the lockfile `npx skills` maintains, with one entry per
+    /// `(name, source, skill path)`.
+    ///
+    /// Skillbase reads this file and never writes it, so the fixture is what
+    /// stands in for the other tool having been run.
+    pub fn skill_lock(&self, entries: &[(&str, &str, &str)]) -> PathBuf {
+        let rows: Vec<String> = entries
+            .iter()
+            .map(|(name, source, path)| {
+                format!(
+                    "\"{name}\":{{\
+                       \"source\":\"{source}\",\
+                       \"sourceType\":\"github\",\
+                       \"sourceUrl\":\"https://github.com/{source}\",\
+                       \"skillPath\":\"{path}\",\
+                       \"skillFolderHash\":\"e3b0c44298fc\",\
+                       \"installedAt\":\"2026-01-02T03:04:05Z\",\
+                       \"updatedAt\":\"2026-01-02T03:04:05Z\"}}"
+                )
+            })
+            .collect();
+        self.write_file(
+            crate::provenance::SKILL_LOCK_FILE,
+            &format!("{{\"skills\":{{{}}}}}", rows.join(",")),
+        )
     }
 
     /// Creates a symlink at `relative` pointing at `target`, as written.

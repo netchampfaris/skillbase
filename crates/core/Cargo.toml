@@ -13,6 +13,15 @@ serde_json = "1"
 serde_yaml_ng = "0.10"
 thiserror = "2"
 toml_edit = "0.22"
+# Fetching skills from GitHub. Blocking HTTP, so every call belongs on a
+# background task; rustls rather than the system TLS stack, so a build needs no
+# OpenSSL. `xattr` is off: a skill is source text, and copying extended
+# attributes out of a downloaded archive is not wanted.
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+# The content digest that says whether an installed skill was edited locally.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

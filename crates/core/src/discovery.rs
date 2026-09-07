@@ -1,8 +1,9 @@
 //! Read-only scan of every scope on the machine.
 //!
-//! Discovery walks the store, the shared directory and each agent's global
-//! directory, groups what it finds by skill name, and works out which path
-//! holds the real bytes ([`LocationKind::Origin`]) and which are links to it.
+//! Discovery walks the store — which is the shared directory `~/.agents/skills`
+//! — the private directory and each agent's global directory, groups what it
+//! finds by skill name, and works out which path holds the real bytes
+//! ([`LocationKind::Origin`]) and which are links to it.
 //!
 //! **Discovery never writes.** It opens directories, reads `SKILL.md` files and
 //! resolves symlinks, and does nothing else. A test asserts the fixture tree is
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::doc::SkillDoc;
 use crate::error::SkillError;
-use crate::registry::{AgentDef, Registry, Roots, STORE_ID};
+use crate::registry::{AgentDef, PRIVATE_ID, Registry, Roots, SHARED_ID};
 use crate::skill::SKILL_FILE_NAME;
 
 /// What a path holding a skill actually is.
@@ -51,7 +52,10 @@ impl LocationKind {
 /// One place a skill was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
-    /// The scope this path belongs to: an agent id, or [`STORE_ID`].
+    /// The scope this path belongs to: an agent id, or [`PRIVATE_ID`].
+    ///
+    /// A path in the store carries [`SHARED_ID`], because the store is the
+    /// shared directory.
     pub agent_id: &'static str,
     /// The skill directory as it was found, before following any symlink.
     pub path: PathBuf,
@@ -78,8 +82,16 @@ pub struct DiscoveredSkill {
     /// Non-empty means the machine has more than one copy of this skill and
     /// editing one will not change the others. Reported, never hidden.
     pub conflicts: Vec<PathBuf>,
-    /// True when the origin is inside `~/.skillbase/store`, so Skillbase owns
-    /// it and may add or remove links freely.
+    /// True when the origin is inside `~/.agents/skills` or
+    /// `~/.skillbase/private`, so Skillbase owns it and may add or remove links
+    /// freely.
+    ///
+    /// Those are the two directories Skillbase writes origins to: the store,
+    /// where the agents that read `~/.agents/skills` find the skill, and the
+    /// private directory, where the origin sits when the user has hidden it
+    /// from them. An origin anywhere else — `~/.claude/skills/foo`, say —
+    /// belongs to another tool, so the skill is unmanaged and its visibility is
+    /// reported read-only.
     pub managed: bool,
     /// True when `~/.codex/config.toml` carries an `enabled = false` entry for
     /// this skill.
@@ -206,11 +218,11 @@ impl Discovery {
         let codex_disabled = self.codex_disabled_dirs(&mut warnings);
         let groups = group_by_name(candidates, &docs);
         let store = self.roots.store_dir();
-        let shared = self.roots.shared_dir();
+        let private = self.roots.private_dir();
 
         let mut skills: Vec<_> = groups
             .into_values()
-            .map(|group| build_skill(group, &mut docs, &store, &shared, &codex_disabled))
+            .map(|group| build_skill(group, &mut docs, &store, &private, &codex_disabled))
             .collect();
         skills.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -218,16 +230,26 @@ impl Discovery {
     }
 
     /// The directories to walk, deduplicated by path, in registry order with
-    /// the store first.
+    /// the store first and the private directory second.
     ///
-    /// Zed's global directory is the shared directory, so it is walked once,
-    /// under the shared id. Zed's visibility comes from `reads_shared`.
+    /// The store is the shared directory, so it is walked once, under
+    /// [`SHARED_ID`]; the shared entry in the agent table adds nothing and is
+    /// dropped by the deduplication. Zed's global directory is that same
+    /// directory, so it is not walked either, and Zed's visibility comes from
+    /// `reads_shared`.
     fn scopes(&self) -> Vec<Scope> {
-        let mut scopes = vec![Scope {
-            agent_id: STORE_ID,
-            path: self.roots.store_dir(),
-            disabled: false,
-        }];
+        let mut scopes = vec![
+            Scope {
+                agent_id: SHARED_ID,
+                path: self.roots.store_dir(),
+                disabled: false,
+            },
+            Scope {
+                agent_id: PRIVATE_ID,
+                path: self.roots.private_dir(),
+                disabled: false,
+            },
+        ];
         for agent in Registry::all() {
             let path = self.roots.agent_dir(agent);
             if !scopes.iter().any(|s| s.path == path) {
@@ -399,13 +421,18 @@ pub fn codex_disabled_paths(config: &Path) -> Result<Vec<PathBuf>, SkillError> {
         .collect())
 }
 
-/// Sort key that puts the store first and then follows the agent table, so a
-/// skill's locations come back in the order the interface lists them.
+/// Sort key that puts the store first, the private directory second, and then
+/// follows the agent table, so a skill's locations come back in the order the
+/// interface lists them.
+///
+/// The store carries [`SHARED_ID`], which is also the agent table's first row,
+/// so it would sort first anyway; naming it here keeps the private directory
+/// from colliding with Claude Code.
 fn scope_order(agent_id: &str) -> usize {
-    if agent_id == STORE_ID {
-        0
-    } else {
-        Registry::order_of(agent_id).saturating_add(1)
+    match agent_id {
+        SHARED_ID => 0,
+        PRIVATE_ID => 1,
+        _ => Registry::order_of(agent_id).saturating_add(1),
     }
 }
 
@@ -492,7 +519,7 @@ fn build_skill(
     mut group: Vec<Candidate>,
     docs: &mut DocCache,
     store: &Path,
-    shared: &Path,
+    private: &Path,
     codex_disabled: &HashSet<PathBuf>,
 ) -> DiscoveredSkill {
     group.sort_by_key(|c| (scope_order(c.agent_id), c.path.clone()));
@@ -504,12 +531,12 @@ fn build_skill(
         .map(|c| c.real.clone())
         .collect();
 
-    // Preference: the store, then the shared directory, then registry order —
+    // Preference: the store, then the private directory, then registry order —
     // which `group` is already sorted by.
     let origin = reals
         .iter()
         .find(|p| p.starts_with(store))
-        .or_else(|| reals.iter().find(|p| p.starts_with(shared)))
+        .or_else(|| reals.iter().find(|p| p.starts_with(private)))
         .or_else(|| reals.first())
         // Every location is a symlink out of every scanned scope: the origin is
         // whatever they resolve to, even though it was never walked.
@@ -557,7 +584,7 @@ fn build_skill(
 
     DiscoveredSkill {
         name,
-        managed: origin.starts_with(store),
+        managed: origin.starts_with(store) || origin.starts_with(private),
         origin,
         locations,
         doc,
@@ -595,6 +622,7 @@ mod tests {
                 "claude-only",
                 "copied-around",
                 "disabled-here",
+                "hidden-one",
                 "renamed-inside",
                 "shared-one",
                 "shared-two",
@@ -619,7 +647,7 @@ mod tests {
 
         let skill = result.get("shared-one").unwrap();
         assert_eq!(skill.origin, fx.shared().join("shared-one"));
-        assert!(!skill.managed);
+        assert!(skill.managed);
         assert_eq!(
             skill.location("shared").unwrap().kind,
             LocationKind::Origin,
@@ -645,18 +673,54 @@ mod tests {
     }
 
     #[test]
-    fn a_skill_in_the_store_is_managed() {
+    fn a_skill_in_the_shared_directory_is_managed() {
         let fx = Fixture::realistic();
         let result = fx.scan();
         let skill = result.get("shared-two").unwrap();
+
+        assert_eq!(fx.store(), fx.shared(), "the store is the shared directory");
         assert_eq!(skill.origin, fx.store().join("shared-two"));
+        assert!(
+            skill.managed,
+            "the origin is in a directory Skillbase owns, so it may move links to it"
+        );
+        assert_eq!(skill.location("shared").unwrap().kind, LocationKind::Origin);
+        assert!(
+            skill.location("store").is_none(),
+            "there is no separate store scope any more"
+        );
+        assert!(skill.visible_to().contains(&"cursor"), "no link in between");
+    }
+
+    #[test]
+    fn a_skill_in_the_private_directory_is_managed_and_not_shared() {
+        let fx = Fixture::realistic();
+        let result = fx.scan();
+        let skill = result.get("hidden-one").unwrap();
+
+        assert_eq!(skill.origin, fx.private().join("hidden-one"));
         assert!(skill.managed);
-        assert_eq!(skill.location("store").unwrap().kind, LocationKind::Origin);
         assert_eq!(
-            skill.location("shared").unwrap().kind,
-            LocationKind::Symlink {
-                target: fx.store().join("shared-two")
-            }
+            skill.location("private").unwrap().kind,
+            LocationKind::Origin
+        );
+        assert!(!skill.is_present_in("shared"));
+        assert_eq!(
+            skill.visible_to(),
+            ["claude-code"],
+            "only the agent holding a link of its own reaches it"
+        );
+    }
+
+    #[test]
+    fn a_skill_owned_by_another_tool_is_unmanaged() {
+        let fx = Fixture::realistic();
+        let skill = fx.scan();
+        let skill = skill.get("claude-only").unwrap();
+        assert_eq!(skill.origin, fx.agent("claude-code").join("claude-only"));
+        assert!(
+            !skill.managed,
+            "an origin outside the store and the private directory belongs to someone else"
         );
     }
 
@@ -857,6 +921,10 @@ mod tests {
         assert_eq!(counts["zed"], 6, "Zed reads the shared directory");
         assert_eq!(counts["codex"], 5, "one of the six is disabled in config");
         assert_eq!(counts["cline"], 0, "Cline has no directory here");
+        assert_eq!(
+            counts["claude-code"], 3,
+            "a link into the store, a skill of its own, and a link into the private directory"
+        );
     }
 
     #[test]
@@ -902,8 +970,25 @@ mod tests {
             .location("claude-code")
             .unwrap();
         assert_eq!(agent_of(location).unwrap().display_name, "Claude Code");
-        let store = result.get("shared-two").unwrap().location("store").unwrap();
-        assert!(agent_of(store).is_none(), "the store is not an agent");
+        let private = result
+            .get("hidden-one")
+            .unwrap()
+            .location("private")
+            .unwrap();
+        assert!(
+            agent_of(private).is_none(),
+            "the private directory is not an agent"
+        );
+        let store = result
+            .get("shared-two")
+            .unwrap()
+            .location("shared")
+            .unwrap();
+        assert_eq!(
+            agent_of(store).unwrap().id,
+            "shared",
+            "the store carries the shared id, which the table does hold"
+        );
     }
 
     /// Scans the real home directory and prints what it found.

@@ -110,9 +110,17 @@ where its origin and links sit.
 
 ### 3.2 Managed and unmanaged skills
 
-A skill is **managed** when its origin is inside Skillbase's own store at
-`~/.skillbase/store/<name>/`. Managed skills get full visibility control,
-because Skillbase owns the origin and can add or remove links freely.
+The store is `~/.agents/skills/`, the vendor-neutral directory most agents
+already read. Skillbase does not keep a private directory of its own and link
+outwards from it; it owns the directory the agents are looking at. A skill
+placed there is visible to every agent in the table above that reads it, with
+no symlink involved at all.
+
+A skill is **managed** when its origin is in the store, or in
+`~/.skillbase/private/<name>/`, which holds skills the user has explicitly
+hidden from the agents that read the shared directory. Both are locations
+Skillbase owns, so it can add and remove links to them freely, and managed
+skills get full visibility control.
 
 Every other skill is **unmanaged**. Skillbase shows it, reads it, and edits it
 in place, but reports its visibility read-only. An explicit **Adopt** action
@@ -124,13 +132,23 @@ Moving 56 directories out from under a tool the user relies on, without asking,
 would be indefensible. Adoption is per skill, opt-in, and reversible by a
 **Release** action that moves the origin back.
 
+Sharing the store with other installers is the point rather than a hazard. A
+skill that `gh skill install` or `npx skills` wrote into `~/.agents/skills` is
+managed on sight, with no adoption step, because it is already where Skillbase
+keeps its own.
+
 ### 3.3 What a visibility toggle does
 
 For a managed skill, turning an agent on creates a relative symlink from that
-agent's directory to the store. Turning it off removes the link. Turning on
-**Shared** creates the link in `~/.agents/skills/`, which reaches every agent in
-the table above that reads it — so Shared is presented as one switch, with the
-agents it covers listed beneath.
+agent's directory to the store. Turning it off removes the link.
+
+**Shared** is different in kind, because the shared directory is the store. It
+does not add or remove a link; it moves the origin. Turning it off moves the
+directory to `~/.skillbase/private/<name>/` and repoints every agent symlink at
+the new location, so the agents that were switched on individually keep working
+while the ones that only saw it through `~/.agents/skills` no longer do.
+Turning it on moves the directory back. One switch, one origin, and the skill
+is reachable at exactly one real path at every point in between.
 
 Symlinks, not copies, are the default: a copy goes stale the moment the skill is
 edited, and the whole point of this application is that one edit lands
@@ -189,6 +207,53 @@ writes each file's length, modification time and counts to
 `~/.skillbase/usage.json`, and a later load reads only the bytes each file has
 grown by, in a few milliseconds. A missing, corrupt or differently versioned
 cache means "scan everything" rather than an error. Nothing else is written.
+
+### 3.6 Where a skill came from
+
+A skill installed from GitHub records where it came from in its own
+`SKILL.md`, under the `metadata` map: `github-repo`, `github-ref`,
+`github-path`, and `github-tree-sha`. This is the convention `gh skill
+install` already writes, and matching it is deliberate. The Agent Skills
+specification allows exactly six frontmatter fields, and `metadata` is the only
+one that takes anything else — a top-level `version:` or `source:` is a
+validation error, not an ignored key. Writing provenance into the file also
+means it survives the directory being moved, copied, or adopted, which matters
+here because Skillbase moves directories.
+
+Skillbase reads `~/.agents/.skill-lock.json`, the lockfile `npx skills`
+maintains, and never writes it. A skill that another installer put in the store
+is therefore still checked for updates. Co-owning that file would invite two
+tools to race over it; reading it costs nothing.
+
+Two different questions get two different mechanisms:
+
+- **Has upstream changed?** The stored `github-tree-sha` against the tree sha
+  GitHub reports now. A tree sha identifies the contents of one subdirectory,
+  so it does not move when an unrelated file in the repository changes — which
+  a commit sha does.
+- **Has the user edited it?** A content digest of the installed directory,
+  recorded at install time in `~/.skillbase/remote.json`. Injecting provenance
+  means the local directory can never equal the upstream tree sha, so the two
+  questions cannot share one number. That cache is disposable: missing or
+  corrupt means fall back to downloading upstream and comparing, never a wrong
+  answer.
+
+A skill that is both edited locally and changed upstream is the interesting
+case, and it is the same shape as a diverging duplicate in §3.3. It gets the
+same treatment: name the difference, refuse by default, and require one
+explicit override.
+
+Update checks batch by repository, because installed skills cluster into far
+fewer repositories than there are skills. The check asks
+`git/ref/heads/{branch}` whether the repository moved at all, at a few hundred
+bytes, and only walks trees when it did. Downloads use the tarball pinned to a
+sha, which is one request and is not on the API rate limit. Unauthenticated
+GitHub allows 60 requests an hour, which a few dozen repositories fit inside; a
+token raises it to 5000. Skillbase takes `SKILLBASE_GITHUB_TOKEN` when it is
+set, otherwise the token from `gh auth token` if GitHub CLI is logged in. The
+CLI token is held in memory and is not written down. Finder-launched copies do
+not inherit a shell environment, so the CLI fallback is what makes the higher
+budget reachable from the installed application.
 
 ---
 
@@ -561,14 +626,18 @@ Filesystem behaviour is covered by tests in the core crate: round-trip fidelity,
 discovery against a synthetic tree of agent directories, and link, adopt, and
 release operations against a temporary directory.
 
-Nothing writes outside `~/.skillbase/` and the agent directories the user has
-explicitly targeted. Discovery is read-only.
+Nothing writes outside `~/.agents/skills/`, `~/.skillbase/`, and the agent
+directories the user has explicitly targeted. Discovery is read-only.
 
 ---
 
 ## 8. Out of scope for v1
 
-Editing bundled files, project-scoped skill management, browsing or installing
-from a remote registry, skill versioning and diffing, import from an archive,
+Editing bundled files, project-scoped skill management, import from an archive,
 and Windows support. Each is plausible later; none is needed for the
 application to be useful.
+
+Installing from a registry, and updating what was installed, were on this list
+and are now built — see §3.6. Publishing a skill to a registry is not, and
+neither is any notion of a version number: the spec has no version field, and
+the tree sha answers the only question the interface actually asks.

@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::SharedString;
 use skillbase_core::{
-    AgentDef, DisableMode, DiscoveredSkill, Discovery, Location, LocationKind, Registry, Roots,
-    SHARED_ID, STORE_ID, SkillError,
+    AgentDef, DisableMode, DiscoveredSkill, Discovery, Location, LocationKind, PRIVATE_ID,
+    Provenance, Registry, Roots, SHARED_ID, SkillError, SkillLock, UpdateTarget, provenance_of,
 };
 
 /// Environment variable that points Skillbase at a different home directory.
@@ -169,7 +169,7 @@ fn after_key<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 /// because `render` may not touch the filesystem.
 #[derive(Clone, Debug)]
 pub struct DirStatus {
-    /// The scope id: [`STORE_ID`], or an agent id.
+    /// The scope id: [`PRIVATE_ID`], or an agent id.
     pub id: &'static str,
     /// What to call it on screen.
     pub label: SharedString,
@@ -205,7 +205,38 @@ impl Library {
             Library::Managed => "Managed",
             Library::Unmanaged => "Unmanaged",
             Library::Invalid => "Invalid",
-            Library::Conflicts => "Conflicts",
+            // "Duplicates" says what the group holds. The detail pane calls
+            // the same thing a duplicate copy, and one operation should not
+            // have two names.
+            Library::Conflicts => "Duplicates",
+        }
+    }
+
+    /// How a skill is recognised as this group. Shown in the list header's
+    /// help, so the wording matches what the filter actually tests.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Library::All => "Every skill Skillbase found on this machine.",
+            Library::Shared => {
+                "The origin is in ~/.agents/skills, which most agents read on their own. \
+                 That directory is Skillbase's store, so a skill here is already managed."
+            }
+            Library::Managed => {
+                "The origin is in the store or in ~/.skillbase/private. Skillbase owns \
+                 the directory, so it can add and remove the links other agents follow."
+            }
+            Library::Unmanaged => {
+                "The origin sits somewhere Skillbase does not own. You can read and edit \
+                 it in place; visibility stays as you found it until you Adopt it."
+            }
+            Library::Invalid => {
+                "SKILL.md is not a frontmatter document Skillbase can parse. The skill \
+                 still appears so you can open the file and fix it."
+            }
+            Library::Conflicts => {
+                "The same name exists as more than one real directory. Copies that \
+                 drifted are listed rather than silently merged."
+            }
         }
     }
 
@@ -294,6 +325,11 @@ pub struct SkillView {
     pub visible_to: Vec<&'static str>,
     /// True when an active link sits in `~/.agents/skills`.
     pub in_shared: bool,
+    /// Where the skill came from, when it says so. Read from its own
+    /// frontmatter first and from the `npx skills` lockfile second; most
+    /// skills were written by hand and carry neither, which is why this is an
+    /// option rather than a default.
+    pub provenance: Option<Provenance>,
 }
 
 impl SkillView {
@@ -376,6 +412,10 @@ pub struct Scan {
     pub agent_counts: HashMap<&'static str, usize>,
     /// How many skills each Library row lists, in [`Library::ALL`] order.
     pub library_counts: [usize; Library::ALL.len()],
+    /// Every skill that names where it came from, ready to be checked for an
+    /// upstream update. Built here because it needs the whole discovery result
+    /// and the `npx skills` lockfile, both of which are read on this thread.
+    pub targets: Vec<UpdateTarget>,
 }
 
 impl Scan {
@@ -394,12 +434,15 @@ impl Scan {
             .filter(|agent| roots.agent_dir(agent).is_dir())
             .collect::<Vec<_>>();
 
-        let store = roots.store_dir();
+        // The store is `~/.agents/skills`, which the shared row below already
+        // lists. What is worth a row of its own is the private directory,
+        // because it is the one place a skill can be that no agent reads.
+        let private = roots.private_dir();
         let mut dirs = vec![DirStatus {
-            id: STORE_ID,
-            label: "Skillbase store".into(),
-            exists: store.is_dir(),
-            path: store,
+            id: PRIVATE_ID,
+            label: "Hidden skills".into(),
+            exists: private.is_dir(),
+            path: private,
         }];
         dirs.extend(Registry::all().iter().map(|agent| {
             let path = roots.agent_dir(agent);
@@ -411,10 +454,15 @@ impl Scan {
             }
         }));
 
+        // Read but never written: `npx skills` owns this file, and co-owning
+        // it would invite two tools to race over it.
+        let lock = SkillLock::read(roots);
+        let targets = skillbase_core::update_targets(&result.skills, &lock);
+
         let skills: Vec<SkillView> = result
             .skills
             .iter()
-            .map(SkillView::from_discovered)
+            .map(|skill| SkillView::from_discovered(skill, &lock))
             .collect();
 
         let mut library_counts = [0usize; Library::ALL.len()];
@@ -429,6 +477,7 @@ impl Scan {
             dirs,
             agent_counts,
             library_counts,
+            targets,
         }
     }
 
@@ -455,7 +504,7 @@ impl Scan {
 }
 
 impl SkillView {
-    fn from_discovered(skill: &DiscoveredSkill) -> Self {
+    fn from_discovered(skill: &DiscoveredSkill, lock: &SkillLock) -> Self {
         let description = skill.description().unwrap_or_default();
         // A description is one line in the list, so a wrapped YAML scalar has
         // to lose its newlines before it gets there.
@@ -491,6 +540,7 @@ impl SkillView {
             codex_disabled: skill.codex_disabled,
             visible_to: skill.visible_to(),
             in_shared: skill.is_present_in(SHARED_ID),
+            provenance: provenance_of(skill, lock),
         }
     }
 
@@ -522,9 +572,122 @@ pub fn display_path(path: &Path, roots: &Roots) -> SharedString {
     }
 }
 
+/// The first seven characters of a git sha, which is how git itself shortens
+/// one and enough to recognise it against a commit page.
+pub fn short_sha(sha: &str) -> SharedString {
+    let short: String = sha.chars().take(SHORT_SHA_LEN).collect();
+    short.into()
+}
+
+/// How many characters of a sha the interface shows.
+const SHORT_SHA_LEN: usize = 7;
+
+/// Seconds since the Unix epoch, or 0 before it.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long ago a Unix timestamp was, in words.
+///
+/// Rounded down to the coarsest unit that still has a whole number in it,
+/// because "checked 2 hours ago" is what the reader wants to know and "7412
+/// seconds" is not. A timestamp in the future reads as "just now": a clock that
+/// has been moved is not worth a sentence of its own.
+pub fn ago(unix: i64) -> SharedString {
+    if unix <= 0 {
+        return "never".into();
+    }
+    let seconds = now_unix().saturating_sub(unix).max(0) as u64;
+    // "just now" is already past tense. A counted duration is not, so it is the
+    // one that needs the suffix: "checked 1 minute" is not English.
+    match counted_duration(seconds) {
+        Some(counted) => format!("{counted} ago").into(),
+        None => "just now".into(),
+    }
+}
+
+/// A number of seconds in words, for a wait the reader is being asked to sit
+/// through. `zero` is what to say when there is nothing left to wait for.
+pub fn in_words(seconds: u64) -> SharedString {
+    match counted_duration(seconds) {
+        Some(counted) => counted.into(),
+        // Every caller reads "resets in {}", so the under-a-minute case has to
+        // be a noun phrase that fits there. "any moment now" does not.
+        None => "under a minute".into(),
+    }
+}
+
+/// A duration as a count of the coarsest whole unit that fits, or `None` when
+/// it is under a minute and there is no whole unit to name. The caller supplies
+/// the wording for both cases, because "just now" and "any moment now" point in
+/// opposite directions in time.
+fn counted_duration(seconds: u64) -> Option<String> {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    let (count, unit) = match seconds {
+        s if s < MINUTE => return None,
+        s if s < HOUR => (s / MINUTE, "minute"),
+        s if s < DAY => (s / HOUR, "hour"),
+        s => (s / DAY, "day"),
+    };
+    Some(format!(
+        "{count} {unit}{}",
+        if count == 1 { "" } else { "s" }
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_duration_reads_as_the_coarsest_whole_unit() {
+        assert_eq!(counted_duration(0), None);
+        assert_eq!(counted_duration(59), None);
+        assert_eq!(counted_duration(60).as_deref(), Some("1 minute"));
+        assert_eq!(counted_duration(3599).as_deref(), Some("59 minutes"));
+        assert_eq!(counted_duration(3600).as_deref(), Some("1 hour"));
+        assert_eq!(counted_duration(86_400).as_deref(), Some("1 day"));
+        assert_eq!(counted_duration(90_000).as_deref(), Some("1 day"));
+    }
+
+    #[test]
+    fn a_timestamp_that_was_never_recorded_says_so() {
+        assert_eq!(ago(0), "never");
+        assert_eq!(ago(-1), "never");
+    }
+
+    #[test]
+    fn a_past_time_reads_as_past_and_a_wait_does_not() {
+        // The bug this guards: "checked 1 minute", with no "ago".
+        assert_eq!(ago(now_unix() - 60), "1 minute ago");
+        assert_eq!(ago(now_unix() - 7200), "2 hours ago");
+        assert_eq!(ago(now_unix()), "just now");
+
+        assert_eq!(in_words(60), "1 minute");
+        assert_eq!(in_words(0), "under a minute");
+
+        // Both callers read "resets in {}", so each phrasing must fit there.
+        for seconds in [0, 30, 60, 7200] {
+            let sentence = format!("It resets in {}.", in_words(seconds));
+            assert!(!sentence.contains("in any"), "{sentence}");
+        }
+    }
+
+    #[test]
+    fn a_sha_is_shortened_the_way_git_shortens_one() {
+        assert_eq!(
+            short_sha("4f2a1c9d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39"),
+            "4f2a1c9"
+        );
+        assert_eq!(short_sha("abc"), "abc");
+        assert_eq!(short_sha(""), "");
+    }
 
     #[test]
     fn the_settings_reader_understands_what_the_writer_writes() {

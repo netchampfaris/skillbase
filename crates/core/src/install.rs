@@ -9,9 +9,9 @@
 //! Three rules are enforced in code, not merely documented:
 //!
 //! 1. Every destructive operation runs its paths through
-//!    [`Installer::ensure_in_scope`] first. A path outside the store and the
-//!    agent directories is refused, including one that tries to climb out with
-//!    `..`.
+//!    [`Installer::ensure_in_scope`] first. A path outside the store, the
+//!    private directory and the agent directories is refused, including one
+//!    that tries to climb out with `..`.
 //! 2. Deleting never follows a symlink. A link is unlinked; only a directory
 //!    proven real is removed recursively.
 //! 3. A real directory is never removed by an operation that expected a link.
@@ -48,14 +48,16 @@ pub const COPY_MARKER: &str = ".skillbase-copy";
 pub enum InstallError {
     /// The path is not inside the store or an agent directory. Refused before
     /// anything was touched.
-    #[error("{path}: outside every directory Skillbase manages, refusing to touch it")]
+    #[error(
+        "{path} is outside every directory Skillbase manages. Move it under ~/.agents/skills, or delete it in Finder."
+    )]
     OutsideScope {
         /// The path that was refused.
         path: PathBuf,
     },
 
     /// A path that had to be a symlink is a real file or directory.
-    #[error("{path}: a real {kind} is already here, not a link Skillbase made")]
+    #[error("A real {kind} already sits at {path}. Rename or remove it, then try again.")]
     NotALink {
         /// The path in the way.
         path: PathBuf,
@@ -65,7 +67,9 @@ pub enum InstallError {
 
     /// A directory could not be shown to be a copy Skillbase made, so it was
     /// left alone.
-    #[error("{path}: not a copy Skillbase made (no {COPY_MARKER}), refusing to remove it")]
+    #[error(
+        "{path} is not a copy Skillbase made, so it was left alone. Remove it in Finder if you no longer want it."
+    )]
     NotACopy {
         /// The directory that was left alone.
         path: PathBuf,
@@ -422,9 +426,9 @@ impl Duplicate {
         &self.path
     }
 
-    /// The scope it sits in: an agent id, or [`STORE_ID`].
+    /// The scope it sits in: an agent id, or [`PRIVATE_ID`].
     ///
-    /// [`STORE_ID`]: crate::registry::STORE_ID
+    /// [`PRIVATE_ID`]: crate::registry::PRIVATE_ID
     pub fn agent_id(&self) -> &'static str {
         self.agent_id
     }
@@ -566,7 +570,13 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Creates, moves and removes the links that make a skill visible.
+/// Creates, moves and removes the links that make a skill visible, and moves
+/// the origins of the skills Skillbase owns.
+///
+/// The store is `~/.agents/skills`, the directory the agents read, so being
+/// shared is a property of where the origin sits rather than of a link. Turning
+/// Shared off moves the origin to `~/.skillbase/private`; turning it on moves it
+/// back. See [`Installer::share`] and [`Installer::unshare`].
 #[derive(Debug, Clone)]
 pub struct Installer {
     roots: Roots,
@@ -583,8 +593,8 @@ impl Installer {
         &self.roots
     }
 
-    /// Rejects any path that is not strictly inside the store or an agent
-    /// directory.
+    /// Rejects any path that is not strictly inside the store, the private
+    /// directory or an agent directory.
     ///
     /// The path is normalized textually first, so `<store>/../../..` is refused
     /// even though nothing on disk was consulted. The normalized path comes
@@ -616,6 +626,11 @@ impl Installer {
     /// Idempotent: a link already pointing at the origin is left alone. A link
     /// pointing somewhere else is repointed. Anything that is not a link is
     /// refused rather than clobbered.
+    ///
+    /// The shared scope is the exception, because its directory is the store.
+    /// Linking there is [`Installer::share`], which moves the origin instead of
+    /// writing a link, and returns [`Change::NoChange`] when the origin is
+    /// already in the store.
     pub fn link(
         &self,
         name: &str,
@@ -626,6 +641,9 @@ impl Installer {
             return Err(InstallError::CoveredByShared {
                 agent: agent.display_name,
             });
+        }
+        if agent.is_shared() {
+            return self.share(name, origin);
         }
         let origin = self.ensure_in_scope(origin)?;
         require_dir(&origin)?;
@@ -642,15 +660,84 @@ impl Installer {
     /// Only ever removes a symlink, or — under [`LinkMode::Copy`] — a directory
     /// carrying the marker file this crate writes. A real directory is refused,
     /// because removing it would destroy the only copy of the skill.
+    ///
+    /// The shared scope is the exception. Its directory is the store, so a real
+    /// directory there is the skill's origin rather than a link, and unlinking
+    /// it is [`Installer::unshare`]: the origin moves to the private directory
+    /// and the links pointing at it follow.
     pub fn unlink(&self, name: &str, agent: &AgentDef) -> Result<Outcome, InstallError> {
         let dest = self.ensure_in_scope(&self.roots.agent_dir(agent).join(name))?;
+        if agent.is_shared() && is_real_dir(&dest) {
+            return self.unshare(name, &dest);
+        }
         self.remove_link_at(&dest, agent.link_mode)
     }
 
-    /// Moves a skill's origin into the store and leaves a symlink behind.
+    /// Turns the Shared switch on: puts the skill where every agent that reads
+    /// `~/.agents/skills` finds it.
+    ///
+    /// That directory is the store, so this moves the origin rather than
+    /// linking to it:
+    ///
+    /// - An origin already in the store is left alone, reported as
+    ///   [`Change::NoChange`]. There is nothing to link, and a symlink from
+    ///   `~/.agents/skills/<name>` to itself is never written.
+    /// - An origin in the private directory moves back to
+    ///   `~/.agents/skills/<name>`, and every symlink that pointed at it is
+    ///   repointed, so no agent loses the skill.
+    /// - An origin Skillbase does not own is linked into the shared directory
+    ///   the way any other agent is linked. Moving another tool's directory
+    ///   without being asked is what [`Installer::adopt`] is for.
+    pub fn share(&self, name: &str, origin: &Path) -> Result<Outcome, InstallError> {
+        let origin = self.ensure_in_scope(origin)?;
+        require_dir(&origin)?;
+        let store = self.roots.store_dir();
+        if origin.starts_with(&store) {
+            return Ok(Outcome::one(Change::NoChange {
+                path: origin,
+                reason: "in the shared directory",
+            }));
+        }
+        if origin.starts_with(self.roots.private_dir()) {
+            return self.move_origin(&origin, &store.join(name));
+        }
+        let dest = self.ensure_in_scope(&store.join(name))?;
+        self.place_symlink(&dest, &origin)
+    }
+
+    /// Turns the Shared switch off: takes the skill out of the directory the
+    /// agents read, without taking it away from the agents linked to it.
+    ///
+    /// - An origin in the store moves to `~/.skillbase/private/<name>`, and
+    ///   every symlink that pointed at it is repointed there. An agent holding
+    ///   its own link — Claude Code, say — keeps the skill; the agents that
+    ///   were reading `~/.agents/skills` no longer see it.
+    /// - An origin already in the private directory is left alone.
+    /// - For an origin Skillbase does not own, the shared directory holds a
+    ///   plain link, and removing that link is all this does.
+    pub fn unshare(&self, name: &str, origin: &Path) -> Result<Outcome, InstallError> {
+        let origin = self.ensure_in_scope(origin)?;
+        let private = self.roots.private_dir();
+        if origin.starts_with(&private) {
+            return Ok(Outcome::one(Change::NoChange {
+                path: origin,
+                reason: "out of the shared directory",
+            }));
+        }
+        if origin.starts_with(self.roots.store_dir()) {
+            require_dir(&origin)?;
+            return self.move_origin(&origin, &private.join(name));
+        }
+        let dest = self.ensure_in_scope(&self.roots.shared_dir().join(name))?;
+        self.remove_link_at(&dest, LinkMode::Symlink)
+    }
+
+    /// Moves a skill's origin into the store — `~/.agents/skills/<name>` — and
+    /// leaves a symlink behind at the path it came from.
     ///
     /// After this the skill is *managed* and Skillbase may add or remove links
-    /// to it freely. Nothing about adoption is automatic; the user asks for it
+    /// to it freely. It is also shared, because the store is the directory the
+    /// agents read. Nothing about adoption is automatic; the user asks for it
     /// per skill.
     ///
     /// If the symlink cannot be created the move is undone, so a failure leaves
@@ -664,6 +751,11 @@ impl Installer {
                 path: origin,
                 reason: "in the store",
             }));
+        }
+        // An origin in the private directory is already managed; sharing it is
+        // a move, not an adoption.
+        if origin.starts_with(self.roots.private_dir()) {
+            return self.share(name, &origin);
         }
         let dest = self.ensure_in_scope(&store.join(name))?;
         if fs::symlink_metadata(&dest).is_ok() {
@@ -982,6 +1074,10 @@ impl Installer {
 
     /// Creates a new skill in the store from a template.
     ///
+    /// The store is `~/.agents/skills`, so a new skill is shared from the
+    /// moment it is written: every agent that reads that directory sees it, and
+    /// only the agents with a directory of their own still need a link.
+    ///
     /// Returns the new directory and what was written.
     pub fn create(
         &self,
@@ -1017,6 +1113,86 @@ impl Installer {
                 ],
             },
         ))
+    }
+
+    /// Moves a skill's origin between two directories Skillbase owns, taking
+    /// every symlink that pointed at it along.
+    ///
+    /// The links are collected before the move, because a link whose target has
+    /// gone cannot be resolved afterwards, and repointed straight after it, so
+    /// each one is broken only for the length of one rename.
+    ///
+    /// If a link cannot be repointed the origin is moved back and every link is
+    /// restored, so a failure leaves the skill where it was.
+    fn move_origin(&self, from: &Path, to: &Path) -> Result<Outcome, InstallError> {
+        let from = self.ensure_in_scope(from)?;
+        let to = self.ensure_in_scope(to)?;
+        require_dir(&from)?;
+        if fs::symlink_metadata(&to).is_ok() {
+            return Err(InstallError::AlreadyExists { path: to });
+        }
+        let links = self.links_pointing_at(&from);
+        if let Some(parent) = to.parent() {
+            create_dir_all(parent)?;
+        }
+        fs::rename(&from, &to).map_err(|e| InstallError::io(&from, e))?;
+
+        let mut outcome = Outcome::one(Change::Moved {
+            from: from.clone(),
+            to: to.clone(),
+        });
+        for link in &links {
+            match self.place_symlink(link, &to) {
+                Ok(placed) => outcome.changes.extend(placed.changes),
+                Err(e) => {
+                    let _ = fs::rename(&to, &from);
+                    for link in &links {
+                        let _ = self.place_symlink(link, &from);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Every symlink in a directory Skillbase manages that resolves to
+    /// `target`.
+    ///
+    /// The target written into each link is resolved textually against the
+    /// link's own directory rather than through the filesystem, so this finds
+    /// the links to an origin that has already been moved away as well as the
+    /// links to one still in place.
+    ///
+    /// Reads only, and sorted, so the changes an operation reports come back in
+    /// the same order every time.
+    fn links_pointing_at(&self, target: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for root in self.roots.scope_roots() {
+            let Ok(entries) = fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.file_type().is_symlink() => {}
+                    _ => continue,
+                }
+                let Ok(written) = fs::read_link(&path) else {
+                    continue;
+                };
+                let resolved = if written.is_absolute() {
+                    normalize_lexical(&written)
+                } else {
+                    normalize_lexical(&root.join(&written))
+                };
+                if resolved.as_deref() == Some(target) && !found.contains(&path) {
+                    found.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
     }
 
     /// Creates or repoints a relative symlink at `dest`.
@@ -1251,6 +1427,14 @@ fn codex_config_array<'a>(
     })
 }
 
+/// True when `path` is a directory in its own right, not a symlink to one.
+fn is_real_dir(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => !meta.file_type().is_symlink() && meta.is_dir(),
+        Err(_) => false,
+    }
+}
+
 /// Fails unless `path` is a directory that exists.
 fn require_dir(path: &Path) -> Result<(), InstallError> {
     if fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
@@ -1482,6 +1666,8 @@ mod tests {
             PathBuf::from("relative/path"),
             fx.store(),
             fx.shared(),
+            fx.private(),
+            fx.private().join("../.."),
         ] {
             assert!(
                 matches!(
@@ -1513,6 +1699,11 @@ mod tests {
             installer
                 .ensure_in_scope(&fx.home().join(".claude/skills-disabled/a"))
                 .is_ok()
+        );
+        assert_eq!(
+            installer.ensure_in_scope(&fx.private().join("a")).unwrap(),
+            fx.private().join("a"),
+            "the private directory is Skillbase's to write in"
         );
     }
 
@@ -1752,51 +1943,303 @@ mod tests {
         assert!(fx.agent("cursor").join("hand-made/SKILL.md").is_file());
     }
 
+    // -- the shared switch ---------------------------------------------------
+
+    fn shared() -> &'static AgentDef {
+        Registry::shared()
+    }
+
+    #[test]
+    fn linking_shared_does_nothing_when_the_origin_is_already_in_the_store() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+        let origin = fx.store().join("shared-one");
+
+        let outcome = fx
+            .installer()
+            .link("shared-one", &origin, shared())
+            .unwrap();
+        assert_eq!(
+            outcome.changes,
+            [Change::NoChange {
+                path: origin.clone(),
+                reason: "in the shared directory",
+            }]
+        );
+        assert_eq!(before, listing(fx.home()), "nothing was written");
+        assert!(
+            !fs::symlink_metadata(&origin)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the shared directory is never linked into itself"
+        );
+
+        // The same through the higher-level call the switch makes.
+        assert!(
+            fx.installer()
+                .share("shared-one", &origin)
+                .unwrap()
+                .is_noop()
+        );
+        assert_eq!(before, listing(fx.home()));
+    }
+
+    #[test]
+    fn turning_shared_off_moves_the_origin_into_the_private_directory() {
+        let fx = Fixture::realistic();
+        let origin = fx.store().join("shared-one");
+        let hidden = fx.private().join("shared-one");
+
+        let outcome = fx.installer().unshare("shared-one", &origin).unwrap();
+        assert_eq!(
+            outcome.changes[0],
+            Change::Moved {
+                from: origin.clone(),
+                to: hidden.clone(),
+            }
+        );
+        assert!(!origin.exists(), "the agents no longer see it");
+        assert!(hidden.join(SKILL_FILE_NAME).is_file());
+
+        let result = fx.scan();
+        let skill = result.get("shared-one").unwrap();
+        assert_eq!(skill.origin, hidden);
+        assert!(skill.managed, "the private directory is Skillbase's too");
+        assert!(!skill.is_present_in("shared"));
+        assert!(!skill.visible_to().contains(&"cursor"));
+        assert!(
+            skill.visible_to().contains(&"claude-code"),
+            "the agent that holds its own link keeps the skill"
+        );
+    }
+
+    #[test]
+    fn turning_shared_off_repoints_every_link_that_pointed_at_the_origin() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        // A second link, and one parked in a disabled directory, so the repoint
+        // has to cover more than the one agent the fixture starts with.
+        installer
+            .link("shared-one", &fx.store().join("shared-one"), cursor())
+            .unwrap();
+        fx.link_rel(
+            ".claude/skills-disabled/shared-one",
+            "../../.agents/skills/shared-one",
+        );
+
+        installer
+            .unshare("shared-one", &fx.store().join("shared-one"))
+            .unwrap();
+
+        for link in [
+            fx.agent("claude-code").join("shared-one"),
+            fx.agent("cursor").join("shared-one"),
+            fx.home().join(".claude/skills-disabled/shared-one"),
+        ] {
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{} is still a link",
+                link.display()
+            );
+            assert_eq!(
+                fs::canonicalize(&link).unwrap(),
+                fx.private().join("shared-one"),
+                "{} follows the origin",
+                link.display()
+            );
+            assert!(
+                link.join(SKILL_FILE_NAME).is_file(),
+                "{} still resolves",
+                link.display()
+            );
+        }
+        assert_eq!(
+            fs::read_link(fx.agent("cursor").join("shared-one")).unwrap(),
+            Path::new("../../.skillbase/private/shared-one"),
+            "and the new target is relative, like every other link"
+        );
+    }
+
+    #[test]
+    fn turning_shared_on_moves_the_origin_back_and_repoints_the_links() {
+        let fx = Fixture::realistic();
+        let hidden = fx.private().join("hidden-one");
+        let link = fx.agent("claude-code").join("hidden-one");
+
+        let outcome = fx.installer().share("hidden-one", &hidden).unwrap();
+        assert_eq!(
+            outcome.changes[0],
+            Change::Moved {
+                from: hidden.clone(),
+                to: fx.store().join("hidden-one"),
+            }
+        );
+        assert!(!hidden.exists());
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("../../.agents/skills/hidden-one")
+        );
+        assert!(link.join(SKILL_FILE_NAME).is_file());
+
+        let result = fx.scan();
+        let skill = result.get("hidden-one").unwrap();
+        assert_eq!(skill.origin, fx.store().join("hidden-one"));
+        assert!(skill.managed);
+        assert!(skill.is_present_in("shared"));
+        assert!(skill.visible_to().contains(&"cursor"));
+        assert!(skill.visible_to().contains(&"claude-code"));
+    }
+
+    #[test]
+    fn turning_shared_off_and_on_again_leaves_the_tree_as_it_was() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+        let installer = fx.installer();
+
+        installer
+            .unshare("shared-one", &fx.store().join("shared-one"))
+            .unwrap();
+        assert_ne!(before, listing(fx.home()));
+
+        installer
+            .share("shared-one", &fx.private().join("shared-one"))
+            .unwrap();
+        assert_eq!(
+            before,
+            listing(fx.home()),
+            "the origin and every link are back where they were"
+        );
+    }
+
+    #[test]
+    fn the_switch_reaches_the_move_through_link_and_unlink_as_well() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+
+        // Off: `unlink` finds a real directory in the shared scope, which is the
+        // origin, and moves it rather than refusing.
+        installer.unlink("shared-one", shared()).unwrap();
+        assert_eq!(
+            fx.scan().get("shared-one").unwrap().origin,
+            fx.private().join("shared-one")
+        );
+
+        // On again: `link` moves it back.
+        installer
+            .link("shared-one", &fx.private().join("shared-one"), shared())
+            .unwrap();
+        assert_eq!(
+            fx.scan().get("shared-one").unwrap().origin,
+            fx.store().join("shared-one")
+        );
+    }
+
+    #[test]
+    fn hiding_a_skill_that_is_already_hidden_does_nothing() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+        let outcome = fx
+            .installer()
+            .unshare("hidden-one", &fx.private().join("hidden-one"))
+            .unwrap();
+        assert!(outcome.is_noop());
+        assert_eq!(before, listing(fx.home()));
+    }
+
+    #[test]
+    fn the_shared_switch_on_an_unmanaged_skill_writes_a_link_and_removes_it() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let origin = fx.agent("claude-code").join("claude-only");
+
+        installer.share("claude-only", &origin).unwrap();
+        let link = fx.shared().join("claude-only");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("../../.claude/skills/claude-only"),
+            "another tool's directory is linked, not moved"
+        );
+        assert!(
+            fx.scan()
+                .get("claude-only")
+                .unwrap()
+                .visible_to()
+                .contains(&"cursor")
+        );
+
+        installer.unshare("claude-only", &origin).unwrap();
+        assert!(!link.exists());
+        assert!(
+            origin.join(SKILL_FILE_NAME).is_file(),
+            "and the directory it pointed at is untouched"
+        );
+    }
+
+    #[test]
+    fn the_shared_switch_refuses_a_move_onto_a_name_that_is_taken() {
+        let fx = Fixture::realistic();
+        fx.skill(".skillbase/private/shared-one", "shared-one-hidden");
+        let before = listing(fx.home());
+
+        let err = fx
+            .installer()
+            .unshare("shared-one", &fx.store().join("shared-one"))
+            .unwrap_err();
+        assert!(matches!(err, InstallError::AlreadyExists { .. }));
+        assert_eq!(before, listing(fx.home()), "a refusal changes nothing");
+    }
+
     // -- adopt and release --------------------------------------------------
 
     #[test]
     fn adopt_moves_the_origin_into_the_store_and_leaves_a_link() {
         let fx = Fixture::realistic();
-        let origin = fx.shared().join("shared-one");
-        let outcome = fx.installer().adopt("shared-one", &origin).unwrap();
+        let origin = fx.agent("claude-code").join("claude-only");
+        let outcome = fx.installer().adopt("claude-only", &origin).unwrap();
 
         assert_eq!(
             outcome.changes,
             [
                 Change::Moved {
                     from: origin.clone(),
-                    to: fx.store().join("shared-one"),
+                    to: fx.store().join("claude-only"),
                 },
                 Change::CreatedSymlink {
                     path: origin.clone(),
-                    target: PathBuf::from("../../.skillbase/store/shared-one"),
+                    target: PathBuf::from("../../.agents/skills/claude-only"),
                 },
             ]
         );
-        assert!(fx.store().join("shared-one/SKILL.md").is_file());
+        assert!(fx.store().join("claude-only/SKILL.md").is_file());
         assert!(origin.symlink_metadata().unwrap().file_type().is_symlink());
         assert!(
-            fx.agent("claude-code")
-                .join("shared-one/SKILL.md")
-                .is_file(),
-            "the link through the shared directory still resolves"
+            origin.join(SKILL_FILE_NAME).is_file(),
+            "the link Claude Code is left with still resolves"
         );
 
         let skill = fx.scan();
-        let adopted = skill.get("shared-one").unwrap();
+        let adopted = skill.get("claude-only").unwrap();
         assert!(adopted.managed);
-        assert_eq!(adopted.origin, fx.store().join("shared-one"));
+        assert_eq!(adopted.origin, fx.store().join("claude-only"));
+        assert!(
+            adopted.visible_to().contains(&"cursor"),
+            "adopting a skill puts it in the directory the agents read"
+        );
     }
 
     #[test]
     fn adopt_and_release_round_trip() {
         let fx = Fixture::realistic();
         let before = listing(fx.home());
-        let origin = fx.shared().join("shared-one");
+        let origin = fx.agent("claude-code").join("claude-only");
         let installer = fx.installer();
 
-        installer.adopt("shared-one", &origin).unwrap();
-        let outcome = installer.release("shared-one", &origin).unwrap();
+        installer.adopt("claude-only", &origin).unwrap();
+        let outcome = installer.release("claude-only", &origin).unwrap();
         assert_eq!(
             outcome.changes,
             [
@@ -1804,7 +2247,7 @@ mod tests {
                     path: origin.clone()
                 },
                 Change::Moved {
-                    from: fx.store().join("shared-one"),
+                    from: fx.store().join("claude-only"),
                     to: origin,
                 },
             ]
@@ -1815,11 +2258,11 @@ mod tests {
     #[test]
     fn adopt_refuses_when_the_store_already_has_that_name() {
         let fx = Fixture::realistic();
-        fx.skill(".skillbase/store/shared-one", "shared-one");
+        fx.skill(".agents/skills/claude-only", "claude-only");
         let before = listing(fx.home());
         let err = fx
             .installer()
-            .adopt("shared-one", &fx.shared().join("shared-one"))
+            .adopt("claude-only", &fx.agent("claude-code").join("claude-only"))
             .unwrap_err();
         assert!(matches!(err, InstallError::AlreadyExists { .. }));
         assert_eq!(before, listing(fx.home()), "a refusal changes nothing");
@@ -1833,6 +2276,28 @@ mod tests {
             .adopt("shared-two", &fx.store().join("shared-two"))
             .unwrap();
         assert!(outcome.is_noop());
+    }
+
+    #[test]
+    fn adopting_a_hidden_skill_shares_it_rather_than_moving_it_twice() {
+        let fx = Fixture::realistic();
+        let outcome = fx
+            .installer()
+            .adopt("hidden-one", &fx.private().join("hidden-one"))
+            .unwrap();
+
+        assert_eq!(
+            outcome.changes[0],
+            Change::Moved {
+                from: fx.private().join("hidden-one"),
+                to: fx.store().join("hidden-one"),
+            }
+        );
+        assert!(
+            !fx.private().join("hidden-one").exists(),
+            "no symlink is left behind in the private directory"
+        );
+        assert!(fx.store().join("hidden-one/SKILL.md").is_file());
     }
 
     #[test]
@@ -1965,7 +2430,16 @@ mod tests {
 
         let plan = installer.plan_delete(result.get("shared-two").unwrap());
         assert_eq!(plan.origin, Some(fx.store().join("shared-two")));
-        assert_eq!(plan.link_count(), 1, "the shared directory links to it");
+        assert_eq!(
+            plan.link_count(),
+            0,
+            "the store is the shared directory, so nothing links to it"
+        );
+        assert_eq!(plan.total(), 1);
+
+        let plan = installer.plan_delete(result.get("hidden-one").unwrap());
+        assert_eq!(plan.origin, Some(fx.private().join("hidden-one")));
+        assert_eq!(plan.link_count(), 1, "Claude Code links to the origin");
         assert_eq!(plan.total(), 2);
 
         let plan = installer.plan_delete(result.get("disabled-here").unwrap());
@@ -2526,8 +3000,12 @@ mod tests {
         let created = found.get("new-thing").unwrap();
         assert!(created.managed);
         assert!(
-            created.visible_to().is_empty(),
-            "a new skill is linked to nothing"
+            created.visible_to().contains(&"cursor"),
+            "the store is the directory the agents read, so a new skill is already there"
+        );
+        assert!(
+            !created.visible_to().contains(&"claude-code"),
+            "Claude Code does not read it and still needs a link"
         );
     }
 
@@ -2562,9 +3040,13 @@ mod tests {
         let fx = Fixture::realistic();
         let installer = fx.installer();
         let (dir, _) = installer.create("new-thing", "A new thing.").unwrap();
-        installer
+        let shared = installer
             .link("new-thing", &dir, Registry::shared())
             .unwrap();
+        assert!(
+            shared.is_noop(),
+            "the skill was written into the shared directory to begin with"
+        );
 
         let visible = fx.scan().get("new-thing").unwrap().visible_to();
         assert!(visible.contains(&"zed"));

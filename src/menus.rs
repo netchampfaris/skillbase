@@ -26,6 +26,7 @@ actions!(
         NewSkill,
         Quit,
         ReloadSkills,
+        Save,
         ShowAll,
         ShowSettings,
         ToggleSidebar,
@@ -48,6 +49,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-n", NewSkill, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
+        // Editing SKILL.md is what the detail pane is for, and in anything that
+        // edits text Cmd-S is reflex: the hand reaches for it before the eye
+        // finds the button.
+        KeyBinding::new("cmd-s", Save, None),
         // What Finder, Notes and Music use for the same command. Cmd-Ctrl-S
         // is Mail's, and reads as a variant of Save rather than of Show.
         KeyBinding::new("cmd-alt-s", ToggleSidebar, None),
@@ -130,6 +135,8 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("New Skill", NewSkill),
             MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
+            // Below Close, where every document application on macOS puts it.
+            MenuItem::action("Save", Save),
         ]),
         // Every item here belongs to the framework's text controls. The
         // search field and the detail pane's editor both answer them, and

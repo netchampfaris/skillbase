@@ -79,7 +79,7 @@ suffix.
 | `folder-open` | `FolderOpen` | |
 | `frame` | `Frame` | Lucide's `#`, not the corner brackets Phosphor used |
 | `gallery-vertical-end` | `GalleryVerticalEnd` | |
-| `github` | `Github` | |
+| `github` | Simple Icons `github` | The official octocat mark, not HugeIcons' outline. Fill rather than stroke, same as the agent logos. |
 | `globe` | `Globe02` | bare `Globe` sits on a desk stand |
 | `hard-drive` | `HardDrive` | |
 | `heart` | `Heart` | |

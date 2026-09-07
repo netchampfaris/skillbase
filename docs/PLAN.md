@@ -16,8 +16,8 @@ One canonical store owned by Skillbase. Every agent gets a link into it.
 Visibility is a property the user sets, not a directory they manage.
 
 ```
-~/.skillbase/skills/<skill-name>/SKILL.md     canonical source of truth
-        │
+~/.agents/skills/<skill-name>/SKILL.md        canonical source of truth
+        │                                        read directly by most agents
         ├── symlink ──> ~/.claude/skills/<skill-name>
         ├── symlink ──> ~/.codex/skills/<skill-name>
         └── (absent)     ~/.cursor/...              not visible to Cursor

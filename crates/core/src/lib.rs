@@ -73,9 +73,15 @@ mod discovery;
 mod doc;
 mod error;
 mod frontmatter;
+mod github;
+mod github_token;
+mod http;
 mod install;
+mod provenance;
 mod registry;
+mod remote;
 mod skill;
+mod skillsh;
 mod slug;
 #[cfg(test)]
 mod test_fixture;
@@ -97,15 +103,35 @@ pub use frontmatter::{
     KEY_ALLOWED_TOOLS, KEY_DESCRIPTION, KEY_LICENSE, KEY_METADATA, KEY_NAME, KEY_VERSION,
     SkillFrontmatter,
 };
+pub use github::{
+    GITHUB_API_BASE, GITHUB_CODELOAD_BASE, GITHUB_TOKEN_ENV, GitHub, GitHubError, RateLimit,
+    RefState, RepoRef, SkillLocation, Tree, TreeEntry, extract_subdir,
+};
+pub use github_token::{TokenSource, github_token_source};
+pub use http::{Http, HttpError, HttpResponse, MAX_BODY_BYTES, USER_AGENT, UreqHttp};
 pub use install::{
     COPY_MARKER, Change, ConsolidatePlan, ContentDiff, DeletePlan, Duplicate, InstallError,
     Installer, Outcome,
 };
+pub use provenance::{
+    DEFAULT_BRANCH, KEY_GITHUB_PATH, KEY_GITHUB_REF, KEY_GITHUB_REPO, KEY_GITHUB_TREE_SHA,
+    LockEntry, PROVENANCE_KEYS, Provenance, SKILL_LOCK_FILE, SkillLock, split_owner_repo,
+};
 pub use registry::{
-    AgentDef, DisableMode, GlobalDir, LinkMode, Registry, Roots, SHARED_ID, SHARED_SKILLS_DIR,
-    STORE_DIR, STORE_ID, UNSUPPORTED, home_dir,
+    AgentDef, DisableMode, GlobalDir, LinkMode, PRIVATE_DIR, PRIVATE_ID, Registry, Roots,
+    SHARED_ID, SHARED_SKILLS_DIR, STORE_DIR, UNSUPPORTED, home_dir,
+};
+pub use remote::{
+    FetchError, InstallOptions, Installed, LocalState, REMOTE_CACHE_FILE, RemoteCache, RepoRecord,
+    STAGING_DIR, SkillRecord, UpdateReport, UpdateStatus, UpdateTarget, check_updates,
+    content_digest, install_from_github, local_state, provenance_of, repo_key, update_targets,
+    upstream_state,
 };
 pub use skill::{SKILL_FILE_NAME, Skill};
+pub use skillsh::{
+    DEFAULT_LIMIT, MAX_LIMIT, MIN_QUERY_LEN, SEARCH_URL, SearchError, SearchHit, SearchResults,
+    SkillsSh, resolve,
+};
 pub use slug::{FALLBACK_SLUG, is_kebab_case, slugify};
 pub use usage::{
     CLAUDE_RETENTION_DAYS, CLAUDE_TRANSCRIPT_DIR, COPILOT_SESSION_DIR, RECORDING_AGENT_IDS,

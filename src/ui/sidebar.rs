@@ -1,29 +1,30 @@
-//! The sidebar column: its two header bands, a New skill row, a Library group,
-//! an Agents group listing only the agents that exist on this machine, and
+//! The sidebar column: its two header bands, a top group of Discover and the
+//! two commands that put a skill in the store, a Library group, a collapsible
+//! Agents group listing only the agents that exist on this machine, and
 //! Settings pinned to the bottom.
 
+use std::rc::Rc;
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::sidebar::{
-    Sidebar, SidebarItem, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
-};
+use gpui_kit::component::sidebar::{Sidebar, SidebarItem, SidebarMenu, SidebarMenuItem};
+use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Collapsible, Icon, IconName, Sizable as _, StyledExt as _, TitleBar, h_flex,
-    v_flex,
+    ActiveTheme as _, Collapsible, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Context, Div, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, App, ClickEvent, Context, ElementId, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    px, rems,
 };
 use skillbase_core::{AgentDef, Registry};
 
+use crate::app::{Skillbase, WorkArea};
+
 use super::agent_icon;
-
-use crate::app::Skillbase;
-
-use super::BAND_HEIGHT;
 use super::model::{Library, Scope};
+use super::{BAND_HEIGHT, TRAFFIC_LIGHT_INSET, drag_band};
 
 /// Wide enough for the longest scope label, and visibly subordinate to the
 /// work area.
@@ -36,14 +37,24 @@ impl Skillbase {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let scope = self.scope;
-        let in_settings = self.showing_settings;
+        let in_library = self.work_area == WorkArea::Skills;
         let scan = self.scan();
 
-        // A new skill lands in the store whatever the selected scope is, so it
-        // reads as a destination's peer rather than as a list control.
+        // Discover is a destination; the other two are commands that land a
+        // skill in the same store. They share a group, headed "Add skills",
+        // because they are how a skill that is not here yet gets here.
+        let discover = SidebarMenuItem::new("Discover")
+            .icon(IconName::Search)
+            .active(self.work_area == WorkArea::Discover)
+            .on_click(cx.listener(|this, _, window, cx| this.show_discover(window, cx)));
+
         let new_skill = SidebarMenuItem::new("New skill")
             .icon(IconName::Plus)
             .on_click(cx.listener(|this, _, window, cx| this.open_new_skill_dialog(window, cx)));
+
+        let install = SidebarMenuItem::new("Install from GitHub")
+            .icon(IconName::Github)
+            .on_click(cx.listener(|this, _, window, cx| this.open_install_dialog(window, cx)));
 
         let library: Vec<_> =
             Library::ALL
@@ -53,7 +64,7 @@ impl Skillbase {
                     let total = scan.map(|scan| scan.count(target));
                     SidebarMenuItem::new(library.label())
                         .icon(library_icon(library))
-                        .active(!in_settings && scope == target)
+                        .active(in_library && scope == target)
                         .suffix(move |_, cx| count_label(total, cx))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.select_scope(target, window, cx)
@@ -82,13 +93,14 @@ impl Skillbase {
                     let absent = scan.is_some() && !installed.contains(&agent);
                     SidebarMenuItem::new(agent.display_name)
                         .icon(agent_icon(agent))
-                        .active(!in_settings && scope == target)
+                        .active(in_library && scope == target)
                         .suffix(move |_, cx| {
                             if absent {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child("not installed")
+                                    .into_any_element()
                             } else {
                                 count_label(total, cx)
                             }
@@ -101,38 +113,40 @@ impl Skillbase {
 
         let settings_item = SidebarMenuItem::new("Settings")
             .icon(IconName::Settings)
-            .active(in_settings)
-            .on_click(cx.listener(|this, _, _, cx| this.show_settings(cx)));
+            .active(self.work_area == WorkArea::Settings)
+            .on_click(cx.listener(|this, _, _, cx| this.show(WorkArea::Settings, cx)));
 
         v_flex()
             .h_full()
             .flex_shrink_0()
             .w(px(SIDEBAR_WIDTH))
-            .bg(cx.theme().tokens.sidebar)
-            // The column owns the boundary with the work area, so the two bands
+            // The step from this background to the work area's is the boundary
+            // — one edge down the full height of the column, so the two bands
             // and the navigation under them cannot draw it at different widths.
-            .border_r_1()
-            .border_color(cx.theme().sidebar_border)
-            .child(self.sidebar_identity_band(cx))
+            // There is no hairline: `sidebar.border` is fully transparent in
+            // both themes, so the `border_r_1` that used to sit here only spent
+            // a pixel of layout width painting nothing.
+            .bg(cx.theme().tokens.sidebar)
+            .child(self.sidebar_identity_band(window, cx))
             .child(self.sidebar_name_band(cx))
-            // New skill sits above the scope list rather than inside it as a
-            // headingless first group. It is a command, not a destination, so
-            // it should not scroll away from the column it acts on — and out
-            // here it is spaced by this padding rather than by the padding the
-            // list puts around a section, which left it stranded between two
-            // gaps wider than the row itself.
-            .child(
-                div()
-                    .px_3()
-                    .child(scope_menu().child(new_skill).render("new", window, cx)),
-            )
             .child(
                 div().flex().flex_1().min_h_0().child(
                     Sidebar::new("scopes")
                         .w_full()
                         .border_r_0()
-                        .child(ScopeGroup::new("Library", library).leading())
-                        .child(ScopeGroup::new("Agents", agents))
+                        .child(
+                            ScopeGroup::new("Add skills", vec![discover, new_skill, install])
+                                .leading(),
+                        )
+                        .child(ScopeGroup::new("Library", library))
+                        .child(
+                            ScopeGroup::new("Agents", agents)
+                                .folded(self.agents_collapsed)
+                                .on_toggle(Rc::new(cx.listener(|this, _, _, cx| {
+                                    this.agents_collapsed = !this.agents_collapsed;
+                                    cx.notify();
+                                }))),
+                        )
                         // Settings goes into the footer as a bare menu rather
                         // than wrapped in `SidebarFooter`. That wrapper adds its
                         // own padding on top of the footer region's, which
@@ -151,20 +165,32 @@ impl Skillbase {
     /// The sidebar's first band: nothing but the collapse control, because the
     /// macOS traffic lights take the rest of the row.
     ///
-    /// `TitleBar` is what stands in here rather than a plain row, for the inset
-    /// those lights need and for the window drag and double-click zoom it
-    /// already owns. Its bottom hairline is painted in the sidebar's own colour
-    /// so the band and the sidebar read as one surface.
-    fn sidebar_identity_band(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        TitleBar::new()
+    /// A `drag_band` rather than `TitleBar`: the latter is 34px tall before
+    /// any override, which sat the toggle off the traffic lights' centre line.
+    fn sidebar_identity_band(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        drag_band("sidebar-identity", window, cx)
+            .flex_shrink_0()
             .h(BAND_HEIGHT)
+            .pl(px(TRAFFIC_LIGHT_INSET))
             .bg(cx.theme().tokens.sidebar)
-            .border_color(cx.theme().tokens.sidebar)
+            .items_center()
             .child(
-                h_flex().h_full().items_center().child(
-                    SidebarToggleButton::new()
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                ),
+                // The `Button` `SidebarToggleButton` wraps, rather than the
+                // wrapper itself: the wrapper exposes no way to name the
+                // control, and this one hides half the interface. The band is
+                // rendered only while the sidebar is showing, so the button is
+                // always the hide half of the pair.
+                Button::new("collapse")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::PanelLeftClose).size_4())
+                    .tooltip("Hide sidebar")
+                    .accessibility_label("Hide sidebar")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
             )
     }
 
@@ -213,13 +239,11 @@ impl Skillbase {
                     .small()
                     .icon(IconName::RotateCw)
                     .tooltip("Re-scan every scope")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.rescan(None, window, cx);
-                        // Cheap after the first read, which is cached, and
-                        // Refresh is the one gesture that means "look at the
-                        // machine again".
-                        this.count_usage(window, cx);
-                    })),
+                    .accessibility_label("Re-scan every scope")
+                    // The one gesture that means "look at the machine again",
+                    // which is why it is also the one that spends requests on
+                    // an update check without being asked twice.
+                    .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
             )
     }
 }
@@ -245,7 +269,14 @@ struct ScopeGroup {
     items: Vec<SidebarMenuItem>,
     /// True for the group at the top, which needs no space above it.
     leading: bool,
+    /// The sidebar rail asked this group to fold to an icon. Distinct from
+    /// [`ScopeGroup::folded`], which is the Agents heading the user clicks.
     collapsed: bool,
+    /// True when the group's own rows are hidden behind its heading. Has no
+    /// effect while the rail is also collapsed, since collapsing hides the
+    /// heading and leaves nothing to unfold with.
+    folded: bool,
+    on_toggle: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
 }
 
 impl ScopeGroup {
@@ -255,6 +286,8 @@ impl ScopeGroup {
             items,
             leading: false,
             collapsed: false,
+            folded: false,
+            on_toggle: None,
         }
     }
 
@@ -262,6 +295,18 @@ impl ScopeGroup {
     /// list already pads its first item.
     fn leading(mut self) -> Self {
         self.leading = true;
+        self
+    }
+
+    /// Hide the rows, leaving the heading as the control that brings them
+    /// back. Ignored while the rail is collapsed, for the same reason.
+    fn folded(mut self, folded: bool) -> Self {
+        self.folded = folded;
+        self
+    }
+
+    fn on_toggle(mut self, on_toggle: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>) -> Self {
+        self.on_toggle = Some(on_toggle);
         self
     }
 }
@@ -286,8 +331,19 @@ impl SidebarItem for ScopeGroup {
     ) -> impl IntoElement {
         let id = id.into();
         let collapsed = self.collapsed;
+        let folded = self.folded;
         let leading = self.leading;
+        let toggle = self.on_toggle.clone();
+        // The rail collapse hides the heading; folding the section does not.
         let label = self.label.clone().filter(|_| !collapsed);
+        // `SidebarMenu::collapsed` does not hide rows, it renders each one
+        // icon-only and centred — the look the rail collapse wants, not the
+        // look a folded section wants. So a folded section skips the menu
+        // entirely instead of passing `folded` through as `collapsed`. This
+        // only applies while the rail is expanded: collapsed, there is no
+        // heading to unfold with, so the rows stay icon-only regardless of
+        // `folded`.
+        let hide_rows = folded && !collapsed;
 
         div()
             .flex()
@@ -295,31 +351,83 @@ impl SidebarItem for ScopeGroup {
             // Sections stand apart; rows within a section do not.
             .when(!leading, |this| this.pt_4())
             .when_some(label, |this, label| {
+                this.child(section_heading(label, folded, toggle, cx))
+            })
+            .when(!hide_rows, |this| {
                 this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_shrink_0()
-                        .h_6()
-                        .px_2()
-                        .text_xs()
-                        .text_color(cx.theme().sidebar_foreground.opacity(0.7))
-                        .child(label),
+                    scope_menu()
+                        .children(self.items)
+                        .collapsed(collapsed)
+                        .render(id, window, cx),
                 )
             })
-            .child(
-                scope_menu()
-                    .children(self.items)
-                    .collapsed(collapsed)
-                    .render(id, window, cx),
-            )
     }
+}
+
+fn section_heading(
+    label: SharedString,
+    folded: bool,
+    toggle: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
+    cx: &App,
+) -> AnyElement {
+    let muted = cx.theme().sidebar_foreground.opacity(0.7);
+    // `flex_1` rather than an intrinsic width: it takes the slack a `Button`
+    // would otherwise spend centring its content, which pushes the chevron
+    // to the trailing edge where a fold control belongs.
+    let text = div()
+        .flex_1()
+        .min_w_0()
+        .text_xs()
+        .text_color(muted)
+        .child(label.clone());
+
+    let Some(toggle) = toggle else {
+        return h_flex()
+            .flex_shrink_0()
+            .h_6()
+            .px_2()
+            .items_center()
+            .child(text)
+            .into_any_element();
+    };
+
+    // A real button rather than a div wearing a hover: this heading is the
+    // control that folds the section, so it has to be a tab stop, show that it
+    // is being pressed, and announce itself. `small` is what gives a Button
+    // the same 24px height, 8px padding and 4px gap the plain heading has;
+    // what changes is that the hover is now the one every other ghost control
+    // in the sidebar uses.
+    Button::new(ElementId::from(format!("scope-heading-{label}")))
+        .ghost()
+        .small()
+        .w_full()
+        .accessibility_label(label)
+        // Expanded, not selected: what the control reports is whether the rows
+        // under it are showing.
+        .toggled(!folded)
+        .child(text)
+        .child(
+            Icon::new(if folded {
+                IconName::ChevronRight
+            } else {
+                IconName::ChevronDown
+            })
+            .xsmall()
+            .flex_shrink_0()
+            .text_color(muted),
+        )
+        .on_click(move |event, window, cx| toggle(event, window, cx))
+        .into_any_element()
 }
 
 fn library_icon(library: Library) -> IconName {
     match library {
-        Library::All => IconName::LayoutDashboard,
-        Library::Shared => IconName::Globe,
+        // A stack of sheets, for the group that is every sheet. A dashboard
+        // grid said "panels", which is not what this row shows.
+        Library::All => IconName::GalleryVerticalEnd,
+        // Linked nodes, for the one directory the agents all read. A globe
+        // said "the internet"; ~/.agents/skills is on this machine.
+        Library::Shared => IconName::Network,
         Library::Managed => IconName::CircleCheck,
         Library::Unmanaged => IconName::Folder,
         Library::Invalid => IconName::TriangleAlert,
@@ -327,14 +435,24 @@ fn library_icon(library: Library) -> IconName {
     }
 }
 
-/// The count trailing a scope row. Neutral: it is metadata, not a state. A
-/// dash stands in until the first scan lands, so the row does not claim zero.
-fn count_label(total: Option<usize>, cx: &App) -> Div {
-    div()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(match total {
-            Some(total) => total.to_string(),
-            None => "—".to_string(),
-        })
+/// The count trailing a scope row. Neutral: it is metadata, not a state. Same
+/// size as the row's name, so the two read as one label.
+///
+/// Until the first scan lands there is no number, and the row wears the same
+/// skeleton the list's rows do rather than a dash: a dash reads as a value —
+/// zero, or not applicable — which is the wrong thing to say about a count
+/// that is still being computed. It is sized to a two-digit count so the row
+/// does not reflow when the real one arrives.
+fn count_label(total: Option<usize>, cx: &App) -> AnyElement {
+    match total {
+        Some(total) => div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(total.to_string())
+            .into_any_element(),
+        None => Skeleton::new()
+            .h(rems(0.8))
+            .w(rems(1.25))
+            .into_any_element(),
+    }
 }

@@ -15,10 +15,10 @@ use std::rc::Rc;
 use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, Textarea, TextareaState};
-use gpui_kit::component::label::Label;
+use gpui_kit::component::dialog::{DialogButtonProps, DialogClose, DialogFooter};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, TextareaState};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
@@ -28,18 +28,23 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, Entity, EventEmitter, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, EventEmitter,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, rems,
 };
 use skillbase_core::{
-    AgentDef, ConsolidatePlan, DeletePlan, DisableMode, Duplicate, InstallError, Installer,
-    LocationKind, Outcome, Registry, Roots, SKILL_FILE_NAME, STORE_ID, Skill, SkillDoc, SkillError,
+    AgentDef, ConsolidatePlan, DeletePlan, DisableMode, Duplicate, InstallError, InstallOptions,
+    Installer, LocalState, LocationKind, Outcome, PRIVATE_ID, Provenance, Registry, RemoteCache,
+    RepoRef, Roots, SKILL_FILE_NAME, Skill, SkillDoc, SkillError, SkillLocation, UpdateReport,
+    UpdateStatus, local_state, repo_key,
 };
 
-use super::model::{Issue, Scan, SkillView, agent_label, display_path, has_disable_state};
-use super::report;
-use super::{BAND_HEIGHT, agent_icon, drag_band};
+use super::model::{
+    Issue, Scan, SkillView, agent_label, ago, display_path, has_disable_state, short_sha,
+};
+use super::{
+    BAND_HEIGHT, PROSE_MAX_WIDTH, agent_icon, drag_band, install_skill, report, report_install,
+};
 
 /// How many differing paths a duplicate lists before it starts counting.
 const DIFF_PATHS: usize = 6;
@@ -48,6 +53,10 @@ const DIFF_PATHS: usize = 6;
 pub enum DetailEvent {
     /// The filesystem changed. Scan again, and land on `select` afterwards.
     Changed { select: Option<SharedString> },
+    /// The skill was replaced by the copy upstream holds. Scan again, land on
+    /// `select`, and ask GitHub again: the tree sha this skill records has
+    /// just moved, so the last check's answer for it is no longer true.
+    Updated { select: Option<SharedString> },
 }
 
 /// Where the `SKILL.md` read has got to.
@@ -70,7 +79,30 @@ enum Duplicates {
     Ready(ConsolidatePlan),
 }
 
-/// The right-hand pane.
+/// Where the read of the selected skill's origin has got to.
+///
+/// Two questions, and only the second costs anything: where the skill came
+/// from, which its own frontmatter answers, and whether the directory still
+/// holds what was installed, which is a hash of every file in it. That is
+/// filesystem work, so it happens on a background task.
+enum Remote {
+    /// The skill records no provenance. Most skills were written by hand and
+    /// never came from anywhere, and a Source section on every one of them
+    /// would be an empty box repeated down the library.
+    None,
+    Reading,
+    Ready(Origin),
+}
+
+/// Where one skill came from, and whether the copy here still matches it.
+struct Origin {
+    provenance: Provenance,
+    local: LocalState,
+    /// Seconds since the Unix epoch when this repository was last asked about,
+    /// or 0 when it never has been.
+    checked_at: i64,
+}
+
 /// One entry in a skill directory, flattened depth-first.
 ///
 /// The directory is shown as a tree rather than a row of tags because its files
@@ -169,6 +201,19 @@ pub struct DetailPane {
     /// Bumped on every comparison, so one that lands after the selection moved
     /// on is dropped.
     duplicates_generation: u64,
+    /// Where the selected skill came from, and whether it has been edited
+    /// since.
+    remote: Remote,
+    /// Bumped on every read of the above, for the same reason.
+    remote_generation: u64,
+    /// What the last update check found, pushed in by the root view. The check
+    /// covers every skill at once and lands long after any one selection, so
+    /// it is handed over rather than read across.
+    updates: Option<Rc<UpdateReport>>,
+    /// Set while the update dialog's checkbox is ticked. Reset every time the
+    /// dialog opens, so an acknowledgement never carries over to another
+    /// skill or another day.
+    update_acknowledged: bool,
     description: Entity<TextareaState>,
     body: Entity<EditorState>,
     dirty: bool,
@@ -211,6 +256,10 @@ impl DetailPane {
             open: Vec::new(),
             duplicates: Duplicates::None,
             duplicates_generation: 0,
+            remote: Remote::None,
+            remote_generation: 0,
+            updates: None,
+            update_acknowledged: false,
             visibility_open: false,
             description,
             body,
@@ -252,10 +301,11 @@ impl DetailPane {
             self.tab_scroll.scroll_to_item(0);
         }
 
-        // The duplicate comparison is against the disk, not against the
-        // editor, so it is refreshed on every show — including the one that
-        // follows a mutation, which is exactly when it has changed.
+        // Both of these compare the disk against a record of it, not against
+        // the editor, so they are refreshed on every show — including the one
+        // that follows a mutation, which is exactly when they have changed.
         self.compare_duplicates(window, cx);
+        self.read_origin(window, cx);
 
         // Re-reading the file under an unsaved edit would throw the edit away.
         // A mutation that only moved links leaves the bytes alone, so keep what
@@ -355,6 +405,95 @@ impl DetailPane {
             .ok();
         })
         .detach();
+    }
+
+    /// Adopt whatever the last update check found.
+    ///
+    /// Pushed in by the root view rather than read across, because the check
+    /// covers every installed skill at once and lands long after any one
+    /// selection has been made.
+    pub fn set_updates(&mut self, updates: Option<Rc<UpdateReport>>, cx: &mut Context<Self>) {
+        self.updates = updates;
+        cx.notify();
+    }
+
+    /// Read where the selected skill came from, and whether it still holds the
+    /// bytes that were installed.
+    ///
+    /// The second question is a content digest of the whole directory compared
+    /// against the one recorded at install, so it is filesystem work and runs
+    /// on a background task. A skill with no provenance costs nothing: the read
+    /// is not started at all.
+    fn read_origin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remote_generation += 1;
+        let generation = self.remote_generation;
+
+        let Some((skill, provenance)) = self
+            .skill
+            .clone()
+            .and_then(|skill| skill.provenance.clone().map(|p| (skill, p)))
+        else {
+            self.remote = Remote::None;
+            return;
+        };
+
+        self.remote = Remote::Reading;
+        let roots = self.roots.clone();
+        let name = skill.name.to_string();
+        let dir = skill.origin.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let origin = cx
+                .background_spawn(async move {
+                    let cache = RemoteCache::read(&roots);
+                    let checked_at = repo_ref_of(&provenance)
+                        .and_then(|repo| cache.repo(&repo_key(&repo)).map(|r| r.checked_at))
+                        .unwrap_or(0);
+                    Origin {
+                        local: local_state(&cache, &name, &dir),
+                        provenance,
+                        checked_at,
+                    }
+                })
+                .await;
+            this.update_in(cx, |this, _, cx| {
+                if this.remote_generation != generation {
+                    return;
+                }
+                this.remote = Remote::Ready(origin);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the last check said about the selected skill.
+    fn update_status(&self) -> Option<&UpdateStatus> {
+        let skill = self.skill.as_ref()?;
+        self.updates.as_ref()?.status(&skill.name)
+    }
+
+    /// True when there is something upstream worth taking.
+    ///
+    /// `NoBaseline` counts. It means whatever installed this skill recorded no
+    /// sha, so Skillbase cannot say the copy here is current; downloading
+    /// upstream again is the only way to make it so.
+    fn update_available(&self) -> bool {
+        matches!(
+            self.update_status(),
+            Some(UpdateStatus::UpdateAvailable { .. } | UpdateStatus::NoBaseline { .. })
+        )
+    }
+
+    /// True when an update would land on this skill's own directory.
+    ///
+    /// A download always writes to `~/.agents/skills/<name>`. For a skill whose
+    /// origin is somewhere else — a hidden skill, or one another tool owns —
+    /// that is a second directory beside the first rather than a replacement,
+    /// so the Update button is not offered and the Source section says why.
+    fn updates_in_place(&self, skill: &SkillView) -> bool {
+        skill.origin == self.roots.store_dir().join(skill.name.as_ref())
     }
 
     /// Accept, or take back, losing one divergent duplicate's edits.
@@ -491,8 +630,17 @@ impl DetailPane {
     // ------------------------------------------------------------- mutations
 
     /// Run one filesystem operation on a background thread and report it.
-    fn run<F>(&mut self, title: &'static str, op: F, window: &mut Window, cx: &mut Context<Self>)
-    where
+    ///
+    /// `failed` is the title a refusal is announced under, so a delete that
+    /// was turned down is not headed "Deleted".
+    fn run<F>(
+        &mut self,
+        title: &'static str,
+        failed: &'static str,
+        op: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
         F: FnOnce(Installer) -> Result<Outcome, InstallError> + Send + 'static,
     {
         if self.busy {
@@ -509,7 +657,7 @@ impl DetailPane {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;
-                report(title, result, &this.roots, window, cx);
+                report(title, failed, result, &this.roots, window, cx);
                 // Scan again either way: a refusal still means the interface
                 // should re-read what is actually there.
                 cx.emit(DetailEvent::Changed { select });
@@ -536,10 +684,15 @@ impl DetailPane {
         let name = skill.name.to_string();
         let origin = skill.origin.clone();
         let parked = skill.parked_in(agent.id);
-        let title = if on { "Linked" } else { "Unlinked" };
+        let (title, failed) = if on {
+            ("Linked", "Could not link")
+        } else {
+            ("Unlinked", "Could not unlink")
+        };
 
         self.run(
             title,
+            failed,
             move |installer| {
                 if on {
                     installer.link(&name, &origin, agent)
@@ -575,8 +728,15 @@ impl DetailPane {
         let name = skill.name.to_string();
         let origin = skill.origin.clone();
 
+        let (title, failed) = if on {
+            ("Enabled", "Could not enable")
+        } else {
+            ("Disabled", "Could not disable")
+        };
+
         self.run(
-            if on { "Enabled" } else { "Disabled" },
+            title,
+            failed,
             move |installer| {
                 if on {
                     installer.enable(&name, &origin, agent)
@@ -597,6 +757,7 @@ impl DetailPane {
         let origin = skill.origin.clone();
         self.run(
             "Adopted",
+            "Could not adopt",
             move |installer| installer.adopt(&name, &origin),
             window,
             cx,
@@ -629,6 +790,7 @@ impl DetailPane {
         };
         self.run(
             "Released",
+            "Could not release",
             move |installer| installer.release(&name, &dest),
             window,
             cx,
@@ -667,8 +829,10 @@ impl DetailPane {
             Some(path) => format!("the directory {}", display_path(path, &roots)),
             None => "nothing that Skillbase owns".to_string(),
         };
+        // The title names the skill, so the body opens on what goes rather
+        // than repeating the name a line below it.
         let summary = format!(
-            "Deleting {name} removes {origin_line}, {} link{}, and {} duplicate director{}.{}",
+            "Removes {origin_line}, {} link{}, and {} duplicate director{}.{}",
             plan.link_count(),
             if plan.link_count() == 1 { "" } else { "s" },
             plan.copy_count(),
@@ -689,13 +853,13 @@ impl DetailPane {
             let plan = plan.clone();
             let this = this.clone();
             alert
-                .title("Delete this skill?")
+                .title(format!("Delete {name}?"))
                 .description(summary.clone())
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Delete")
                         .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
-                        .cancel_text("Keep")
+                        .cancel_text("Cancel")
                         .show_cancel(true),
                 )
                 .on_ok(move |_, window, cx| {
@@ -703,6 +867,7 @@ impl DetailPane {
                         let plan = plan.clone();
                         this.run(
                             "Deleted",
+                            "Could not delete",
                             move |installer| installer.delete(&plan),
                             window,
                             cx,
@@ -833,12 +998,15 @@ impl DetailPane {
                     });
 
             alert
-                .title(format!("Consolidate {name}?"))
+                .title(format!(
+                    "Replace {replace_count} cop{} of {name}?",
+                    if replace_count == 1 { "y" } else { "ies" }
+                ))
                 .description(description)
                 .width(px(520.))
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text(format!("Replace {replace_count}"))
+                        .ok_text("Replace")
                         .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
                         .cancel_text("Cancel")
                         .show_cancel(true),
@@ -847,7 +1015,8 @@ impl DetailPane {
                     this.update(cx, |this, cx| {
                         let plan = plan.clone();
                         this.run(
-                            "Consolidated",
+                            "Replaced",
+                            "Could not replace",
                             move |installer| installer.consolidate(&plan),
                             window,
                             cx,
@@ -857,6 +1026,192 @@ impl DetailPane {
                     true
                 })
         });
+    }
+
+    // -------------------------------------------------------------- updating
+
+    /// Take the copy the repository holds now.
+    ///
+    /// A directory that still matches what was installed is replaced without
+    /// asking: nothing is lost, and the notification names what was written.
+    /// Anything else stops and confirms, because the one thing an update must
+    /// never do is throw away work without saying so first.
+    fn update_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(skill), false) = (self.skill.clone(), self.busy) else {
+            return;
+        };
+        let local = match &self.remote {
+            Remote::Ready(origin) => origin.local,
+            _ => LocalState::Unknown,
+        };
+        match local {
+            LocalState::Pristine => self.apply_update(window, cx),
+            LocalState::Edited | LocalState::Unknown => {
+                self.confirm_update(&skill, local, window, cx)
+            }
+        }
+    }
+
+    /// Name what the update would overwrite, and refuse until it is accepted.
+    ///
+    /// The same shape as consolidating a divergent duplicate: say what the
+    /// difference is, do nothing by default, and take one explicit tick to go
+    /// ahead. An edited skill needs that tick; a skill Skillbase simply has no
+    /// record of needs the sentence but not the ceremony.
+    fn confirm_update(
+        &mut self,
+        skill: &SkillView,
+        local: LocalState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_acknowledged = false;
+
+        let name = skill.name.clone();
+        let dir = display_path(&skill.origin, &self.roots);
+        let repo: SharedString = skill
+            .provenance
+            .as_ref()
+            .and_then(repo_ref_of)
+            .map(|repo| repo.slug().into())
+            .unwrap_or_else(|| "the repository it came from".into());
+        let edited = local == LocalState::Edited;
+        let this = cx.entity().downgrade();
+
+        // The builder runs on every frame the dialog is up, so the confirm
+        // button's disabled state is read from the view each time rather than
+        // captured once when the dialog opened.
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let consequence = if edited {
+                format!(
+                    "This copy has been edited since it was installed. Updating deletes {dir} \
+                     and writes the copy from {repo} in its place. Those edits are not kept \
+                     anywhere else."
+                )
+            } else {
+                format!(
+                    "Skillbase has no record of what was installed here, so it cannot tell \
+                     whether this copy has been edited. Updating deletes {dir} and writes the \
+                     copy from {repo} in its place."
+                )
+            };
+            let this = this.clone();
+
+            dialog
+                .title(format!("Update {name}?"))
+                .width(px(480.))
+                .content({
+                    let this = this.clone();
+                    move |content, _, cx| {
+                        let acknowledged = this
+                            .read_with(cx, |this, _| this.update_acknowledged)
+                            .unwrap_or(false);
+                        let this = this.clone();
+                        content.child(
+                            v_flex()
+                                .p_4()
+                                .gap_3()
+                                .child(div().text_sm().child(consequence.clone()))
+                                .when(edited, |content| {
+                                    content.child(
+                                        Checkbox::new("acknowledge-update")
+                                            .checked(acknowledged)
+                                            .label("Replace anyway, discarding those edits")
+                                            .on_click(move |checked: &bool, _, cx| {
+                                                let checked = *checked;
+                                                this.update(cx, |this, cx| {
+                                                    this.update_acknowledged = checked;
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                            }),
+                                    )
+                                }),
+                        )
+                    }
+                })
+                .footer({
+                    let this = this.clone();
+                    let blocked = edited
+                        && !this
+                            .read_with(cx, |this, _| this.update_acknowledged)
+                            .unwrap_or(false);
+                    DialogFooter::new()
+                        .p_4()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("cancel-update").outline().label("Cancel")),
+                        )
+                        .child(
+                            Button::new("confirm-update")
+                                .danger()
+                                .label("Replace")
+                                .disabled(blocked)
+                                .on_click(move |_, window, cx| {
+                                    this.update(cx, |this, cx| this.apply_update(window, cx))
+                                        .ok();
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                })
+        });
+    }
+
+    /// Download the skill again and write it over its own directory.
+    ///
+    /// `replacing()` is what makes it a replacement rather than a refusal, and
+    /// `named` keeps the directory name it already has, so a frontmatter name
+    /// that has drifted from the directory cannot leave two copies behind.
+    fn apply_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(skill), false) = (self.skill.clone(), self.busy) else {
+            return;
+        };
+        let Some(location) = skill.provenance.as_ref().and_then(location_of) else {
+            window.push_notification(
+                Notification::error(
+                    "This skill does not record a GitHub repository, so there is nothing to \
+                     download.",
+                )
+                .title("Cannot update"),
+                cx,
+            );
+            return;
+        };
+
+        let name = skill.name.clone();
+        let roots = self.roots.clone();
+        self.busy = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let options = InstallOptions::new().named(name.to_string()).replacing();
+            let installed = cx
+                .background_spawn(async move { install_skill(&roots, &location, &options) })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                match report_install(
+                    "Updated",
+                    "Could not update",
+                    installed,
+                    &this.roots,
+                    window,
+                    cx,
+                ) {
+                    Some(select) => cx.emit(DetailEvent::Updated {
+                        select: Some(select),
+                    }),
+                    // Nothing was written, but the pane should still re-read
+                    // what is actually there rather than assume.
+                    None => cx.emit(DetailEvent::Changed {
+                        select: Some(name.clone()),
+                    }),
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -883,70 +1238,81 @@ impl DetailPane {
 
     // ----------------------------------------------------------- presentation
 
-    fn empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn empty_state(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // No scan has landed yet, so the list beside this pane is still
+        // skeletons: there is nothing to pick from and saying so would be a
+        // lie. Once a scan is in, an empty pane means the scope is empty and
+        // the sentence points somewhere real.
+        let scanning = self.scan.is_none();
+
         v_flex()
             .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
             .bg(cx.theme().background)
+            // The window owns its titlebar drag (`app_owns_titlebar_drag`), so
+            // AppKit provides no fallback region: every state has to draw the
+            // band itself or the top of the window stops dragging and zooming.
+            // This one carries no controls — there is no skill to act on — but
+            // it matches the header's height and inset so the band across the
+            // title row stays continuous.
             .child(
-                Icon::new(IconName::FileText)
-                    .large()
-                    .text_color(cx.theme().muted_foreground),
+                drag_band("detail-header", window, cx)
+                    .flex_shrink_0()
+                    .h(BAND_HEIGHT)
+                    .px_5()
+                    .gap_3()
+                    .items_center()
+                    .justify_between(),
             )
-            .child(div().text_sm().child("No skill selected"))
             .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Pick a skill from the list to read or edit it."),
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::FileText)
+                            .large()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(div().text_sm().font_medium().child("No skill selected"))
+                    .when(!scanning, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Pick a skill from the list to read or edit it."),
+                        )
+                    }),
             )
             .into_any_element()
     }
 
+    /// The 48px band across the top of the pane.
+    ///
+    /// It carries the tab strip on its left, inside the window's own drag
+    /// region, and the action buttons — Reveal, Delete, Update when there is
+    /// somewhere for it to land, and Save — on its right. The buttons are
+    /// `flex_shrink_0` so a strip long enough to overrun the band is what
+    /// gives way and scrolls; Save never gets squeezed out to make room for a
+    /// tab.
     fn header(
         &self,
         skill: &SkillView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let invalid = skill.parse_error.is_some();
-
         drag_band("detail-header", window, cx)
             .flex_shrink_0()
             .h(BAND_HEIGHT)
             .px_5()
-            .gap_3()
+            .gap_2()
             .items_center()
             .justify_between()
+            .child(self.tabs(cx))
             .child(
                 h_flex()
-                    .gap_2()
-                    .items_center()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_base()
-                            .font_medium()
-                            .truncate()
-                            .child(skill.name.clone()),
-                    )
-                    .when(invalid, |this| {
-                        this.child(
-                            Icon::new(IconName::TriangleAlert)
-                                .small()
-                                .text_color(cx.theme().warning),
-                        )
-                    })
-                    .child(Tag::secondary().small().child(if skill.managed {
-                        "Managed"
-                    } else {
-                        "Unmanaged"
-                    })),
-            )
-            .child(
-                h_flex()
+                    .flex_shrink_0()
                     .gap_2()
                     .items_center()
                     .child(
@@ -955,6 +1321,9 @@ impl DetailPane {
                             .small()
                             .icon(IconName::FolderOpen)
                             .tooltip("Reveal the origin folder")
+                            // Icon-only: a Button names itself from its label
+                            // or this, never from its tooltip.
+                            .accessibility_label("Reveal the origin folder")
                             .on_click(cx.listener(|this, _, window, cx| this.reveal(window, cx))),
                     )
                     .child(
@@ -963,10 +1332,31 @@ impl DetailPane {
                             .small()
                             .icon(IconName::Delete)
                             .tooltip("Delete this skill")
+                            .accessibility_label("Delete this skill")
                             .disabled(self.busy)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)),
                             ),
+                    )
+                    // Only when there is something to take, and only when it
+                    // would land on this skill's own directory. Outline rather
+                    // than primary: Save is the commit this header is built
+                    // around, and two emphasised buttons would compete.
+                    .when(
+                        self.update_available() && self.updates_in_place(skill),
+                        |this| {
+                            this.child(
+                                Button::new("update")
+                                    .outline()
+                                    .small()
+                                    .label("Update")
+                                    .tooltip("Replace this skill with the copy upstream holds")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.update_skill(window, cx)
+                                    })),
+                            )
+                        },
                     )
                     .child(
                         Button::new("save")
@@ -979,6 +1369,44 @@ impl DetailPane {
                             ),
                     ),
             )
+    }
+
+    /// The 44px row under the band: the skill's name, a warning glyph when
+    /// its frontmatter fails to parse, and whether it is Managed or
+    /// Unmanaged.
+    ///
+    /// This used to sit in the band itself, next to the action buttons. The
+    /// band's left side is the tab strip now, so the name needs a row of its
+    /// own — one that stays put under the tabs rather than scrolling with
+    /// them.
+    fn identity_row(&self, skill: &SkillView, cx: &mut Context<Self>) -> impl IntoElement {
+        let invalid = skill.parse_error.is_some();
+
+        h_flex()
+            .flex_shrink_0()
+            .h_11()
+            .px_5()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_base()
+                    .font_medium()
+                    .truncate()
+                    .child(skill.name.clone()),
+            )
+            .when(invalid, |this| {
+                this.child(
+                    Icon::new(IconName::TriangleAlert)
+                        .small()
+                        .text_color(cx.theme().warning),
+                )
+            })
+            .child(Tag::secondary().small().child(if skill.managed {
+                "Managed"
+            } else {
+                "Unmanaged"
+            }))
     }
 
     /// The "Visible to" section, closed until asked for.
@@ -1010,12 +1438,21 @@ impl DetailPane {
         v_flex()
             .flex_shrink_0()
             .gap_3()
+            // A Button rather than a hand-rolled row: a disclosure is a
+            // control, and only a Button here carries a focus handle, so only
+            // a Button answers Enter and Space and draws a focus ring. The
+            // chevron and the summary go in as children rather than as
+            // `.icon()` and `.label()`, which would take the button's own size
+            // and colour instead of the heading's.
             .child(
-                h_flex()
-                    .id("visibility-header")
+                Button::new("visibility-header")
+                    .ghost()
+                    .small()
                     .w_full()
-                    .gap_2()
-                    .items_center()
+                    .accessibility_label("Visible to")
+                    // The chevron is the only thing that says open or closed,
+                    // and a listener cannot see it.
+                    .toggled(open)
                     .child(
                         Icon::new(if open {
                             IconName::ChevronDown
@@ -1023,6 +1460,7 @@ impl DetailPane {
                             IconName::ChevronRight
                         })
                         .xsmall()
+                        .flex_shrink_0()
                         .text_color(cx.theme().muted_foreground),
                     )
                     .child(section_title("Visible to", cx))
@@ -1048,6 +1486,26 @@ impl DetailPane {
                     &self.roots.shared_dir().join(skill.name.as_ref()),
                     &self.roots,
                 );
+                let private_path = display_path(
+                    &self.roots.private_dir().join(skill.name.as_ref()),
+                    &self.roots,
+                );
+                // Shared is the one switch that moves the directory rather
+                // than adding or removing a link, because the shared directory
+                // is the store. Say which way it will move, and where to.
+                let shared_effect = if skill.in_shared {
+                    format!(
+                        "Lives at {shared_path}, which {} agents read. \
+                         Switching off moves it to {private_path}.",
+                        covered.len()
+                    )
+                } else {
+                    format!(
+                        "Lives at {private_path}. Switching on moves it back to \
+                         {shared_path}, which {} agents read.",
+                        covered.len()
+                    )
+                };
 
                 this.child(
                     v_flex()
@@ -1060,11 +1518,14 @@ impl DetailPane {
                                     .bg(cx.theme().group_box)
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        "This skill's directory is not in Skillbase's store, so \
-                                         another tool may own it. Visibility is read-only until \
-                                         you adopt it.",
-                                    ),
+                                    // The measure is capped on the text, not
+                                    // on the box: the box stays the width of
+                                    // the rows it sits above.
+                                    .child(div().max_w(px(PROSE_MAX_WIDTH)).child(
+                                        "This skill's directory is not in Skillbase's store, \
+                                             so another tool may own it. Visibility is read-only \
+                                             until you adopt it.",
+                                    )),
                             )
                         })
                         .child(
@@ -1072,6 +1533,7 @@ impl DetailPane {
                                 .gap_1()
                                 .child(
                                     Switch::new("visible-shared")
+                                        .small()
                                         .checked(skill.in_shared)
                                         .disabled(!managed || self.busy)
                                         .label("Shared")
@@ -1086,6 +1548,10 @@ impl DetailPane {
                                     div()
                                         .id("shared-effect")
                                         .pl_10()
+                                        // Prose, so it stops at a measure a
+                                        // reader can track rather than running
+                                        // the full width of the pane.
+                                        .max_w(px(PROSE_MAX_WIDTH))
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         // Fourteen agent names is two lines of
@@ -1097,10 +1563,7 @@ impl DetailPane {
                                                 Tooltip::new(names.clone()).build(window, cx)
                                             }
                                         })
-                                        .child(format!(
-                                            "Links {shared_path}, which {} agents read.",
-                                            covered.len()
-                                        )),
+                                        .child(shared_effect),
                                 ),
                         )
                         .child(
@@ -1124,6 +1587,13 @@ impl DetailPane {
     /// made two agents' rows four times the height of everybody else's. Both
     /// switches now sit on one line in fixed lanes, and the explanation is a
     /// tooltip on the switch it explains.
+    ///
+    /// The row's own sentence is a tooltip for the same reason. "Reached
+    /// through Shared. A switch here would also link ~/.claude/skills/foo."
+    /// under a dozen rows is a page of near-identical text differing only in
+    /// one path segment, and it pushed everything below the fold. Only the two
+    /// states that say something the switches do not — a copy that is not a
+    /// link, and a directory parked out of the way — stay on screen.
     fn agent_row(
         &self,
         skill: &SkillView,
@@ -1138,7 +1608,8 @@ impl DetailPane {
             &self.roots,
         );
 
-        let effect = match skill.location_kind(agent.id) {
+        let kind = skill.location_kind(agent.id);
+        let effect = match kind {
             Some(LocationKind::Origin) => format!("The origin directory itself, at {dir}"),
             Some(LocationKind::Symlink { .. }) => format!("Linked at {dir}"),
             Some(LocationKind::Copy) => format!("A separate copy at {dir}, not a link"),
@@ -1148,6 +1619,12 @@ impl DetailPane {
             }
             None => format!("Links {dir}"),
         };
+        // A copy is not a link and a parked directory is not where the switch
+        // says it is: those two the reader has to be told without hovering.
+        let inline = matches!(
+            kind,
+            Some(LocationKind::Copy) | Some(LocationKind::Disabled)
+        );
 
         let switchable = has_disable_state(agent) && (present || via_shared);
         // Codex's off state is a line in its own config file, so writing it
@@ -1162,8 +1639,15 @@ impl DetailPane {
             .gap_1()
             .child(
                 h_flex()
+                    .id(ElementId::from((ElementId::from("agent-row"), agent.id)))
                     .gap_3()
                     .items_center()
+                    .when(!inline, |this| {
+                        let effect = effect.clone();
+                        this.tooltip(move |window, cx| {
+                            Tooltip::new(effect.clone()).build(window, cx)
+                        })
+                    })
                     .child(
                         h_flex()
                             .flex_1()
@@ -1177,14 +1661,25 @@ impl DetailPane {
                     // column in every row whether or not the agent has an
                     // "enabled" state, and both switches carry their own label
                     // rather than sharing one between them.
-                    .child(h_flex().flex_shrink_0().w(rems(6.5)).justify_end().when(
+                    //
+                    // Sized for the small switch: its track is 8px narrower
+                    // than medium, and its label sits at text_sm instead of
+                    // text_base, so both lanes shrank by a rem from the
+                    // widths a medium switch needed.
+                    .child(h_flex().flex_shrink_0().w(rems(5.5)).justify_end().when(
                         switchable,
                         |this| {
                             this.child(
                                 Switch::new((ElementId::from("enabled"), agent.id))
+                                    .small()
                                     .checked(enabled)
                                     .disabled(locked || self.busy)
                                     .label("Enabled")
+                                    // The visible label has room for one word;
+                                    // a reader who cannot see which row it sits
+                                    // in needs the agent named, and this
+                                    // switch moves files on disk.
+                                    .accessibility_label(format!("{} enabled", agent.display_name))
                                     .tooltip(how)
                                     .on_click(cx.listener(
                                         move |this, checked: &bool, window, cx| {
@@ -1195,25 +1690,184 @@ impl DetailPane {
                         },
                     ))
                     .child(
-                        h_flex().flex_shrink_0().w(rems(5.5)).justify_end().child(
+                        h_flex().flex_shrink_0().w(rems(4.5)).justify_end().child(
+                            // "Linked", not "Visible": this switch adds or
+                            // removes the link, which is the word the row's
+                            // own caption and its notification already use.
+                            // "Visible" and "Enabled" side by side read as the
+                            // same question asked twice.
                             Switch::new((ElementId::from("visible"), agent.id))
+                                .small()
                                 .checked(present)
                                 .disabled(!managed || self.busy)
-                                .label("Visible")
+                                .label("Linked")
+                                .accessibility_label(format!("{} linked", agent.display_name))
                                 .on_click(cx.listener(move |this, checked: &bool, window, cx| {
                                     this.set_present(agent, *checked, window, cx)
                                 })),
                         ),
                     ),
             )
+            .when(inline, |this| {
+                this.child(
+                    div()
+                        .pl_6()
+                        .max_w(px(PROSE_MAX_WIDTH))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(effect),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Where the skill came from, and how it stands against what is there now.
+    ///
+    /// Nothing at all for a skill with no provenance, which on a real machine
+    /// is most of them. An empty Source box under every hand-written skill
+    /// would be a heading standing in for an answer nobody asked for.
+    fn source_section(&self, skill: &SkillView, cx: &mut Context<Self>) -> AnyElement {
+        let origin = match &self.remote {
+            Remote::None => return div().into_any_element(),
+            Remote::Reading => {
+                return v_flex()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .child(section_title("Source", cx))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Reading where this skill came from…"),
+                    )
+                    .into_any_element();
+            }
+            Remote::Ready(origin) => origin,
+        };
+
+        let provenance = &origin.provenance;
+        let repo: SharedString = repo_ref_of(provenance)
+            .map(|repo| repo.slug().into())
+            .unwrap_or_else(|| provenance.repo_url.clone().into());
+        let path: SharedString = provenance.path.clone().into();
+        let elsewhere = !self.updates_in_place(skill);
+
+        v_flex()
+            .flex_shrink_0()
+            .gap_2()
+            .child(section_title("Source", cx))
             .child(
-                div()
-                    .pl_6()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(effect),
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .min_w_0()
+                            .text_sm()
+                            .child(Icon::new(IconName::Github).xsmall())
+                            .child(div().flex_1().min_w_0().truncate().child(repo)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(if provenance.path.is_empty() {
+                                provenance.reference.clone()
+                            } else {
+                                format!("{} · {}", provenance.reference, path)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if self.update_available() {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(self.update_sentence(&provenance.reference)),
+                    )
+                    .when(origin.local == LocalState::Edited, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().warning)
+                                .child("Edited locally since install."),
+                        )
+                    })
+                    .when(origin.local == LocalState::Unknown, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("No install record, so local edits cannot be told."),
+                        )
+                    })
+                    .when(origin.checked_at > 0, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("Checked {}", ago(origin.checked_at))),
+                        )
+                    })
+                    .when(elsewhere, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().warning)
+                                .child(format!(
+                                    "An update would land in {}, not this directory.",
+                                    display_path(
+                                        &self.roots.store_dir().join(skill.name.as_ref()),
+                                        &self.roots
+                                    )
+                                )),
+                        )
+                    }),
             )
             .into_any_element()
+    }
+
+    /// The last check's answer, in a sentence.
+    ///
+    /// Every branch names what would change and what it was measured against.
+    /// A status with no words behind it is worse than no status: the reader
+    /// cannot tell a check that came back clean from one that never ran.
+    fn update_sentence(&self, reference: &str) -> SharedString {
+        match self.update_status() {
+            None => "Not checked against GitHub yet.".into(),
+            Some(UpdateStatus::Unknown) => "The recorded source is not a GitHub repository, so \
+                                            there is nothing to check it against."
+                .into(),
+            Some(UpdateStatus::UpToDate) => format!("Up to date with {reference}.").into(),
+            Some(UpdateStatus::UpdateAvailable { tree_sha }) => format!(
+                "An update is available. {reference} holds {} now.",
+                short_sha(tree_sha)
+            )
+            .into(),
+            Some(UpdateStatus::NoBaseline { tree_sha }) => format!(
+                "Whatever installed this recorded no tree sha, so whether it is current cannot \
+                 be told from the record. {reference} holds {} now.",
+                short_sha(tree_sha)
+            )
+            .into(),
+            Some(UpdateStatus::Gone) => "The repository no longer holds a directory at this \
+                                         path. It was renamed, moved or removed upstream."
+                .into(),
+            Some(UpdateStatus::Failed {
+                rate_limited: true, ..
+            }) => "Not checked: GitHub's request limit was spent. Settings says when it resets."
+                .into(),
+            Some(UpdateStatus::Failed { reason, .. }) => {
+                format!("Could not be checked: {reason}").into()
+            }
+            // `UpdateStatus` is `#[non_exhaustive]`: a status this build does
+            // not know about is reported as unchecked rather than guessed at.
+            Some(_) => "Not checked against GitHub yet.".into(),
+        }
     }
 
     fn location(&self, skill: &SkillView, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1226,10 +1880,7 @@ impl DetailPane {
             .child(section_title("Location", cx))
             .child(
                 v_flex()
-                    .p_3()
-                    .gap_3()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().group_box)
+                    .gap_2()
                     .child(
                         h_flex()
                             .gap_2()
@@ -1241,13 +1892,13 @@ impl DetailPane {
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(if skill.managed {
-                                "Skillbase owns this directory and may add or remove links to it."
+                                "Owned by Skillbase. Links can be added or removed."
                             } else {
-                                "Skillbase reads and edits this directory in place. Adopting it \
-                                 moves it into ~/.skillbase/store and leaves a symlink behind."
+                                "Edited in place. Adopt moves it into the store and leaves a \
+                                 symlink behind."
                             }),
                     )
                     .when(conflicts > 0, |this| {
@@ -1258,7 +1909,7 @@ impl DetailPane {
                                 .child(format!(
                                     "{conflicts} other real director{} claim{} this name. Editing \
                                  here does not change {}. They are listed under Duplicate \
-                                 copies above.",
+                                 copies below.",
                                     if conflicts == 1 { "y" } else { "ies" },
                                     if conflicts == 1 { "s" } else { "" },
                                     if conflicts == 1 { "it" } else { "them" },
@@ -1283,7 +1934,10 @@ impl DetailPane {
                                     .outline()
                                     .small()
                                     .label("Release")
-                                    .tooltip("Move the directory back out of the store")
+                                    .tooltip(
+                                        "Move the directory back out of the store, to where its \
+                                         link points",
+                                    )
                                     .disabled(self.busy)
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.release(window, cx)),
@@ -1352,9 +2006,9 @@ impl DetailPane {
                             .primary()
                             .small()
                             .label(if replace == 1 {
-                                "Consolidate 1 copy".to_string()
+                                "Replace 1 copy".to_string()
                             } else {
-                                format!("Consolidate {replace} copies")
+                                format!("Replace {replace} copies")
                             })
                             .tooltip("Replace each copy with a symlink to the origin")
                             .disabled(self.busy || replace == 0)
@@ -1372,6 +2026,9 @@ impl DetailPane {
             .child(
                 v_flex()
                     .rounded(cx.theme().radius)
+                    // The rows are square, and a divergent one carries a left
+                    // border: both would paint over the card's corner curve.
+                    .overflow_hidden()
                     .bg(cx.theme().group_box)
                     .children(
                         plan.duplicates()
@@ -1544,81 +2201,102 @@ impl DetailPane {
                     // user can predict.
                     .py_1()
                     .rounded(cx.theme().radius)
+                    // The rows are square. Without this the top and bottom
+                    // row's hover and selected fills paint over the card's
+                    // corner curve.
+                    .overflow_hidden()
                     .bg(cx.theme().group_box)
                     .children(self.tree.clone().iter().map(|node| self.file_row(node, cx)))
                     .into_any_element()
             })
     }
 
+    /// One row of the listing.
+    ///
+    /// A `Button` shaped as a row, not a `div` that happens to take clicks:
+    /// opening a file is a control, and `Button` is the only thing here that
+    /// tracks a focus handle, so it is the only thing that answers Enter and
+    /// Space, joins the tab ring and draws a focus ring. `ListItem` looks the
+    /// part but never calls `track_focus`, which leaves the row reachable by
+    /// pointer only.
+    ///
+    /// The open file used to be marked by the lowercase word "open" alone,
+    /// which is a caption where the reader is looking for a highlighted row.
+    /// It now carries the selected background as well — the same one the tabs
+    /// above use, because it is the same question: which of these am I in.
     fn file_row(&self, node: &FileNode, cx: &mut Context<Self>) -> AnyElement {
         let showing = self.is_open(&node.rel);
         let rel = node.rel.clone();
         // One step on the spacing scale per level: enough to read as nesting
         // without pushing a deep file off the pane.
         let indent = rems(0.5 + 0.75 * node.depth as f32);
+        // A directory has nothing to open and a binary has nothing an editor
+        // can do with it. Neither is a control, so neither takes a click, a
+        // hover or a place in the tab ring — a stop that does nothing when the
+        // user gets there is worse than no stop.
+        let inert = node.is_dir || !node.editable;
+        let selected = showing && !inert;
 
-        let row = h_flex()
-            .id(ElementId::from((
-                ElementId::from("file-row"),
-                node.rel.clone(),
-            )))
-            .w_full()
-            .h_7()
-            .pr_2()
-            .pl(indent)
-            .gap_2()
-            .items_center()
-            .child(
-                Icon::new(if node.is_dir {
-                    IconName::Folder
-                } else {
-                    IconName::FileText
-                })
-                .xsmall()
-                .flex_shrink_0()
-                .text_color(cx.theme().muted_foreground),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .when(node.is_dir, |this| {
-                        this.text_color(cx.theme().muted_foreground)
+        Button::new(ElementId::from((
+            ElementId::from("file-row"),
+            node.rel.clone(),
+        )))
+        .ghost()
+        .small()
+        .w_full()
+        .h_7()
+        .pr_2()
+        .pl(indent)
+        .disabled(inert)
+        .tab_stop(!inert)
+        .selected(selected)
+        // The button announces itself from this: its children are an icon and
+        // a truncating div, and a listener needs the file named and told
+        // whether it is the one already showing.
+        .accessibility_label(if selected {
+            format!("{}, open", node.label)
+        } else {
+            node.label.to_string()
+        })
+        // Ghost's disabled foreground is `muted_foreground` at half alpha,
+        // which is fainter than a directory name should be. The instance
+        // style is replayed inside the disabled state, so setting the colour
+        // here restores the weight the row had before.
+        .when(inert, |this| this.text_color(cx.theme().muted_foreground))
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .items_center()
+                .child(
+                    Icon::new(if node.is_dir {
+                        IconName::Folder
+                    } else {
+                        IconName::FileText
                     })
-                    .child(node.label.clone()),
-            );
-
-        if node.is_dir {
-            return row.into_any_element();
-        }
-
-        if !node.editable {
-            // Nothing an editor can do with it, and saying so beats a row that
-            // looks clickable and then refuses.
-            return row
+                    .xsmall()
+                    .flex_shrink_0()
+                    .text_color(cx.theme().muted_foreground),
+                )
                 .child(
                     div()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("not text"),
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(node.label.clone()),
                 )
-                .into_any_element();
-        }
-
-        row.when(showing, |this| {
-            this.child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("open"),
+                // Saying so beats a row that looks clickable and then refuses.
+                .when(!node.is_dir && !node.editable, |this| {
+                    this.child(row_note("not text", cx))
+                })
+                .when(selected, |this| this.child(row_note("open", cx))),
+        )
+        .when(!inert, |this| {
+            this.on_click(
+                cx.listener(move |this, _, window, cx| this.open_file(rel.clone(), window, cx)),
             )
         })
-        .hover(|this| this.bg(cx.theme().list_hover))
-        .on_click(cx.listener(move |this, _, window, cx| this.open_file(rel.clone(), window, cx)))
         .into_any_element()
     }
 
@@ -1649,7 +2327,11 @@ impl DetailPane {
     /// The Overview and the `SKILL.md` tab both save through [`Self::save`]:
     /// they are two views of one file, the Overview editing its frontmatter and
     /// the tab its text, and that one write reconciles them.
-    fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// Reachable from outside the pane: the header's Save button and the
+    /// File > Save menu item are two entry points to this one commit, so the
+    /// menu does not get a second path to disk.
+    pub(crate) fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.showing.clone() {
             Showing::Overview => self.save(window, cx),
             Showing::File(rel) if rel == SKILL_FILE_NAME => self.save(window, cx),
@@ -1756,7 +2438,7 @@ impl DetailPane {
                     DialogButtonProps::default()
                         .ok_text("Discard")
                         .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
-                        .cancel_text("Keep editing")
+                        .cancel_text("Cancel")
                         .show_cancel(true),
                 )
                 .on_ok(move |_, _, cx| {
@@ -1848,8 +2530,8 @@ impl DetailPane {
     /// the same language as every other control in the pane: transparent until
     /// it is hovered or selected, and a grey surface when it is. Every `TabBar`
     /// variant insists on more than that — a trough behind the row, or a rule
-    /// under it — which would draw a second boundary immediately below the
-    /// header for no gain.
+    /// under it — which would fight the drag band the strip now sits inside
+    /// instead of reading as part of it.
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut labels: Vec<(Showing, SharedString, bool, bool)> = vec![
             (Showing::Overview, "Overview".into(), self.dirty, false),
@@ -1918,20 +2600,20 @@ impl DetailPane {
                 let Showing::File(rel) = showing else {
                     return this;
                 };
+                // A Button, not a bare icon in a zero-padding div: the xsmall
+                // geometry gives the 12-pixel glyph a hit area to sit in, and
+                // brings the focus handle a keyboard needs to reach it at all.
                 this.child(
-                    div()
-                        .id(ElementId::from((ElementId::from("close-tab"), rel.clone())))
+                    Button::new(ElementId::from((ElementId::from("close-tab"), rel.clone())))
+                        .ghost()
+                        .xsmall()
                         .flex_shrink_0()
-                        .rounded(cx.theme().radius)
-                        .hover(|this| this.bg(cx.theme().list_hover))
-                        .child(
-                            Icon::new(IconName::Close)
-                                .xsmall()
-                                .text_color(cx.theme().muted_foreground),
-                        )
+                        .icon(IconName::Close)
+                        .accessibility_label(format!("Close {rel}"))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            // Without this the tab itself would also read the
-                            // click and select the tab that is on its way out.
+                            // The close button sits inside the tab's own
+                            // button, so without this the tab would also read
+                            // the click and select the tab on its way out.
                             cx.stop_propagation();
                             this.close_file(rel.clone(), window, cx);
                         })),
@@ -2036,6 +2718,22 @@ impl DetailPane {
 }
 
 /// What turning an agent's Enabled switch off actually does.
+/// The repository and ref a provenance names, when it names one that can be
+/// read. A provenance whose `repo_url` is not a GitHub repository has nothing
+/// to ask about, which is exactly what `UpdateStatus::Unknown` reports.
+fn repo_ref_of(provenance: &Provenance) -> Option<RepoRef> {
+    let (owner, repo) = provenance.owner_repo()?;
+    Some(RepoRef::new(owner, repo, &provenance.reference))
+}
+
+/// Where a provenance says the skill can be downloaded from again.
+fn location_of(provenance: &Provenance) -> Option<SkillLocation> {
+    Some(SkillLocation::new(
+        repo_ref_of(provenance)?,
+        &provenance.path,
+    ))
+}
+
 fn disable_effect(agent: &AgentDef, roots: &Roots) -> String {
     match agent.disable {
         DisableMode::MoveAside(dir) => format!(
@@ -2060,7 +2758,7 @@ fn disable_effect(agent: &AgentDef, roots: &Roots) -> String {
 /// agent, which is worth saying rather than papering over.
 fn scope_label(agent_id: &str) -> &'static str {
     match agent_id {
-        STORE_ID => "Skillbase store",
+        PRIVATE_ID => "Hidden skills",
         "" => "Unknown scope",
         id => agent_label(id),
     }
@@ -2090,9 +2788,24 @@ fn reach(skill: &SkillView, cx: &mut Context<DetailPane>) -> SharedString {
     }
 }
 
+/// The greyed word at the end of a file row, for what the row cannot say by
+/// looking like itself: a file the editor will not take, or the one showing.
+// `use<>`: the element owns everything it needs, so it must not be tied to the
+// borrow of `App` the colour was read through.
+fn row_note(text: &'static str, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .flex_shrink_0()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+}
+
 fn section_title(label: &'static str, cx: &mut Context<DetailPane>) -> impl IntoElement {
+    // A step smaller than the body it heads, so weight rather than size is what
+    // separates the two: same colour, same scale step, heavier.
     div()
         .text_xs()
+        .font_medium()
         .text_color(cx.theme().muted_foreground)
         .child(label)
 }
@@ -2192,6 +2905,8 @@ fn language_for(rel: &str) -> Option<&'static str> {
         "toml" => "toml",
         "sh" | "bash" | "zsh" => "bash",
         "py" => "python",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
         _ => return None,
     })
 }
@@ -2244,7 +2959,7 @@ fn issue_lines(issues: Vec<&Issue>, cx: &mut Context<DetailPane>) -> Vec<AnyElem
 impl Render for DetailPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(skill) = self.skill.clone() else {
-            return self.empty_state(cx).into_any_element();
+            return self.empty_state(window, cx).into_any_element();
         };
 
         let body = match self.showing.clone() {
@@ -2260,14 +2975,7 @@ impl Render for DetailPane {
             .min_w_0()
             .bg(cx.theme().background)
             .child(self.header(&skill, window, cx))
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .h_11()
-                    .px_5()
-                    .items_center()
-                    .child(self.tabs(cx)),
-            )
+            .child(self.identity_row(&skill, cx))
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
@@ -2290,7 +2998,9 @@ impl DetailPane {
             // One scroll owner for the tab.
             .id("detail-overview")
             .size_full()
-            .overflow_y_scroll()
+            // With a bar: the tab runs past the fold — the agent list alone is
+            // cut mid-row — and nothing else says there is more below.
+            .overflow_y_scrollbar()
             .px_5()
             .py_5()
             .gap_6()
@@ -2329,42 +3039,33 @@ impl DetailPane {
             .child(
                 v_flex()
                     .flex_shrink_0()
-                    .gap_4()
+                    .gap_2()
+                    // No name here. The identity row above already carries it,
+                    // and stays put across a tab switch; a second, larger copy
+                    // of the same word 90 pixels below out-ranked the thing it
+                    // belongs to. The description leads the body instead.
                     .child(
-                        v_flex()
-                            .gap_2()
-                            .child(Label::new("Name"))
-                            // Shown, not edited. Renaming a skill here would
-                            // write a `name:` that the directory around it no
-                            // longer agrees with, and a skill whose two names
-                            // disagree is the thing this pane spends the rest
-                            // of its length reporting. The SKILL.md tab still
-                            // edits the frontmatter for anyone who means it.
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(div().text_sm().truncate().child(skill.name.clone()))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Rename it in the SKILL.md tab."),
-                                    )
-                                    .children(issue_lines(issues_for(&skill.issues, "name"), cx)),
-                            ),
+                        div()
+                            .max_w(px(PROSE_MAX_WIDTH))
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if skill.description.is_empty() {
+                                SharedString::from("No description.")
+                            } else {
+                                skill.description.clone()
+                            }),
                     )
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(Label::new("Description"))
-                            .child(Textarea::new(&self.description).h(rems(4.5)))
-                            .children(issue_lines(issues_for(&skill.issues, "description"), cx)),
-                    ),
+                    .children(issue_lines(issues_for(&skill.issues, "name"), cx))
+                    .children(issue_lines(issues_for(&skill.issues, "description"), cx)),
             )
             .child(self.folder_structure(cx))
+            // Location before Visibility: the switches below are read-only
+            // until an unmanaged skill is adopted, and Adopt lives in
+            // Location. Ownership answered first, then what it allows.
+            .child(self.location(skill, cx))
             .child(self.visibility(skill, cx))
             .child(self.duplicates_section(cx))
-            .child(self.location(skill, cx))
+            .child(self.source_section(skill, cx))
             .into_any_element()
     }
 }

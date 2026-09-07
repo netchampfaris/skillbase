@@ -3,7 +3,7 @@
   "author": "Skillbase",
   "themes": [
     {
-      "is_default": true,
+      "is_default": false,
       "name": "Skillbase Light",
       "mode": "light",
       "colors": {
@@ -34,7 +34,7 @@
         "chart_bullish": "#0BA43F",
         "danger.background": "#C0392B",
         "danger.foreground": "#FFFFFF",
-        "description_list_label.foreground": "#8A8B8D",
+        "description_list_label.foreground": "#666668",
         "drag_border": "#989898",
         "drop_target.background": "#98989833",
         "foreground": "#171A1D",
@@ -47,13 +47,13 @@
         "link.active": "#171A1D",
         "link.hover": "#3F4448",
         "list.active.background": "#7D7D7D",
-        "list.active.border": "#E5E5E5",
+        "list.active.border": "#838383",
         "list.background": "#FFFFFF",
         "list.even.background": "#FFFFFF",
         "list.head.background": "#FFFFFF",
         "list.hover.background": "#F4F4F4",
         "muted.background": "#F1F0F0",
-        "muted.foreground": "#8A8B8D",
+        "muted.foreground": "#666668",
         "overlay": "#171A1D26",
         "popover.background": "#FFFFFF",
         "popover.foreground": "#171A1D",
@@ -62,7 +62,7 @@
         "primary.foreground": "#FFFFFF",
         "primary.hover.background": "#2E3338",
         "progress.bar.background": "#171A1D",
-        "ring": "#989898",
+        "ring": "#767676",
         "scrollbar.background": "#FFFFFF00",
         "scrollbar.thumb.background": "#8A8B8D80",
         "scrollbar.thumb.hover.background": "#8A8B8DCC",
@@ -83,28 +83,28 @@
         "slider.thumb.background": "#FFFFFF",
         "status_bar.background": "#F1F0F0",
         "status_bar.border": "#F1F0F0",
-        "success.background": "#0BA43F",
+        "success.background": "#087F31",
         "success.foreground": "#FFFFFF",
-        "switch.background": "#D4D4D4",
+        "switch.background": "#8F8F8F",
         "switch.thumb.background": "#FFFFFF",
         "tab.active.background": "#FFFFFF",
         "tab.active.foreground": "#171A1D",
         "tab.background": "#00000000",
-        "tab.foreground": "#8A8B8D",
+        "tab.foreground": "#666668",
         "tab_bar.background": "#F1F0F0",
         "tab_bar.segmented.background": "#E5E5E5",
         "table.active.background": "#7D7D7D",
-        "table.active.border": "#E5E5E5",
+        "table.active.border": "#838383",
         "table.background": "#FFFFFF",
         "table.even.background": "#FFFFFF",
         "table.head.background": "#F8F8F8",
-        "table.head.foreground": "#8A8B8D",
+        "table.head.foreground": "#666668",
         "table.hover.background": "#F4F4F4",
         "table.row.border": "#E0E0E0",
         "tiles.background": "#F8F8F8",
         "title_bar.background": "#F1F0F0",
         "title_bar.border": "#F1F0F0",
-        "warning.background": "#E0611F",
+        "warning.background": "#C2540F",
         "warning.foreground": "#FFFFFF",
         "window_border": "#E0E0E0"
       },
@@ -112,16 +112,16 @@
         "editor.foreground": "#171A1D",
         "editor.background": "#FFFFFF",
         "editor.active_line.background": "#F8F8F8",
-        "editor.line_number": "#B4B5B7",
+        "editor.line_number": "#8A8B8D",
         "editor.active_line_number": "#171A1D",
         "editor.invisible": "#8A8B8D66",
         "conflict": "#C0392B",
-        "created": "#0BA43F",
-        "hidden": "#8A8B8D",
+        "created": "#087F31",
+        "hidden": "#666668",
         "hint": "#AB7AF7",
-        "modified": "#E0611F",
-        "predictive": "#B4B5B7",
-        "warning": "#E0611F",
+        "modified": "#C2540F",
+        "predictive": "#8A8B8D",
+        "warning": "#C2540F",
         "syntax": {
           "attribute": {
             "color": "#8A5A00"
@@ -130,10 +130,10 @@
             "color": "#C0392B"
           },
           "comment": {
-            "color": "#8A8B8D"
+            "color": "#666668"
           },
           "comment.doc": {
-            "color": "#8A8B8D"
+            "color": "#666668"
           },
           "constant": {
             "color": "#C0392B"
@@ -161,7 +161,7 @@
             "font_style": "normal"
           },
           "link_uri": {
-            "color": "#0E9AB8",
+            "color": "#0A7490",
             "font_style": "italic"
           },
           "number": {
@@ -177,10 +177,10 @@
             "color": "#17803D"
           },
           "string.special": {
-            "color": "#E0611F"
+            "color": "#C2540F"
           },
           "string.special.symbol": {
-            "color": "#E0611F"
+            "color": "#C2540F"
           },
           "tag": {
             "color": "#2563EB"
@@ -257,13 +257,13 @@
         "link.active": "#EDEDED",
         "link.hover": "#FFFFFF",
         "list.active.background": "#A8A8B4",
-        "list.active.border": "#2A2A2D",
+        "list.active.border": "#7E7E7E",
         "list.background": "#181818",
         "list.even.background": "#181818",
         "list.head.background": "#181818",
         "list.hover.background": "#242424",
         "muted.background": "#242424",
-        "muted.foreground": "#8A8A8A",
+        "muted.foreground": "#9E9E9E",
         "overlay": "#00000059",
         "popover.background": "#1E1E1E",
         "popover.foreground": "#EDEDED",
@@ -281,7 +281,7 @@
         "secondary.foreground": "#EDEDED",
         "secondary.hover.background": "#323235",
         "selection.background": "#8C8C8C",
-        "sidebar.accent.background": "#2A2A2D",
+        "sidebar.accent.background": "#353537",
         "sidebar.accent.foreground": "#EDEDED",
         "sidebar.background": "#1E1E1E",
         "sidebar.border": "#1E1E1E00",
@@ -295,8 +295,8 @@
         "status_bar.border": "#1E1E1E",
         "success.background": "#4ADE80",
         "success.foreground": "#181818",
-        "switch.background": "#3A3A3E",
-        "switch.thumb.background": "#EDEDED",
+        "switch.background": "#707074",
+        "switch.thumb.background": "#181818",
         "tab.active.background": "#181818",
         "tab.active.foreground": "#EDEDED",
         "tab.background": "#00000000",
@@ -304,7 +304,7 @@
         "tab_bar.background": "#1E1E1E",
         "tab_bar.segmented.background": "#2A2A2D",
         "table.active.background": "#A8A8B4",
-        "table.active.border": "#2A2A2D",
+        "table.active.border": "#7E7E7E",
         "table.background": "#181818",
         "table.even.background": "#181818",
         "table.head.background": "#1E1E1E",
@@ -322,7 +322,7 @@
         "editor.foreground": "#EDEDED",
         "editor.background": "#181818",
         "editor.active_line.background": "#1E1E1E",
-        "editor.line_number": "#5A5A5A",
+        "editor.line_number": "#7A7A7A",
         "editor.active_line_number": "#EDEDED",
         "editor.invisible": "#8A8A8A66",
         "conflict": "#F87171",
