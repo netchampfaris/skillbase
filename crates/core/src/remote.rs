@@ -14,7 +14,7 @@
 //! directory can never hash to the upstream tree sha whatever format is used;
 //! a plain deterministic digest answers the question and is far simpler.
 //!
-//! # The cache is disposable
+//! # The cache is disposable, but not silently
 //!
 //! [`REMOTE_CACHE_FILE`] is modelled on the usage cache: a version, and
 //! missing, corrupt or differently versioned all mean "work it out again"
@@ -23,13 +23,23 @@
 //! comparing, and update checking still works because the baseline sha lives in
 //! the `SKILL.md`, not in the cache.
 //!
+//! A cache that cannot be *written* is different. It is not one lost answer, it
+//! is every answer from now on: every skill reports [`LocalState::Unknown`] for
+//! ever, and every check spends the hourly GitHub budget again. So
+//! [`RemoteCache::write`] hands back a [`CacheWriteError`] instead of
+//! swallowing it. It is still not fatal — nothing here stops the install that
+//! just succeeded from having succeeded — it is only no longer invisible.
+//!
 //! Every call here blocks. Run them on a background task.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -40,7 +50,9 @@ use crate::doc::SkillDoc;
 use crate::error::SkillError;
 use crate::github::{GitHub, GitHubError, RateLimit, RepoRef, SkillLocation, extract_subdir};
 use crate::http::Http;
-use crate::install::{Change, InstallError, Installer, Outcome};
+use crate::install::{
+    Change, DeletePlan, InstallError, Installer, Outcome, copy_dir, crosses_filesystems,
+};
 use crate::provenance::{Provenance, SkillLock};
 use crate::registry::Roots;
 use crate::skill::SKILL_FILE_NAME;
@@ -168,6 +180,20 @@ pub struct SkillRecord {
     /// The tree sha it was installed from.
     #[serde(default)]
     pub tree_sha: String,
+    /// The commit sha the ref pointed at when it was installed.
+    ///
+    /// The tree sha above answers "has upstream changed?" and is the cheaper
+    /// question, but it is not a commit-ish: `github.com/o/r/compare/a...b`
+    /// only resolves branches, tags and commits, and answers 404 for a tree.
+    /// So the commit is recorded alongside it, and it is the one thing that
+    /// lets the interface link at the difference itself.
+    ///
+    /// Empty for a skill installed before this was recorded, and for one
+    /// another tool installed. Neither is an error; there is simply no
+    /// comparison to offer, and the interface says so rather than linking at a
+    /// page that does not exist.
+    #[serde(default)]
+    pub commit_sha: String,
     /// When it was recorded, in seconds since the Unix epoch.
     #[serde(default)]
     pub recorded_at: i64,
@@ -245,30 +271,42 @@ impl RemoteCache {
         }
     }
 
-    /// Writes the cache under `roots`, ignoring every failure.
-    pub fn write(&self, roots: &Roots) {
-        self.write_file(&Self::path(roots));
+    /// Writes the cache under `roots`, and returns what went wrong when
+    /// anything did.
+    ///
+    /// Not fatal: nothing here stops an install or an update check from having
+    /// worked. But a cache that never lands is not a slower Skillbase, it is a
+    /// different one — every skill reports "no record of what was installed
+    /// here" for ever, and every update check spends the hourly GitHub budget
+    /// again — so the caller is handed the failure to say so. See
+    /// [`CacheWriteError`].
+    ///
+    /// The return type is [`Option`] rather than [`Result`] so that a caller
+    /// with nothing useful to do about it can go on writing `cache.write(&roots);`.
+    pub fn write(&self, roots: &Roots) -> Option<CacheWriteError> {
+        self.write_file(&Self::path(roots))
     }
 
-    /// Writes the cache to an explicit path, ignoring every failure.
-    ///
+    /// Writes the cache to an explicit path. As [`RemoteCache::write`].
+    pub fn write_file(&self, path: &Path) -> Option<CacheWriteError> {
+        self.try_write_file(path).err()
+    }
+
     /// Written to a sibling and renamed, so an interrupted write leaves the
     /// previous cache rather than a truncated one.
-    pub fn write_file(&self, path: &Path) {
+    fn try_write_file(&self, path: &Path) -> Result<(), CacheWriteError> {
         let mut cache = self.clone();
         cache.version = CACHE_VERSION;
-        let Ok(text) = serde_json::to_string(&cache) else {
-            return;
-        };
-        if let Some(parent) = path.parent()
-            && fs::create_dir_all(parent).is_err()
-        {
-            return;
+        let text = serde_json::to_string(&cache).map_err(CacheWriteError::Serialize)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| CacheWriteError::io(parent, e))?;
         }
         let temp = path.with_extension("json.tmp");
-        if fs::write(&temp, text).is_ok() && fs::rename(&temp, path).is_err() {
+        fs::write(&temp, text).map_err(|e| CacheWriteError::io(&temp, e))?;
+        fs::rename(&temp, path).map_err(|e| {
             let _ = fs::remove_file(&temp);
-        }
+            CacheWriteError::io(path, e)
+        })
     }
 
     /// What was recorded for one skill.
@@ -284,6 +322,104 @@ impl RemoteCache {
     /// Forgets a skill, which is what an uninstall should do.
     pub fn forget_skill(&mut self, name: &str) -> Option<SkillRecord> {
         self.skills.remove(name)
+    }
+
+    /// Forgets the record of every skill a delete removed, and returns true
+    /// when the cache changed and has to be written.
+    ///
+    /// A record left behind after a delete answers for whatever takes the name
+    /// next, because the records are keyed by name: the next skill created,
+    /// imported or renamed to it is measured against the deleted skill's
+    /// install-time digest, and the compare link points at the deleted skill's
+    /// upstream commit.
+    ///
+    /// A record is dropped only when the delete removed that skill's origin
+    /// directory, which is the last thing [`Installer::delete`] does. `result`
+    /// says whether it got there in both cases: an [`InstallError::Partial`]
+    /// carries the changes that stood, so a delete that stopped on one of the
+    /// links keeps the record of a skill that is still on disk rather than
+    /// leaving it reporting [`LocalState::Unknown`] for ever.
+    ///
+    /// A skill whose origin is outside every managed scope keeps its record for
+    /// the same reason: the delete took away the links, and the directory the
+    /// digest describes is still there.
+    ///
+    /// An origin that was inside a managed scope and had already gone when the
+    /// plan was made — [`DeletePlan::origin_missing`] — counts as removed.
+    /// There is no directory left for the record to describe, so keeping it
+    /// would hand it to the next skill of that name.
+    ///
+    /// The one case this leaves alone is a delete that changed nothing at all
+    /// and whose origin was already gone: nothing happened, the user was told
+    /// the delete was refused, and the record stays until a delete that does
+    /// something drops it.
+    pub fn forget_deleted(
+        &mut self,
+        plans: &[DeletePlan],
+        result: &Result<Outcome, InstallError>,
+    ) -> bool {
+        let done = match result {
+            Ok(outcome) => Cow::Borrowed(outcome),
+            Err(error) => match error.completed() {
+                Some(done) => done,
+                // Nothing was changed, so nothing was removed.
+                None => return false,
+            },
+        };
+        let mut changed = false;
+        for plan in plans {
+            let removed = match &plan.origin {
+                Some(origin) => origin_removed(&done.changes, origin),
+                // Nothing for the delete to remove, so there is no change to
+                // look for: the plan already says whether the directory was
+                // gone or merely out of reach.
+                None => plan.origin_missing,
+            };
+            if removed {
+                changed |= self.forget_skill(&plan.name).is_some();
+            }
+        }
+        changed
+    }
+
+    /// Moves a skill's record to a new name, which is what a rename should do.
+    ///
+    /// The records are keyed by skill name, so without this a renamed skill
+    /// loses its digest and its shas: it reports [`LocalState::Unknown`] for
+    /// ever, every update has to ask before overwriting, and the compare link
+    /// the commit sha is kept for is gone. The record left behind under the old
+    /// name is never collected, because nothing installs there any more.
+    ///
+    /// `digest` is the [`content_digest`] of the renamed directory, or `None`
+    /// when it could not be computed. It is asked for rather than kept because
+    /// a rename also rewrites the frontmatter `name`: the directory no longer
+    /// hashes to what was recorded at install time, and carrying the old digest
+    /// over would report a skill nobody touched as edited.
+    ///
+    /// Returns true when the cache changed and has to be written, which is the
+    /// only question the caller has. Any record already under `to` is replaced
+    /// when a record moves onto it, and dropped when there was nothing to move:
+    /// it describes a skill that is no longer at that name, and calling the
+    /// renamed directory pristine against someone else's digest is worse than
+    /// having no answer. That drop is a change like any other, so it is
+    /// reported and reaches the disk.
+    pub fn rename_skill(&mut self, from: &str, to: &str, digest: Option<String>) -> bool {
+        let changed = if from == to {
+            self.skills.contains_key(from)
+        } else {
+            match self.skills.remove(from) {
+                Some(record) => {
+                    self.skills.insert(to.to_string(), record);
+                    true
+                }
+                None => self.skills.remove(to).is_some(),
+            }
+        };
+        if let Some(record) = self.skills.get_mut(to) {
+            record.digest = digest.unwrap_or_default();
+            record.recorded_at = now_unix();
+        }
+        changed
     }
 
     /// What the last check saw in one repository.
@@ -302,9 +438,62 @@ impl RemoteCache {
     }
 }
 
+/// Why the cache at [`REMOTE_CACHE_FILE`] could not be written.
+///
+/// Every variant means the same thing to the user, whatever the cause: from now
+/// on Skillbase has no record of what it installed. It cannot tell an edited
+/// skill from an untouched one, so it has to ask before every update; and it
+/// cannot remember what a check saw, so every check spends the whole hourly
+/// GitHub budget again. Neither is worth stopping the app for, and neither is
+/// something the user can work out on their own.
+#[derive(Debug, Error)]
+pub enum CacheWriteError {
+    /// The cache could not be turned into JSON. A bug rather than a condition
+    /// of the machine, but it is reported the same way.
+    #[error("the install record could not be serialized: {0}")]
+    Serialize(#[source] serde_json::Error),
+
+    /// The file could not be written: no permission, no space, a read-only
+    /// home, or `~/.skillbase` is not a directory.
+    #[error("the install record at {path} could not be written: {source}")]
+    Io {
+        /// The path being created, written or renamed.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl CacheWriteError {
+    /// Builds a [`CacheWriteError::Io`] carrying the path that failed.
+    fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+}
+
 /// The key a repository and ref are recorded under: `owner/repo@ref`.
 pub fn repo_key(repo: &RepoRef) -> String {
     format!("{}@{}", repo.slug(), repo.reference)
+}
+
+/// Whether `changes` show that the directory at `origin` is no longer there.
+///
+/// [`Installer::delete`] moves a real directory into the trash, and reports
+/// [`Change::NoChange`] for one that was not there when it looked. Either way
+/// nothing of the skill is left at that path. A cross-filesystem move that
+/// copied the directory and then could not remove the original reports
+/// [`Change::Copied`], which is not the same thing: the skill is still where it
+/// was, and its record still describes it.
+fn origin_removed(changes: &[Change], origin: &Path) -> bool {
+    changes.iter().any(|change| match change {
+        Change::MovedToTrash { from, .. } => from == origin,
+        Change::NoChange { path, .. } => path == origin,
+        _ => false,
+    })
 }
 
 /// Seconds since the Unix epoch, or 0 before it.
@@ -745,6 +934,10 @@ pub enum FetchError {
         name: String,
     },
 
+    /// The install was stopped before anything was written into the store.
+    #[error("the install was cancelled")]
+    Cancelled,
+
     /// A filesystem call failed.
     #[error("{path}: {source}")]
     Io {
@@ -754,6 +947,28 @@ pub enum FetchError {
         #[source]
         source: io::Error,
     },
+
+    /// The install stopped after it had already changed the filesystem.
+    ///
+    /// Replacing an existing skill moves the old directory to the trash before
+    /// the new one is put in its place. If the second half then fails, the
+    /// skill the user had is only in the trash, under a timestamped name
+    /// nothing else names. Carrying what was already done is what tells them
+    /// where to find it.
+    ///
+    /// The counterpart of [`InstallError::Partial`], and it reads the same way:
+    /// the changes that stand, then why the rest did not happen.
+    ///
+    /// Build it with [`FetchError::partial`], never by hand: an install that
+    /// failed before it changed anything must stay the plain error.
+    #[error("{}\nThen it stopped: {source}", done.describe())]
+    Partial {
+        /// What the install had already done.
+        done: Box<Outcome>,
+        /// Why it stopped.
+        #[source]
+        source: Box<FetchError>,
+    },
 }
 
 impl FetchError {
@@ -762,6 +977,49 @@ impl FetchError {
         Self::Io {
             path: path.into(),
             source,
+        }
+    }
+
+    /// Attaches what the install had already done to the error that stopped it.
+    ///
+    /// An install that failed before it changed anything returns the plain
+    /// error, so the ordinary refusal reads exactly as it always did.
+    pub fn partial(done: Outcome, source: FetchError) -> Self {
+        if done.is_noop() {
+            return source;
+        }
+        Self::Partial {
+            done: Box::new(done),
+            source: Box::new(source),
+        }
+    }
+
+    /// What the install had already done before it failed, when it had done
+    /// anything.
+    pub fn completed(&self) -> Option<&Outcome> {
+        match self {
+            Self::Partial { done, .. } => Some(done),
+            _ => None,
+        }
+    }
+
+    /// The message with `home` written as `~`, as
+    /// [`InstallError::describe_under`].
+    ///
+    /// The abbreviation is presentation, so it is a second rendering rather
+    /// than a change to the paths. It matters most for
+    /// [`FetchError::Partial`]: the trash directory it names is what the user
+    /// has to go and find, and `~/.skillbase/trash/pdf-1748...` is read where
+    /// `/Users/someone/.skillbase/trash/pdf-1748...` is skimmed.
+    pub fn describe_under(&self, home: &Path) -> String {
+        match self {
+            Self::Install(install) => install.describe_under(home),
+            Self::Partial { done, source } => format!(
+                "{}\nThen it stopped: {}",
+                done.describe_under(home),
+                source.describe_under(home)
+            ),
+            other => other.to_string(),
         }
     }
 }
@@ -774,6 +1032,10 @@ pub struct InstallOptions {
     /// Replace a skill of the same name already in the store. Off by default,
     /// so installing never overwrites without being told to.
     pub replace: bool,
+    /// Set from another thread to stop the install. Checked between steps, so
+    /// a download already in flight still runs to its end, but nothing is
+    /// written into the store after the flag is set.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl InstallOptions {
@@ -793,6 +1055,21 @@ impl InstallOptions {
         self.replace = true;
         self
     }
+
+    /// Stop the install when `flag` is set. The caller keeps a clone and sets
+    /// it from the thread that owns the interface.
+    pub fn cancelled_by(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    /// True once the cancel flag is set. False when there is no flag, which is
+    /// the case for an install nobody can cancel.
+    pub fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
 }
 
 /// A skill downloaded from GitHub and written into the store.
@@ -805,9 +1082,17 @@ pub struct Installed {
     /// What was written into its frontmatter.
     pub provenance: Provenance,
     /// Its [`content_digest`] as installed, also recorded in the cache.
+    ///
+    /// Empty when the digest could not be computed. The skill is installed
+    /// either way; what is lost is the ability to tell an edited copy from an
+    /// untouched one, which [`local_state`] then reports as
+    /// [`LocalState::Unknown`].
     pub digest: String,
     /// How many files were extracted.
     pub files: usize,
+    /// What the sweep of [`STAGING_DIR`] this install ran first took away, and
+    /// what it could not. See [`sweep_staging`].
+    pub staging: StagingSweep,
     /// What changed on disk.
     pub outcome: Outcome,
 }
@@ -828,9 +1113,25 @@ pub struct Installed {
 /// 4. Move the staged directory into the store. Nothing appears in
 ///    `~/.agents/skills` until the skill is complete.
 /// 5. Record the content digest, so a later check can tell an edited skill from
-///    an untouched one.
+///    an untouched one, and the commit sha beside it, so an update can link at
+///    the difference rather than only name it. The skill is in the store by
+///    then, so a digest that cannot be taken leaves the record without one
+///    rather than failing an install that worked.
 ///
-/// The staging directory is removed whether this succeeds or fails.
+/// The staging directory is removed whether this succeeds or fails. Before one
+/// is made, [`sweep_staging`] takes away what runs that were killed mid-install
+/// left behind; what it could not remove comes back in [`Installed::staging`].
+///
+/// # Cancelling
+///
+/// Every call here blocks, so the interface runs this on a background task.
+/// Dropping that task does not stop a blocking call, which is why cancelling
+/// is a flag rather than a drop: [`InstallOptions::cancel`] is read between
+/// steps, and a set flag returns [`FetchError::Cancelled`]. The last check
+/// comes immediately before the destination is touched, so a cancelled install
+/// replaces nothing, trashes nothing, and leaves no staging directory behind.
+/// A download already in flight still runs to its end; its bytes are thrown
+/// away.
 pub fn install_from_github<H: Http>(
     installer: &Installer,
     gh: &GitHub<H>,
@@ -841,6 +1142,9 @@ pub fn install_from_github<H: Http>(
     let roots = installer.roots();
     let commit = gh.ref_sha(&location.repo)?;
     let tree_sha = gh.subtree_sha(&location.repo, &commit, &location.path)?;
+    if options.cancelled() {
+        return Err(FetchError::Cancelled);
+    }
     let archive = gh.download_tarball(&location.repo, &commit)?;
 
     let staged = Staging::new(roots, location.dir_name())?;
@@ -865,38 +1169,39 @@ pub fn install_from_github<H: Http>(
         return Err(FetchError::UnusableName { name });
     }
 
-    let dest = installer.ensure_in_scope(&roots.store_dir().join(&name))?;
-    let mut outcome = Outcome::default();
-    if fs::symlink_metadata(&dest).is_ok() {
-        if !options.replace {
-            return Err(InstallError::AlreadyExists { path: dest }.into());
-        }
-        outcome
-            .changes
-            .extend(replace_existing(installer, &dest)?.changes);
+    // The last chance to stop, and the only one after the download: past this
+    // point the destination is replaced and the staged directory is moved into
+    // it. On this early return `Staging`'s `Drop` takes the staged directory
+    // away, so a cancelled install leaves nothing anywhere.
+    //
+    // One check rather than two. A second one between the extraction and the
+    // provenance write would save a single local file write, and nothing can
+    // set the flag between two consecutive checks, so a test could only ever
+    // reach the first of them — leaving this one, the one that matters,
+    // uncovered.
+    if options.cancelled() {
+        return Err(FetchError::Cancelled);
     }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| FetchError::io(parent, e))?;
-    }
-    fs::rename(staged.path(), &dest).map_err(|e| FetchError::io(&dest, e))?;
-    staged.keep();
 
-    let digest = content_digest(&dest).map_err(|e| FetchError::io(&dest, e))?;
+    let dest = installer.ensure_in_scope(&roots.store_dir().join(&name))?;
+    let outcome = place_into_store(installer, staged.path(), &dest, options.replace)?;
+    let staging = staged.keep();
+
+    // The skill is on disk now, so a digest that cannot be computed is not a
+    // failed install and is not reported as one. What is lost is edit
+    // detection: the record goes in with an empty digest, which `local_state`
+    // reads as "no baseline" rather than as an edit, and the tree and commit
+    // shas an update check needs are still recorded.
+    let digest = content_digest(&dest).unwrap_or_default();
     cache.record_skill(
         &name,
         SkillRecord {
             digest: digest.clone(),
             tree_sha: tree_sha.clone(),
+            commit_sha: commit.clone(),
             recorded_at: now_unix(),
         },
     );
-
-    outcome
-        .changes
-        .push(Change::CreatedDirectory { path: dest.clone() });
-    outcome.changes.push(Change::WroteFile {
-        path: dest.join(SKILL_FILE_NAME),
-    });
 
     Ok(Installed {
         name,
@@ -904,15 +1209,66 @@ pub fn install_from_github<H: Http>(
         provenance,
         digest,
         files,
+        staging,
         outcome,
     })
 }
 
-/// Removes what is already at `dest` before an install replaces it.
+/// Puts the staged directory at `dest`, taking whatever is already there to the
+/// trash first.
+///
+/// The two halves are one step because only the first is destructive: between
+/// them the skill the user had exists only under `~/.skillbase/trash`, in a
+/// timestamped directory nothing else names. So a failure of the second half
+/// comes back as [`FetchError::Partial`], carrying the [`Change::MovedToTrash`]
+/// that says where the old skill went. A bare "Cross-device link" would leave
+/// the user with an empty store entry and no idea their skill still existed.
+fn place_into_store(
+    installer: &Installer,
+    staged: &Path,
+    dest: &Path,
+    replace: bool,
+) -> Result<Outcome, FetchError> {
+    let mut outcome = Outcome::default();
+    if fs::symlink_metadata(dest).is_ok() {
+        if !replace {
+            return Err(InstallError::AlreadyExists {
+                path: dest.to_path_buf(),
+            }
+            .into());
+        }
+        outcome
+            .changes
+            .extend(replace_existing(installer, dest)?.changes);
+    }
+    if let Some(parent) = dest.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return Err(FetchError::partial(outcome, FetchError::io(parent, e)));
+    }
+    if let Err(e) = move_into_place(staged, dest) {
+        return Err(FetchError::partial(outcome, e));
+    }
+    outcome.push(Change::CreatedDirectory {
+        path: dest.to_path_buf(),
+    });
+    outcome.push(Change::WroteFile {
+        path: dest.join(SKILL_FILE_NAME),
+    });
+    Ok(outcome)
+}
+
+/// Takes away what is already at `dest` before an install replaces it.
 ///
 /// Goes through [`Installer::ensure_in_scope`] first, and refuses to follow a
-/// symlink: a link at that path is unlinked, and only a real directory is
-/// removed.
+/// symlink: a link at that path is unlinked, because a link holds no bytes of
+/// its own and nothing is lost by removing it.
+///
+/// Anything else goes to [`Installer::remove_real_dir`], which moves the
+/// directory into the trash rather than deleting it. The directory being
+/// replaced may be a skill the person edited, and an update they did not want
+/// has to be recoverable. That call does its own scope, symlink and
+/// non-directory checks, and reports where the old directory landed.
 fn replace_existing(installer: &Installer, dest: &Path) -> Result<Outcome, InstallError> {
     let dest = installer.ensure_in_scope(dest)?;
     let meta = fs::symlink_metadata(&dest).map_err(|e| InstallError::Io {
@@ -926,17 +1282,37 @@ fn replace_existing(installer: &Installer, dest: &Path) -> Result<Outcome, Insta
         })?;
         return Ok(Outcome::one(Change::RemovedSymlink { path: dest }));
     }
-    if !meta.is_dir() {
-        return Err(InstallError::NotALink {
-            path: dest,
-            kind: "file",
-        });
+    installer.remove_real_dir(&dest)
+}
+
+/// Moves the staged directory to `dest`, copying it across a filesystem
+/// boundary.
+///
+/// The mirror of `Installer::move_to_trash`, which has had this fallback from
+/// the start. Without it the destructive half of a replace can get across a
+/// boundary and the constructive half cannot, so a store on another volume
+/// would trash the old skill and then fail with "Cross-device link".
+///
+/// A copy that fails part-way leaves nothing at `dest`: half a skill in
+/// `~/.agents/skills` is exactly what staging exists to prevent, and an agent
+/// would load it.
+fn move_into_place(from: &Path, dest: &Path) -> Result<(), FetchError> {
+    let Err(rename_error) = fs::rename(from, dest) else {
+        return Ok(());
+    };
+    if !crosses_filesystems(&rename_error) {
+        return Err(FetchError::io(dest, rename_error));
     }
-    fs::remove_dir_all(&dest).map_err(|e| InstallError::Io {
-        path: dest.clone(),
-        source: e,
-    })?;
-    Ok(Outcome::one(Change::RemovedDirectory { path: dest }))
+    if let Err(e) = copy_dir(from, dest) {
+        let _ = fs::remove_dir_all(dest);
+        return Err(e.into());
+    }
+    // The copy landed, so the skill is installed. A source that will not go is
+    // one more directory under `STAGING_DIR` for the next sweep, not a failed
+    // install, and reporting it as one would describe a disk that does not
+    // exist.
+    let _ = fs::remove_dir_all(from);
+    Ok(())
 }
 
 /// Writes `provenance` into the `SKILL.md` in `dir` and returns the skill's
@@ -944,13 +1320,156 @@ fn replace_existing(installer: &Installer, dest: &Path) -> Result<Outcome, Insta
 ///
 /// The rest of the file is untouched: the body is never re-rendered, and every
 /// other frontmatter key keeps its value and its position.
+///
+/// Rendered with [`SkillDoc::try_to_markdown`], not `to_markdown`: this
+/// overwrites a file, and the lossy renderer would drop the one key YAML
+/// refused and leave a `SKILL.md` that is well formed, missing a key, and
+/// reported as a success. The name returned here comes from the in-memory
+/// frontmatter, so it would name a key the file does not hold.
 fn write_provenance(dir: &Path, provenance: &Provenance) -> Result<Option<String>, FetchError> {
     let path = dir.join(SKILL_FILE_NAME);
     let source = fs::read_to_string(&path).map_err(|e| FetchError::io(&path, e))?;
     let mut doc = SkillDoc::parse(&source)?;
     provenance.write(&mut doc.frontmatter);
-    fs::write(&path, doc.to_markdown()).map_err(|e| FetchError::io(&path, e))?;
+    let text = doc.try_to_markdown()?;
+    fs::write(&path, text).map_err(|e| FetchError::io(&path, e))?;
     Ok(doc.frontmatter.name().map(str::to_string))
+}
+
+// ---------------------------------------------------------------------------
+// Staging
+// ---------------------------------------------------------------------------
+
+/// How old an entry under [`STAGING_DIR`] must be before a sweep takes it away.
+///
+/// Long enough that no install still running can be mistaken for abandoned —
+/// including one started by a second copy of Skillbase, whose directories this
+/// process cannot tell from its own — and short enough that a crash costs the
+/// disk one extracted tarball rather than a growing pile of them.
+const STALE_STAGING_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// What a sweep of [`STAGING_DIR`] did, from [`sweep_staging`].
+///
+/// `failed` is the part worth showing. Nothing else in Skillbase names
+/// `~/.skillbase/staging` to the user, so a directory that cannot be removed
+/// holds a whole extracted tarball, for ever, in a place nobody has been told
+/// about.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StagingSweep {
+    removed: Vec<PathBuf>,
+    failed: Vec<(PathBuf, String)>,
+}
+
+impl StagingSweep {
+    /// What was taken away, in path order.
+    pub fn removed(&self) -> &[PathBuf] {
+        &self.removed
+    }
+
+    /// What could not be taken away, in path order, each with the reason.
+    pub fn failed(&self) -> &[(PathBuf, String)] {
+        &self.failed
+    }
+
+    /// True when nothing was left behind.
+    pub fn is_clean(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// One sentence for the interface, or `None` when there is nothing to say.
+    ///
+    /// It names the directory, because that is the whole problem: the user
+    /// cannot delete what nobody has told them about.
+    pub fn warning(&self) -> Option<String> {
+        let (path, reason) = self.failed.first()?;
+        Some(match self.failed.len() {
+            1 => format!(
+                "A part-downloaded skill is still taking up space at {}, and could not be \
+                 removed: {reason}. Delete it by hand to get the space back.",
+                path.display()
+            ),
+            n => format!(
+                "{n} part-downloaded skills are still taking up space in ~/{STAGING_DIR}, and \
+                 could not be removed. The first is {}: {reason}. Delete them by hand to get \
+                 the space back.",
+                path.display()
+            ),
+        })
+    }
+}
+
+/// Takes away everything under [`STAGING_DIR`] that an earlier run abandoned.
+///
+/// A staging directory is removed when its [`Staging`] guard drops, so this
+/// only ever finds the ones where that never happened: the process was killed,
+/// or the machine lost power, mid-install. Each holds a fully extracted
+/// tarball.
+///
+/// Sweeping rather than reporting the drop is deliberate. The failure the user
+/// actually meets is the one no `Drop` ever ran for, so there is no error to
+/// report — only a directory nobody will look in again. Reporting is kept for
+/// what the sweep itself could not remove, in [`StagingSweep::warning`].
+///
+/// Only entries older than [`STALE_STAGING_AGE`] are touched, so an install
+/// running right now — in this process or another copy of Skillbase — is left
+/// alone.
+pub fn sweep_staging(roots: &Roots) -> StagingSweep {
+    sweep_staging_dir(&roots.home().join(STAGING_DIR), STALE_STAGING_AGE)
+}
+
+fn sweep_staging_dir(root: &Path, older_than: Duration) -> StagingSweep {
+    let mut sweep = StagingSweep::default();
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        // Nothing has ever been staged. The ordinary case, not a failure.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return sweep,
+        Err(e) => {
+            sweep.failed.push((root.to_path_buf(), e.to_string()));
+            return sweep;
+        }
+    };
+
+    let now = SystemTime::now();
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                sweep.failed.push((root.to_path_buf(), e.to_string()));
+                continue;
+            }
+        };
+        match is_stale(&path, now, older_than) {
+            Err(e) => sweep.failed.push((path, e.to_string())),
+            Ok(false) => {}
+            Ok(true) => match remove_staged(&path) {
+                Ok(()) => sweep.removed.push(path),
+                Err(e) => sweep.failed.push((path, e.to_string())),
+            },
+        }
+    }
+
+    sweep.removed.sort();
+    sweep.failed.sort();
+    sweep
+}
+
+/// Whether `path` was last written more than `older_than` ago. A modification
+/// time in the future reads as fresh, because the alternative is deleting a
+/// directory on the strength of a wrong clock.
+fn is_stale(path: &Path, now: SystemTime, older_than: Duration) -> Result<bool, io::Error> {
+    let modified = fs::symlink_metadata(path)?.modified()?;
+    Ok(now
+        .duration_since(modified)
+        .is_ok_and(|age| age >= older_than))
+}
+
+/// Removes one entry under [`STAGING_DIR`], whatever it turned out to be.
+fn remove_staged(path: &Path) -> Result<(), io::Error> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 /// A directory under [`STAGING_DIR`], removed when it goes out of scope unless
@@ -961,24 +1480,44 @@ fn write_provenance(dir: &Path, provenance: &Provenance) -> Result<Option<String
 struct Staging {
     path: PathBuf,
     keep: bool,
+    /// What the sweep this staging directory ran on the way in found. Carried
+    /// out through [`Installed::staging`].
+    sweep: StagingSweep,
 }
 
 impl Staging {
     /// Creates a staging directory whose name will not collide with a
-    /// concurrent install.
+    /// concurrent install, sweeping abandoned ones first.
     fn new(roots: &Roots, label: &str) -> Result<Staging, FetchError> {
         let root = roots.home().join(STAGING_DIR);
         fs::create_dir_all(&root).map_err(|e| FetchError::io(&root, e))?;
+        // Before anything is added, take away what earlier runs never did.
+        // An install is the only moment this directory is thought about, so it
+        // is the only moment the pile can be found.
+        let sweep = sweep_staging_dir(&root, STALE_STAGING_AGE);
+
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let label = slugify(label);
         let path = root.join(format!("{label}-{}-{unique}", std::process::id()));
-        // A leftover from a crashed run under the same name is not reused.
-        let _ = fs::remove_dir_all(&path);
+        // A leftover from a crashed run under the same name is not reused: its
+        // files would be extracted over and shipped into the store. The name
+        // carries a process id and a nanosecond, so this all but never fires —
+        // and when it does, a download that cannot get a clean directory is a
+        // download that must stop.
+        if let Err(e) = fs::remove_dir_all(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return Err(FetchError::io(&path, e));
+        }
         fs::create_dir_all(&path).map_err(|e| FetchError::io(&path, e))?;
-        Ok(Staging { path, keep: false })
+        Ok(Staging {
+            path,
+            keep: false,
+            sweep,
+        })
     }
 
     fn path(&self) -> &Path {
@@ -986,14 +1525,17 @@ impl Staging {
     }
 
     /// The directory has been moved away, so there is nothing left to remove.
-    fn keep(mut self) {
+    fn keep(mut self) -> StagingSweep {
         self.keep = true;
+        std::mem::take(&mut self.sweep)
     }
 }
 
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.keep {
+            // Nowhere to report a failure from here, which is why the sweep
+            // exists: whatever this leaves behind, the next install finds.
             let _ = fs::remove_dir_all(&self.path);
         }
     }
@@ -1084,12 +1626,17 @@ mod tests {
             SkillRecord {
                 digest: "abc".into(),
                 tree_sha: "def".into(),
+                commit_sha: "c0ffee".into(),
                 recorded_at: 7,
             },
         );
-        cache.write(&fx.roots());
+        assert!(
+            cache.write(&fx.roots()).is_none(),
+            "a write that worked reports nothing"
+        );
         let read = RemoteCache::read(&fx.roots());
         assert_eq!(read.skill("pdf").unwrap().digest, "abc");
+        assert_eq!(read.skill("pdf").unwrap().commit_sha, "c0ffee");
 
         fx.write_file(REMOTE_CACHE_FILE, "{ not json ");
         assert!(RemoteCache::read(&fx.roots()).is_empty());
@@ -1098,6 +1645,341 @@ mod tests {
         assert!(RemoteCache::read(&fx.roots()).is_empty());
 
         assert!(RemoteCache::read_file(Path::new("/nonexistent/remote.json")).is_empty());
+    }
+
+    /// A renamed skill keeps its record, so it can still be called pristine and
+    /// an update can still link at the difference.
+    #[test]
+    fn a_renamed_skill_takes_its_record_with_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("pdf-tools");
+        write(&dir, "SKILL.md", "---\nname: pdf-tools\n---\n");
+
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "pdf",
+            SkillRecord {
+                digest: "the-digest-before-the-rename".into(),
+                tree_sha: "pdf-tree-sha".into(),
+                commit_sha: "c0ffee".into(),
+                recorded_at: 7,
+            },
+        );
+
+        assert!(cache.rename_skill("pdf", "pdf-tools", content_digest(&dir).ok()));
+
+        assert!(
+            cache.skill("pdf").is_none(),
+            "nothing is left under the old name to go stale"
+        );
+        let record = cache.skill("pdf-tools").expect("the record moved");
+        assert_eq!(record.tree_sha, "pdf-tree-sha");
+        assert_eq!(record.commit_sha, "c0ffee");
+        // The frontmatter `name` was rewritten by the rename, so the digest had
+        // to be taken again; keeping the old one would read as an edit.
+        assert_eq!(local_state(&cache, "pdf-tools", &dir), LocalState::Pristine);
+    }
+
+    #[test]
+    fn renaming_over_a_name_that_has_a_record_does_not_leave_the_old_one_answering() {
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "pdf-tools",
+            SkillRecord {
+                digest: "someone-elses".into(),
+                tree_sha: "other".into(),
+                ..SkillRecord::default()
+            },
+        );
+
+        // Nothing was recorded for `pdf`, so there is nothing to move, and the
+        // record sitting under the new name describes a skill that is not there
+        // any more. Dropping it is a change like any other, so the caller is
+        // told to write the cache.
+        assert!(cache.rename_skill("pdf", "pdf-tools", Some("new".into())));
+        assert!(cache.skill("pdf-tools").is_none());
+        assert!(cache.is_empty());
+    }
+
+    /// The call site writes the cache only when the rename says the cache
+    /// changed, so a drop that is not reported never reaches the disk and the
+    /// stale record answers again on the next read.
+    #[test]
+    fn the_stale_record_a_rename_drops_stays_dropped() {
+        let fx = Fixture::empty();
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "pdf-tools",
+            SkillRecord {
+                digest: "the-deleted-skills-digest".into(),
+                commit_sha: "c0ffee".into(),
+                ..SkillRecord::default()
+            },
+        );
+        cache.write(&fx.roots());
+
+        let mut cache = RemoteCache::read(&fx.roots());
+        if cache.rename_skill("pdf", "pdf-tools", Some("new".into())) {
+            cache.write(&fx.roots());
+        }
+
+        assert!(
+            RemoteCache::read(&fx.roots()).skill("pdf-tools").is_none(),
+            "the drop was written, so nothing measures the renamed directory \
+             against a deleted skill's digest"
+        );
+    }
+
+    #[test]
+    fn a_rename_with_nothing_recorded_on_either_side_changes_nothing() {
+        let mut cache = RemoteCache::new();
+        cache.record_skill("unrelated", SkillRecord::default());
+
+        assert!(!cache.rename_skill("pdf", "pdf-tools", Some("new".into())));
+        assert!(cache.skill("unrelated").is_some());
+    }
+
+    #[test]
+    fn renaming_a_skill_to_the_name_it_already_has_only_refreshes_the_digest() {
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "pdf",
+            SkillRecord {
+                digest: "before".into(),
+                tree_sha: "pdf-tree-sha".into(),
+                ..SkillRecord::default()
+            },
+        );
+
+        assert!(cache.rename_skill("pdf", "pdf", Some("after".into())));
+        let record = cache.skill("pdf").expect("still there");
+        assert_eq!(record.digest, "after");
+        assert_eq!(record.tree_sha, "pdf-tree-sha");
+    }
+
+    #[test]
+    fn a_rename_with_no_digest_leaves_no_baseline_rather_than_a_wrong_one() {
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "pdf",
+            SkillRecord {
+                digest: "before".into(),
+                tree_sha: "pdf-tree-sha".into(),
+                ..SkillRecord::default()
+            },
+        );
+
+        assert!(cache.rename_skill("pdf", "pdf-tools", None));
+        assert!(cache.skill("pdf-tools").unwrap().digest.is_empty());
+        assert_eq!(cache.skill("pdf-tools").unwrap().tree_sha, "pdf-tree-sha");
+    }
+
+    /// A record left behind by a delete answers for whatever takes the name
+    /// next, because the records are keyed by name.
+    #[test]
+    fn a_deleted_skill_takes_its_record_with_it() {
+        let fx = Fixture::realistic();
+        let dir = fx.shared().join("shared-one");
+
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "shared-one",
+            SkillRecord {
+                digest: content_digest(&dir).unwrap(),
+                tree_sha: "shared-one-tree-sha".into(),
+                commit_sha: "c0ffee".into(),
+                recorded_at: 7,
+            },
+        );
+
+        let installer = fx.installer();
+        let plan = installer.plan_delete(fx.scan().get("shared-one").unwrap());
+        let result = installer.delete(&plan);
+        assert!(result.is_ok(), "{result:?}");
+
+        assert!(
+            cache.forget_deleted(std::slice::from_ref(&plan), &result),
+            "the cache changed, so the caller has to write it"
+        );
+        assert!(cache.skill("shared-one").is_none());
+
+        // A local skill written at the same name afterwards holds the same
+        // bytes the deleted one did, so the record left behind would have
+        // called a skill nobody installed pristine.
+        let fresh = fx.skill(".agents/skills/shared-one", "shared-one");
+        assert_eq!(
+            local_state(&cache, "shared-one", &fresh),
+            LocalState::Unknown
+        );
+    }
+
+    /// The other half: a delete that stopped leaves the skill on disk, and a
+    /// record dropped there would report it as having no install record for
+    /// ever.
+    #[test]
+    fn a_delete_that_never_reached_the_directory_keeps_its_record() {
+        let fx = Fixture::realistic();
+        let dir = fx.shared().join("shared-one");
+
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "shared-one",
+            SkillRecord {
+                digest: content_digest(&dir).unwrap(),
+                ..SkillRecord::default()
+            },
+        );
+
+        // The second link is a real directory, so the delete refuses it after
+        // the first link is gone and before it reaches the origin.
+        let plan = DeletePlan {
+            name: "shared-one".into(),
+            origin: Some(dir.clone()),
+            links: vec![
+                fx.agent("claude-code").join("shared-one"),
+                fx.agent("claude-code").join("claude-only"),
+            ],
+            ..DeletePlan::default()
+        };
+        let result = fx.installer().delete(&plan);
+        assert!(result.is_err(), "{result:?}");
+        assert!(dir.is_dir(), "the skill is still where it was");
+
+        assert!(!cache.forget_deleted(std::slice::from_ref(&plan), &result));
+        assert_eq!(
+            local_state(&cache, "shared-one", &dir),
+            LocalState::Pristine
+        );
+    }
+
+    /// A skill whose directory went away before the delete was planned is as
+    /// gone as one the delete removed itself, and its record would answer for
+    /// the next skill of that name just the same.
+    #[test]
+    fn a_delete_whose_origin_had_already_gone_forgets_the_record() {
+        let fx = Fixture::realistic();
+        let dir = fx.shared().join("shared-one");
+
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "shared-one",
+            SkillRecord {
+                digest: content_digest(&dir).unwrap(),
+                ..SkillRecord::default()
+            },
+        );
+
+        let installer = fx.installer();
+        let scan = fx.scan();
+        // Removed by something other than Skillbase between the scan and the
+        // plan. The scan is what the interface was looking at when the user
+        // pressed Delete.
+        fs::remove_dir_all(&dir).unwrap();
+
+        let plan = installer.plan_delete(scan.get("shared-one").unwrap());
+        assert_eq!(plan.origin, None, "there is nothing left to remove");
+        let result = installer.delete(&plan);
+        assert!(result.is_ok(), "{result:?}");
+
+        assert!(cache.forget_deleted(std::slice::from_ref(&plan), &result));
+        assert!(cache.skill("shared-one").is_none());
+    }
+
+    /// The other origin a plan leaves empty: one outside every managed scope.
+    /// The delete never reaches it, so the directory the digest describes is
+    /// still there and the record still describes it.
+    #[test]
+    fn a_delete_that_left_an_unmanaged_origin_alone_keeps_the_record() {
+        let fx = Fixture::realistic();
+        let dir = fx.home().join("Documents/secret");
+
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "secret",
+            SkillRecord {
+                digest: content_digest(&dir).unwrap(),
+                ..SkillRecord::default()
+            },
+        );
+
+        // What `plan_delete` produces for an origin outside every scope: no
+        // origin, the path listed as left alone, and the links still going.
+        let plan = DeletePlan {
+            name: "secret".into(),
+            origin: None,
+            origin_missing: false,
+            links: vec![fx.agent("claude-code").join("shared-one")],
+            skipped: vec![dir.clone()],
+            ..DeletePlan::default()
+        };
+        let result = fx.installer().delete(&plan);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(dir.is_dir(), "the origin was never in reach");
+
+        assert!(!cache.forget_deleted(std::slice::from_ref(&plan), &result));
+        assert_eq!(local_state(&cache, "secret", &dir), LocalState::Pristine);
+    }
+
+    /// Deleting a marked set runs the plans in order and stops at the first
+    /// refusal, so one result covers skills that went and skills that stayed.
+    #[test]
+    fn a_bulk_delete_forgets_only_the_skills_it_removed() {
+        let fx = Fixture::realistic();
+        let mut cache = RemoteCache::new();
+        for name in ["shared-one", "shared-two"] {
+            cache.record_skill(
+                name,
+                SkillRecord {
+                    digest: content_digest(&fx.shared().join(name)).unwrap(),
+                    ..SkillRecord::default()
+                },
+            );
+        }
+
+        let installer = fx.installer();
+        let scan = fx.scan();
+        let plans = vec![
+            installer.plan_delete(scan.get("shared-one").unwrap()),
+            installer.plan_delete(scan.get("shared-two").unwrap()),
+        ];
+        let done = installer.delete(&plans[0]).unwrap();
+        let result = Err(InstallError::partial(
+            done,
+            InstallError::NotALink {
+                path: fx.agent("claude-code").join("claude-only"),
+                kind: "directory",
+            },
+        ));
+
+        assert!(cache.forget_deleted(&plans, &result));
+        assert!(cache.skill("shared-one").is_none(), "removed");
+        assert!(
+            cache.skill("shared-two").is_some(),
+            "never touched, so still recorded"
+        );
+    }
+
+    #[test]
+    fn a_cache_that_cannot_be_written_reports_the_failure() {
+        let fx = Fixture::empty();
+        // `~/.skillbase` is a file, so the directory the cache lives in cannot
+        // be created. A read-only home reads the same way.
+        fx.write_file(".skillbase", "not a directory\n");
+
+        let mut cache = RemoteCache::new();
+        cache.record_skill("pdf", SkillRecord::default());
+        let error = cache
+            .write(&fx.roots())
+            .expect("a write that failed reports why");
+
+        assert!(matches!(error, CacheWriteError::Io { .. }), "{error:?}");
+        let sentence = error.to_string();
+        assert!(sentence.contains("install record"), "{sentence}");
+        assert!(sentence.contains(".skillbase"), "{sentence}");
+
+        // And the consequence the user would otherwise never be told about:
+        // there is no record, so nothing can be called pristine.
+        assert!(RemoteCache::read(&fx.roots()).is_empty());
     }
 
     #[test]
@@ -1114,7 +1996,7 @@ mod tests {
             SkillRecord {
                 digest: content_digest(&dir).unwrap(),
                 tree_sha: "t".into(),
-                recorded_at: 0,
+                ..SkillRecord::default()
             },
         );
         assert_eq!(local_state(&cache, "pdf", &dir), LocalState::Pristine);
@@ -1283,7 +2165,7 @@ mod tests {
             SkillRecord {
                 digest: String::new(),
                 tree_sha: "pdf-old".into(),
-                recorded_at: 0,
+                ..SkillRecord::default()
             },
         );
         let report = check_updates(&gh, &targets, &mut cache);
@@ -1503,6 +2385,29 @@ mod tests {
         http
     }
 
+    /// Sets a cancel flag while the archive is being fetched.
+    ///
+    /// The only injection point an install has after the first cancel check:
+    /// every later step is filesystem work with nothing to substitute. Without
+    /// it a test can only ever trip the check that comes before the download.
+    struct CancelOnDownload {
+        inner: FakeHttp,
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl Http for CancelOnDownload {
+        fn get(
+            &self,
+            url: &str,
+            headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, crate::http::HttpError> {
+            if url.contains("codeload.test") {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            self.inner.get(url, headers)
+        }
+    }
+
     #[test]
     fn installing_writes_the_skill_and_its_provenance_into_the_store() {
         let fx = Fixture::empty();
@@ -1539,6 +2444,13 @@ mod tests {
             local_state(&cache, "pdf", &installed.dir),
             LocalState::Pristine
         );
+
+        // Both shas, because they answer different questions. The tree sha is
+        // what a later check compares; the commit sha is the only one of the
+        // two GitHub's compare view will resolve.
+        let record = cache.skill("pdf").expect("recorded");
+        assert_eq!(record.tree_sha, "pdf-tree-sha");
+        assert_eq!(record.commit_sha, "c0ffee");
 
         // Discovery sees it as a managed skill with no adoption step.
         let found = fx.scan();
@@ -1584,6 +2496,211 @@ mod tests {
         )
         .unwrap();
         assert!(installed.dir.join("scripts/run.sh").is_file());
+
+        // The skill that was replaced went to the trash, not to nothing.
+        let moved = installed
+            .outcome
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                Change::MovedToTrash { from, to } => Some((from.clone(), to.clone())),
+                _ => None,
+            })
+            .expect("the old directory was moved to the trash");
+        assert_eq!(moved.0, fx.store().join("pdf"));
+        assert!(moved.1.starts_with(fx.roots().trash_dir()));
+        assert!(
+            fs::read_to_string(moved.1.join("SKILL.md"))
+                .unwrap()
+                .contains("name: pdf"),
+            "the replaced skill is still readable under the trash"
+        );
+    }
+
+    /// The half-done replace: the old skill is already in the trash and the new
+    /// one cannot be put down. The staged directory is missing here, which is
+    /// what a rename failing with ENOSPC or across a filesystem boundary
+    /// amounts to from the destination's side — the old skill is gone from the
+    /// store and only the error can say where it went.
+    #[test]
+    fn a_replace_that_cannot_land_the_new_skill_says_where_the_old_one_went() {
+        let fx = Fixture::empty();
+        let dest = fx.skill(".agents/skills/pdf", "pdf");
+        let staged = fx.home().join(STAGING_DIR).join("pdf-never-extracted");
+
+        let err = place_into_store(&fx.installer(), &staged, &dest, true).unwrap_err();
+
+        let done = err.completed().expect("what was already done: {err:?}");
+        let trashed = done
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                Change::MovedToTrash { to, .. } => Some(to.clone()),
+                _ => None,
+            })
+            .expect("the old directory was moved to the trash");
+        assert!(!dest.exists(), "the store entry is gone");
+        assert!(
+            trashed.join("SKILL.md").is_file(),
+            "and the skill is under the trash"
+        );
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&trashed.display().to_string()),
+            "the message names the directory the skill is in: {message}"
+        );
+        assert!(message.contains("Then it stopped: "), "{message}");
+
+        // And the interface's rendering says the same with a `~`.
+        let abbreviated = err.describe_under(fx.home());
+        assert!(
+            abbreviated.contains("to the trash at ~/.skillbase/trash/pdf-"),
+            "{abbreviated}"
+        );
+        assert!(abbreviated.contains("Then it stopped: "), "{abbreviated}");
+    }
+
+    #[test]
+    fn an_install_that_changed_nothing_before_it_failed_is_not_reported_as_partial() {
+        let fx = Fixture::empty();
+        let dest = fx.store().join("pdf");
+        let staged = fx.home().join(STAGING_DIR).join("pdf-never-extracted");
+
+        let err = place_into_store(&fx.installer(), &staged, &dest, true).unwrap_err();
+
+        assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
+        assert!(err.completed().is_none());
+    }
+
+    /// What an install writes when the digest cannot be computed. The skill is
+    /// already in the store by then, so the install is not failed; the record
+    /// goes in without a digest, and the shas an update check needs are still
+    /// there. An empty digest has to read as "no baseline", never as an edit,
+    /// or a skill nobody touched would prompt on every update.
+    #[test]
+    fn a_record_with_no_digest_reads_as_unknown_rather_than_edited() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("pdf");
+        write(&dir, "SKILL.md", "---\nname: pdf\n---\n");
+
+        let mut cache = RemoteCache::new();
+        cache.record_skill(
+            "pdf",
+            SkillRecord {
+                digest: String::new(),
+                tree_sha: "pdf-tree-sha".into(),
+                commit_sha: "c0ffee".into(),
+                recorded_at: now_unix(),
+            },
+        );
+
+        assert_eq!(local_state(&cache, "pdf", &dir), LocalState::Unknown);
+        let record = cache.skill("pdf").unwrap();
+        assert_eq!(record.tree_sha, "pdf-tree-sha");
+        assert_eq!(record.commit_sha, "c0ffee");
+    }
+
+    #[test]
+    fn a_tree_that_cannot_be_renamed_across_a_filesystem_is_copied_instead() {
+        let temp = tempfile::tempdir().unwrap();
+        let from = temp.path().join("staged");
+        write(&from, "SKILL.md", "---\nname: pdf\n---\n");
+        write(&from, "scripts/run.sh", "#!/bin/sh\n");
+        symlink("run.sh", from.join("scripts/also.sh")).unwrap();
+
+        let to = temp.path().join("store/pdf");
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        copy_dir(&from, &to).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(to.join("scripts/run.sh")).unwrap(),
+            "#!/bin/sh\n"
+        );
+        assert_eq!(
+            fs::read_link(to.join("scripts/also.sh")).unwrap(),
+            Path::new("run.sh"),
+            "a symlink is recreated as written, not followed"
+        );
+        assert_eq!(content_digest(&from).unwrap(), content_digest(&to).unwrap());
+    }
+
+    /// Cancelled before the call, so the check before the download is the one
+    /// that stops it: nothing is downloaded and nothing is staged.
+    #[test]
+    fn a_cancelled_install_writes_nothing_and_stages_nothing() {
+        let fx = Fixture::empty();
+        let gh = client(install_http());
+        let mut cache = RemoteCache::new();
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        let err = install_from_github(
+            &fx.installer(),
+            &gh,
+            &SkillLocation::parse("o/r/skills/pdf").unwrap(),
+            &InstallOptions::new().cancelled_by(Arc::clone(&cancel)),
+            &mut cache,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, FetchError::Cancelled), "{err:?}");
+        assert!(!fx.store().exists(), "nothing was written into the store");
+        assert!(
+            gh.http().urls().iter().all(|url| !url.contains("codeload")),
+            "and the archive was never asked for: {:?}",
+            gh.http().urls()
+        );
+        let staging = fx.home().join(STAGING_DIR);
+        assert!(
+            !staging.exists() || fs::read_dir(&staging).unwrap().count() == 0,
+            "nothing was left in staging"
+        );
+        assert!(cache.skill("pdf").is_none(), "nothing was recorded");
+    }
+
+    /// Cancelled from inside the download, which is where a person cancelling a
+    /// slow install actually gets to. Setting the flag before the call only ever
+    /// trips the first check, which is before the archive is fetched and before
+    /// a staging directory exists, so it can say nothing about the check that
+    /// guards the destination.
+    #[test]
+    fn cancelling_during_the_download_still_replaces_nothing() {
+        let fx = Fixture::empty();
+        let existing = fx.skill(".agents/skills/pdf", "pdf");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let gh = GitHub::new(CancelOnDownload {
+            inner: install_http(),
+            cancel: Arc::clone(&cancel),
+        })
+        .with_endpoints("https://api.test", "https://codeload.test");
+        let mut cache = RemoteCache::new();
+        let options = InstallOptions::new()
+            .replacing()
+            .cancelled_by(Arc::clone(&cancel));
+
+        let err = install_from_github(
+            &fx.installer(),
+            &gh,
+            &SkillLocation::parse("o/r/skills/pdf").unwrap(),
+            &options,
+            &mut cache,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, FetchError::Cancelled), "{err:?}");
+        assert!(existing.join("SKILL.md").is_file(), "untouched");
+        assert!(!existing.join("scripts").exists(), "and not half-replaced");
+        assert!(
+            !fx.roots().trash_dir().exists(),
+            "nothing was moved to the trash"
+        );
+        // The archive really was downloaded and extracted, so a staging
+        // directory really did exist and `Staging::drop` really did take it
+        // away. Without the download this assertion would hold vacuously.
+        let staging = fx.home().join(STAGING_DIR);
+        assert!(staging.is_dir(), "the install got as far as staging");
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        assert!(cache.skill("pdf").is_none(), "nothing was recorded");
     }
 
     #[test]
@@ -1665,5 +2782,115 @@ mod tests {
             upstream_state(&gh, &fx.roots(), &location, &installed.dir).unwrap(),
             LocalState::Edited
         );
+    }
+
+    // -- staging -------------------------------------------------------------
+
+    #[test]
+    fn a_sweep_of_a_home_that_never_staged_anything_has_nothing_to_say() {
+        let fx = Fixture::empty();
+        let sweep = sweep_staging(&fx.roots());
+
+        assert!(sweep.is_clean());
+        assert!(sweep.removed().is_empty());
+        assert!(sweep.warning().is_none());
+    }
+
+    #[test]
+    fn a_sweep_leaves_alone_what_a_running_install_might_own() {
+        let fx = Fixture::empty();
+        let live = fx.dir(&format!("{STAGING_DIR}/pdf-1-1"));
+
+        // The real threshold, against a directory made a moment ago: another
+        // copy of Skillbase could be extracting into it right now.
+        let sweep = sweep_staging(&fx.roots());
+
+        assert!(sweep.removed().is_empty(), "{sweep:?}");
+        assert!(sweep.is_clean());
+        assert!(live.is_dir());
+    }
+
+    #[test]
+    fn a_sweep_takes_away_what_a_killed_install_left_behind() {
+        let fx = Fixture::empty();
+        let root = fx.dir(STAGING_DIR);
+        let abandoned = fx.dir(&format!("{STAGING_DIR}/pdf-1-1"));
+        fs::write(abandoned.join("SKILL.md"), "half a skill\n").unwrap();
+        fs::write(abandoned.join("big.bin"), "x".repeat(4096)).unwrap();
+        let stray = fx.write_file(&format!("{STAGING_DIR}/stray.tmp"), "x");
+
+        // Age zero, so everything counts as abandoned without waiting an hour.
+        let sweep = sweep_staging_dir(&root, Duration::ZERO);
+
+        assert_eq!(sweep.removed(), [abandoned.clone(), stray.clone()]);
+        assert!(sweep.is_clean());
+        assert!(sweep.warning().is_none());
+        assert!(!abandoned.exists());
+        assert!(!stray.exists());
+    }
+
+    #[test]
+    fn a_sweep_that_cannot_remove_names_the_directory_it_left() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = Fixture::empty();
+        let root = fx.dir(STAGING_DIR);
+        let stuck = fx.dir(&format!("{STAGING_DIR}/pdf-1-1"));
+        // Readable, so the sweep sees it; not writable, so it cannot act.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let sweep = sweep_staging_dir(&root, Duration::ZERO);
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!sweep.is_clean(), "{sweep:?}");
+        assert_eq!(sweep.failed().len(), 1, "{sweep:?}");
+        assert_eq!(sweep.failed()[0].0, stuck);
+        let warning = sweep.warning().expect("a sentence naming the directory");
+        assert!(warning.contains("pdf-1-1"), "{warning}");
+        assert!(stuck.is_dir(), "and the space really is still spent");
+    }
+
+    /// Backdates `path` so a sweep counts it as abandoned. An install sweeps
+    /// with [`STALE_STAGING_AGE`] rather than an age a test can pass in, so the
+    /// only way to plant something an install will take away is to make it old.
+    fn backdate(path: &Path, by: Duration) {
+        let times = fs::FileTimes::new().set_modified(SystemTime::now() - by);
+        fs::File::open(path).unwrap().set_times(times).unwrap();
+    }
+
+    #[test]
+    fn an_install_sweeps_staging_and_reports_what_the_sweep_found() {
+        let fx = Fixture::empty();
+        // What a run that was killed mid-install left behind, old enough that
+        // no install still running could own it.
+        let abandoned = fx.dir(&format!("{STAGING_DIR}/pdf-1-1"));
+        fs::write(abandoned.join("SKILL.md"), "half a skill\n").unwrap();
+        backdate(&abandoned, STALE_STAGING_AGE * 2);
+
+        let gh = client(install_http());
+        let mut cache = RemoteCache::new();
+        let installed = install_from_github(
+            &fx.installer(),
+            &gh,
+            &SkillLocation::parse("o/r/skills/pdf").unwrap(),
+            &InstallOptions::new(),
+            &mut cache,
+        )
+        .unwrap();
+
+        assert!(installed.staging.is_clean(), "{:?}", installed.staging);
+        assert!(installed.staging.warning().is_none());
+        // The wiring this test is named for: what `Staging::new` swept reaches
+        // `Installed::staging` through `Staging::keep`.
+        assert_eq!(
+            installed.staging.removed(),
+            std::slice::from_ref(&abandoned)
+        );
+        assert!(!abandoned.exists());
+        // And this install's own staging directory went with `Staging::drop`,
+        // not with the sweep.
+        let staging = fx.home().join(STAGING_DIR);
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     }
 }

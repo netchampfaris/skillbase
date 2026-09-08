@@ -90,19 +90,68 @@ impl SkillFrontmatter {
         self.raw.is_none()
     }
 
-    /// The YAML block, without the `---` delimiters.
+    /// The YAML block, without the `---` delimiters, or the error the
+    /// serializer reported.
     ///
     /// Replays the source verbatim when nothing has been mutated. Otherwise
     /// serializes the mapping, which preserves key order but normalizes
     /// formatting. An empty mapping produces an empty string rather than `{}`.
-    pub fn to_yaml(&self) -> String {
+    ///
+    /// **Anything that writes a `SKILL.md` should call this rather than
+    /// [`SkillFrontmatter::to_yaml`].** Serializing a mapping fails only for a
+    /// value YAML cannot spell — a value nested inside two tags, say — but when
+    /// it does, the alternative to an error is a file whose frontmatter is
+    /// shorter than the one that was read, and no error is worse than a saved
+    /// skill with no `name` in it.
+    ///
+    /// Skillbase's own interface cannot produce such a value: it edits
+    /// frontmatter through the string accessors only. The guard is for callers
+    /// of [`SkillFrontmatter::as_mapping_mut`], which hands out the mapping
+    /// itself and so admits any `Value` at all.
+    pub fn try_to_yaml(&self) -> Result<String, serde_yaml_ng::Error> {
         if let Some(raw) = &self.raw {
-            return raw.clone();
+            return Ok(raw.clone());
         }
         if self.map.is_empty() {
+            return Ok(String::new());
+        }
+        serde_yaml_ng::to_string(&self.map)
+    }
+
+    /// The YAML block, without the `---` delimiters, on the assumption that it
+    /// can be produced.
+    ///
+    /// The same as [`SkillFrontmatter::try_to_yaml`] except that a serializer
+    /// error is answered with the entries that *can* be serialized instead of
+    /// being reported. That is a last resort for a caller with nowhere to put
+    /// an error, and it still drops the offending entry, so a caller that is
+    /// about to overwrite a file on disk must use `try_to_yaml` and refuse the
+    /// write instead.
+    pub fn to_yaml(&self) -> String {
+        self.try_to_yaml().unwrap_or_else(|_| self.to_yaml_lossy())
+    }
+
+    /// Every entry that can be serialized, in order, skipping the ones that
+    /// cannot.
+    ///
+    /// Entries are added one at a time and the growing mapping is re-serialized
+    /// after each, so one unspellable value costs its own key and no other. It
+    /// is only reachable from [`SkillFrontmatter::to_yaml`], where the previous
+    /// behaviour was to return an empty string and take `name` and
+    /// `description` down with the offending key.
+    fn to_yaml_lossy(&self) -> String {
+        let mut kept = Mapping::new();
+        for (key, value) in &self.map {
+            let mut probe = kept.clone();
+            probe.insert(key.clone(), value.clone());
+            if serde_yaml_ng::to_string(&probe).is_ok() {
+                kept = probe;
+            }
+        }
+        if kept.is_empty() {
             return String::new();
         }
-        serde_yaml_ng::to_string(&self.map).unwrap_or_default()
+        serde_yaml_ng::to_string(&kept).unwrap_or_default()
     }
 
     /// Forgets the source text, so the next [`SkillFrontmatter::to_yaml`]
@@ -284,6 +333,8 @@ impl<'de> Deserialize<'de> for SkillFrontmatter {
 
 #[cfg(test)]
 mod tests {
+    use serde_yaml_ng::value::{Tag, TaggedValue};
+
     use super::*;
 
     fn parse(yaml: &str) -> SkillFrontmatter {
@@ -394,5 +445,53 @@ mod tests {
     #[test]
     fn an_empty_in_memory_mapping_emits_nothing() {
         assert_eq!(SkillFrontmatter::new().to_yaml(), "");
+        assert_eq!(SkillFrontmatter::new().try_to_yaml().unwrap(), "");
+    }
+
+    /// A value inside two tags. YAML has no spelling for it, so the serializer
+    /// refuses the whole mapping — the one realistic way this can happen.
+    fn doubly_tagged() -> Value {
+        let inner = Value::Tagged(Box::new(TaggedValue {
+            tag: Tag::new("Inner"),
+            value: Value::String("x".into()),
+        }));
+        Value::Tagged(Box::new(TaggedValue {
+            tag: Tag::new("Outer"),
+            value: inner,
+        }))
+    }
+
+    #[test]
+    fn try_to_yaml_reports_what_the_serializer_refuses() {
+        let mut fm = parse("name: pdf\ndescription: Reads PDFs.\n");
+        fm.as_mapping_mut()
+            .insert(Value::String("metadata".into()), doubly_tagged());
+
+        assert!(
+            fm.try_to_yaml().is_err(),
+            "a doubly tagged value must not serialize"
+        );
+    }
+
+    #[test]
+    fn to_yaml_keeps_the_rest_when_one_value_cannot_be_serialized() {
+        let mut fm = parse("name: pdf\ndescription: Reads PDFs.\n");
+        fm.as_mapping_mut()
+            .insert(Value::String("metadata".into()), doubly_tagged());
+
+        // The old behaviour was an empty string here, which `to_markdown` then
+        // wrote out as `---\n---\n`: a skill with no name and no description.
+        let yaml = fm.to_yaml();
+        assert!(yaml.contains("name: pdf"), "{yaml:?}");
+        assert!(yaml.contains("description: Reads PDFs."), "{yaml:?}");
+        assert!(!yaml.contains("metadata"), "{yaml:?}");
+    }
+
+    #[test]
+    fn to_yaml_matches_try_to_yaml_when_nothing_is_wrong() {
+        let mut fm = parse("name: pdf\ndescription: Reads PDFs.\n");
+        fm.set_name("pdf-reader");
+        assert_eq!(fm.to_yaml(), fm.try_to_yaml().unwrap());
+        assert!(fm.to_yaml().contains("pdf-reader"));
     }
 }

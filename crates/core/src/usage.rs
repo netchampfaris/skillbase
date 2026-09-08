@@ -245,7 +245,10 @@ impl Usage {
     ///
     /// Never fails. An unreadable directory or file becomes a warning and the
     /// scan carries on, exactly as in [`crate::discovery`]. A cache that cannot
-    /// be read or written is not even that: it silently means "do a full scan".
+    /// be *read* is not even that: it silently means "do a full scan", and the
+    /// scan that follows answers the same question. A cache that cannot be
+    /// *written* is a warning, because it means every later load repeats the
+    /// full scan and nothing else on the machine will ever say why.
     pub fn load(roots: &Roots) -> Usage {
         let mut warnings = Vec::new();
         let cache_path = roots.home().join(USAGE_CACHE_FILE);
@@ -284,7 +287,9 @@ impl Usage {
 
         // Files that vanished are simply absent from `fresh`. Claude Code prunes
         // at ~30 days, so this is routine and the counts decay with it.
-        Cache::write(&cache_path, fresh);
+        if let Err(warning) = Cache::write(&cache_path, fresh) {
+            warnings.push(warning);
+        }
 
         let mut counts: HashMap<String, u32> = HashMap::new();
         let mut plugins: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -783,27 +788,44 @@ impl Cache {
         }
     }
 
-    /// Writes the cache, ignoring every failure.
+    /// Writes the cache, and returns a warning line when it could not be
+    /// written.
     ///
     /// Written to a sibling and renamed, so a load interrupted midway leaves the
     /// previous cache intact rather than a truncated one.
-    fn write(path: &Path, files: BTreeMap<String, FileRecord>) {
+    ///
+    /// Failing here costs no correctness and all of the speed: the next load
+    /// reads every transcript on the machine from byte zero again, and the one
+    /// after that too. That is a few hundred megabytes on a well used machine,
+    /// so it is worth a line in [`Usage::warnings`] rather than a silent
+    /// return.
+    fn write(path: &Path, files: BTreeMap<String, FileRecord>) -> Result<(), String> {
         let cache = Cache {
             version: CACHE_VERSION,
             files,
         };
-        let Ok(text) = serde_json::to_string(&cache) else {
-            return;
+        let failed = |e: &dyn std::fmt::Display| {
+            format!(
+                "cannot write the usage cache {}: {e}; until it can be written, \
+                 every launch reads every transcript again",
+                path.display()
+            )
         };
-        if let Some(parent) = path.parent()
-            && fs::create_dir_all(parent).is_err()
-        {
-            return;
+        let text = serde_json::to_string(&cache).map_err(|e| failed(&e))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| failed(&e))?;
         }
         let temp = path.with_extension("json.tmp");
-        if fs::write(&temp, text).is_ok() && fs::rename(&temp, path).is_err() {
+        fs::write(&temp, text).map_err(|e| {
+            // A half-written temp file left behind is never read and never
+            // cleaned up by anything else, so remove it here too.
             let _ = fs::remove_file(&temp);
-        }
+            failed(&e)
+        })?;
+        fs::rename(&temp, path).map_err(|e| {
+            let _ = fs::remove_file(&temp);
+            failed(&e)
+        })
     }
 }
 
@@ -1170,6 +1192,41 @@ mod tests {
         let text = fs::read_to_string(fx.home().join(USAGE_CACHE_FILE)).unwrap();
         assert!(text.contains("\"version\":1"), "{text}");
         assert_eq!(Usage::load(&fx.roots()).count("diagnose"), 1);
+    }
+
+    #[test]
+    fn a_cache_that_cannot_be_written_warns_and_the_counts_still_arrive() {
+        let fx = Fixture::empty();
+        transcript(&fx, "one", &[tool_use("a", "diagnose")]);
+        // `.skillbase` is a file, so the cache directory cannot be created and
+        // the cache cannot be written.
+        fx.write_file(".skillbase", "not a directory\n");
+
+        let usage = Usage::load(&fx.roots());
+
+        assert_eq!(usage.count("diagnose"), 1, "the scan still answers");
+        let warning = usage
+            .warnings()
+            .iter()
+            .find(|w| w.contains("usage cache"))
+            .unwrap_or_else(|| panic!("no cache warning in {:?}", usage.warnings()));
+        assert!(warning.contains(USAGE_CACHE_FILE), "{warning}");
+        assert!(warning.contains("every launch"), "{warning}");
+    }
+
+    #[test]
+    fn a_cache_written_without_trouble_says_nothing() {
+        let fx = Fixture::empty();
+        transcript(&fx, "one", &[tool_use("a", "diagnose")]);
+
+        let usage = Usage::load(&fx.roots());
+
+        assert!(
+            usage.warnings().is_empty(),
+            "a cache that wrote is not news: {:?}",
+            usage.warnings()
+        );
+        assert!(fx.home().join(USAGE_CACHE_FILE).is_file());
     }
 
     #[test]

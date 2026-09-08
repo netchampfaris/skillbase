@@ -104,14 +104,14 @@ pub use frontmatter::{
     SkillFrontmatter,
 };
 pub use github::{
-    GITHUB_API_BASE, GITHUB_CODELOAD_BASE, GITHUB_TOKEN_ENV, GitHub, GitHubError, RateLimit,
-    RefState, RepoRef, SkillLocation, Tree, TreeEntry, extract_subdir,
+    GITHUB_API_BASE, GITHUB_CODELOAD_BASE, GITHUB_TOKEN_ENV, GitHub, GitHubError, ParsedLocation,
+    RateLimit, RefState, RepoRef, SkillLocation, Tree, TreeEntry, extract_subdir,
 };
-pub use github_token::{TokenSource, github_token_source};
+pub use github_token::{TokenSource, github_token_source, refresh_github_token};
 pub use http::{Http, HttpError, HttpResponse, MAX_BODY_BYTES, USER_AGENT, UreqHttp};
 pub use install::{
-    COPY_MARKER, Change, ConsolidatePlan, ContentDiff, DeletePlan, Duplicate, InstallError,
-    Installer, Outcome,
+    COPY_MARKER, Change, ConsolidatePlan, ContentDiff, DeletePlan, Duplicate, ImportOptions,
+    InstallError, Installer, Outcome,
 };
 pub use provenance::{
     DEFAULT_BRANCH, KEY_GITHUB_PATH, KEY_GITHUB_REF, KEY_GITHUB_REPO, KEY_GITHUB_TREE_SHA,
@@ -122,10 +122,10 @@ pub use registry::{
     SHARED_ID, SHARED_SKILLS_DIR, STORE_DIR, UNSUPPORTED, home_dir,
 };
 pub use remote::{
-    FetchError, InstallOptions, Installed, LocalState, REMOTE_CACHE_FILE, RemoteCache, RepoRecord,
-    STAGING_DIR, SkillRecord, UpdateReport, UpdateStatus, UpdateTarget, check_updates,
-    content_digest, install_from_github, local_state, provenance_of, repo_key, update_targets,
-    upstream_state,
+    CacheWriteError, FetchError, InstallOptions, Installed, LocalState, REMOTE_CACHE_FILE,
+    RemoteCache, RepoRecord, STAGING_DIR, SkillRecord, StagingSweep, UpdateReport, UpdateStatus,
+    UpdateTarget, check_updates, content_digest, install_from_github, local_state, provenance_of,
+    repo_key, sweep_staging, update_targets, upstream_state,
 };
 pub use skill::{SKILL_FILE_NAME, Skill};
 pub use skillsh::{

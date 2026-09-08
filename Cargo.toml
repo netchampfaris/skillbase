@@ -30,8 +30,9 @@ gpui-kit = { version = "0.6", features = [
 anyhow = "1"
 rust-embed = "8"
 
-# Reading the system accent colour for the focus ring. Both crates are already
-# in the lock file by way of `gpui`; this only widens the feature set.
+# Reading the system accent colour, and noticing when the user changes it. All
+# of these crates are already in the lock file by way of `gpui`; this only
+# widens the feature set.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
@@ -43,6 +44,14 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSColorSpace",
     "NSResponder",
     "objc2-core-foundation",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "NSDistributedNotificationCenter",
+    "NSNotification",
+    "NSOperation",
+    "NSString",
 ] }
 
 [profile.dev]

@@ -1,10 +1,11 @@
 //! The middle column: a band naming the scope and ordering it, a search field,
 //! and a scrolling list of skill rows.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::dialog::{DialogClose, DialogFooter};
+use gpui_kit::component::dialog::{DialogButtonProps, DialogClose, DialogFooter};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -12,21 +13,28 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, StyledExt as _,
-    WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
+    StyledExt as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, ElementId, InteractiveElement as _, IntoElement,
-    KeyBinding, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Window, actions, div, px, rems,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, FocusHandle,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, actions, div, px, rems,
 };
-use skillbase_core::Installer;
+use skillbase_core::{
+    AgentDef, DeletePlan, InstallError, Installer, MAX_NAME_LEN, MIN_QUERY_LEN, Outcome, Registry,
+    RemoteCache, is_kebab_case,
+};
 
 use crate::app::{ScanState, Skillbase};
+use crate::menus::{ClearMarks, MarkAll};
 
-use super::model::{Library, SkillSort, SkillView};
-use super::report;
+use super::model::{Library, Scan, Scope, SkillSort, SkillView, display_path, join_and};
+use super::{
+    agent_icon, delete_cache_failure_notification, remember_delete_cache_failure, report,
+    take_delete_cache_failure,
+};
 
 /// A comfortable default: long enough for a skill name plus a description
 /// fragment, short enough that the detail pane keeps the surplus.
@@ -35,7 +43,18 @@ pub const LIST_MIN_WIDTH: f32 = 240.;
 pub const LIST_MAX_WIDTH: f32 = 460.;
 
 /// The keymap context the list's own bindings live in.
-const CONTEXT: &str = "SkillList";
+///
+/// Named here and used from [`crate::menus`] too: the marking commands appear
+/// in the menu bar, and a menu item shows its shortcut only when the binding
+/// was registered before the menu was built.
+pub(crate) const CONTEXT: &str = "SkillList";
+
+/// The keymap context the search field above the list lives in.
+///
+/// Separate from [`CONTEXT`] because the two want opposite things from the
+/// arrows: in the list they move the selection, in a text field they move the
+/// caret. Only the one key that has to cross the join is bound here.
+const SEARCH_CONTEXT: &str = "SkillSearch";
 
 actions!(
     skill_list,
@@ -44,7 +63,10 @@ actions!(
         SelectPrev,
         SelectFirst,
         SelectLast,
-        ConfirmSelection
+        ExtendNext,
+        ExtendPrev,
+        ConfirmSelection,
+        EnterList
     ]
 );
 
@@ -65,7 +87,208 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("home", SelectFirst, Some(CONTEXT)),
         KeyBinding::new("end", SelectLast, Some(CONTEXT)),
         KeyBinding::new("enter", ConfirmSelection, Some(CONTEXT)),
+        // Shift with an arrow grows the marked set instead of moving the one
+        // selection, which is what every desktop list does and what makes a
+        // run of rows reachable without the mouse. The detail pane stays where
+        // it is: extending a mark is not opening a skill.
+        KeyBinding::new("shift-down", ExtendNext, Some(CONTEXT)),
+        KeyBinding::new("shift-up", ExtendPrev, Some(CONTEXT)),
+        // The join Cmd-F leaves open: the field takes focus, and without
+        // these two the arrows and Enter stop at its edge. Down is what
+        // Spotlight and Finder use to step from a search field into its
+        // results; Enter is what a reader tries when Down does not occur to
+        // them. A single-line input leaves both keys unhandled, so the
+        // deeper binding runs first and then hands them on.
+        KeyBinding::new("down", EnterList, Some(SEARCH_CONTEXT)),
+        KeyBinding::new("enter", EnterList, Some(SEARCH_CONTEXT)),
     ]);
+}
+
+/// The rows a bulk action works on, and the two ends a range extension is
+/// measured between.
+///
+/// It sits beside the single selection rather than replacing it: the selection
+/// is what the detail pane shows, and one skill open in an editor is a
+/// different thing from six skills about to be deleted. A plain click sets both
+/// to the same row, so a set of one is the interface that was here before.
+///
+/// Every position is worked out against the rows the list is showing *now* —
+/// filtered by the search field and ordered by the sort menu — so shift never
+/// marks a row the reader cannot see. Membership is by name, because a scan, a
+/// filter or a re-sort moves every index.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Marks {
+    /// Every marked skill, by name.
+    names: Vec<SharedString>,
+    /// Where a range extension starts: the last row plain-clicked or toggled.
+    anchor: Option<SharedString>,
+    /// The far end of the last extension, which is where a shift-arrow carries
+    /// on from.
+    cursor: Option<SharedString>,
+}
+
+impl Marks {
+    /// Mark this row and nothing else, and start measuring ranges from it.
+    ///
+    /// What a plain click and every arrow key do.
+    pub(crate) fn reset_to(&mut self, name: Option<SharedString>) {
+        self.names = name.iter().cloned().collect();
+        self.anchor = name.clone();
+        self.cursor = name;
+    }
+
+    /// Add this row to the marked set, or take it out again.
+    ///
+    /// The row becomes the anchor either way: the next shift-click measures
+    /// from the row the user last touched, marked or not, which is what
+    /// Finder does.
+    pub(crate) fn toggle(&mut self, name: SharedString) {
+        match self.names.iter().position(|marked| *marked == name) {
+            Some(at) => {
+                self.names.remove(at);
+            }
+            None => self.names.push(name.clone()),
+        }
+        self.anchor = Some(name.clone());
+        self.cursor = Some(name);
+    }
+
+    /// Mark every row between the anchor and `name`, in the order the list is
+    /// showing.
+    ///
+    /// An anchor the current filter has hidden is not one end of a visible
+    /// range, so the gesture falls back to marking the row that was clicked.
+    /// Extending to rows nobody can see is worse than doing less.
+    pub(crate) fn extend_to(&mut self, name: SharedString, ordered: &[SharedString]) {
+        let to = index_of(ordered, &name);
+        let from = self.anchor.as_ref().and_then(|at| index_of(ordered, at));
+        match (from, to) {
+            (Some(from), Some(to)) => {
+                let (first, last) = if from <= to { (from, to) } else { (to, from) };
+                self.names = ordered[first..=last].to_vec();
+                self.cursor = Some(name);
+            }
+            _ => self.reset_to(Some(name)),
+        }
+    }
+
+    /// Where a shift-arrow lands, having marked everything from the anchor to
+    /// there.
+    ///
+    /// `from` is where the list's own selection sits, used when no extension
+    /// has started yet. `None` means the list has no rows to move through.
+    pub(crate) fn step(
+        &mut self,
+        ordered: &[SharedString],
+        forward: bool,
+        from: Option<usize>,
+    ) -> Option<usize> {
+        if ordered.is_empty() {
+            return None;
+        }
+        let at = self
+            .cursor
+            .as_ref()
+            .and_then(|at| index_of(ordered, at))
+            .or(from);
+        let next = match (at, forward) {
+            (Some(at), true) => (at + 1).min(ordered.len() - 1),
+            (Some(at), false) => at.saturating_sub(1),
+            // Nothing to extend from: the key enters the list at the end it
+            // points away from, exactly as the plain arrows do.
+            (None, true) => 0,
+            (None, false) => ordered.len() - 1,
+        };
+        let name = ordered[next].clone();
+        if self.anchor.is_none() {
+            self.anchor = Some(name.clone());
+        }
+        self.extend_to(name, ordered);
+        Some(next)
+    }
+
+    /// Mark every row the list is showing.
+    pub(crate) fn mark_all(&mut self, ordered: &[SharedString]) {
+        self.names = ordered.to_vec();
+        self.anchor = ordered.first().cloned();
+        self.cursor = ordered.last().cloned();
+    }
+
+    /// Drop the marks whose skills are no longer there.
+    ///
+    /// Called after every scan: a deleted skill that stayed marked would put a
+    /// name in the band's count that nothing on disk backs up.
+    pub(crate) fn retain(&mut self, present: impl Fn(&SharedString) -> bool) {
+        self.names.retain(&present);
+        self.anchor = self.anchor.take().filter(&present);
+        self.cursor = self.cursor.take().filter(&present);
+    }
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.names.iter().any(|marked| marked == name)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub(crate) fn names(&self) -> &[SharedString] {
+        &self.names
+    }
+}
+
+fn index_of(ordered: &[SharedString], name: &SharedString) -> Option<usize> {
+    ordered.iter().position(|row| row == name)
+}
+
+/// The rows the list shows, in the order it shows them.
+///
+/// One function rather than a filter in `render` and a second one in the key
+/// handlers: the arrows, shift-extension, Mark all and the bulk actions all
+/// have to mean the rows on screen, and a second copy of this order is a second
+/// chance for them to disagree.
+pub(crate) fn listed<'a>(
+    scan: &'a Scan,
+    scope: Scope,
+    query: &str,
+    sort: SkillSort,
+    has_update: &dyn Fn(&str) -> bool,
+    usage_count: &dyn Fn(&str) -> u32,
+) -> Vec<&'a SkillView> {
+    let mut matches = scan.filter(scope, query, has_update);
+    if sort == SkillSort::MostUsed {
+        // Ties fall back to the name, so the order is stable rather than
+        // whatever the filter happened to produce — and every skill nothing has
+        // recorded is a tie at zero, which on a typical machine is most of them.
+        matches.sort_by(|a, b| {
+            usage_count(&b.name)
+                .cmp(&usage_count(&a.name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+    }
+    matches
+}
+
+/// What one row needs to know about its own state, gathered so the row builder
+/// takes a state and not seven booleans.
+#[derive(Clone, Copy)]
+struct RowState<'a> {
+    /// The one skill the detail pane is showing.
+    selected: bool,
+    marked: bool,
+    /// True while more than one row is marked, which is when the check column
+    /// and the band above the list appear.
+    marking: bool,
+    /// The column's own focus, not the row's: the list is a single tab stop,
+    /// so what a focus treatment has to say is which row the arrow keys are
+    /// about to move away from.
+    list_focused: bool,
+    /// Whether the invocation count is part of the ordering, and so worth
+    /// showing.
+    counts: bool,
+    focus: &'a FocusHandle,
+    /// The rows on screen, so a shift-click can measure a range against them.
+    ordered: &'a Rc<Vec<SharedString>>,
 }
 
 impl Skillbase {
@@ -95,60 +318,108 @@ impl Skillbase {
         let list_focused = focus.is_focused(window);
 
         // The order the rows are rendered in, which is the order the arrows
-        // walk. Collected here rather than re-derived in the key handlers, so
-        // the filter and the sort cannot mean one thing to the eye and another
-        // to the keyboard.
-        let mut ordered: Vec<SharedString> = Vec::new();
+        // walk and the order a shift-click measures a range against. Collected
+        // here rather than re-derived in the key handlers, so the filter and
+        // the sort cannot mean one thing to the eye and another to the
+        // keyboard.
+        let mut ordered: Rc<Vec<SharedString>> = Rc::new(Vec::new());
 
         let body: Vec<AnyElement> = match &self.scan {
             ScanState::Loading => vec![
                 v_flex()
                     .px_3()
                     .py_2()
-                    .gap_4()
-                    .children((0..6).map(|row| {
-                        v_flex()
-                            .id(ElementId::from(("skeleton", row as usize)))
-                            .gap_2()
-                            .child(Skeleton::new().h(rems(0.9)).w(rems(9.)))
-                            .child(Skeleton::new().h(rems(0.8)).w_full())
-                    }))
+                    .gap_6()
+                    .child(
+                        // What is happening, and the one thing a cautious
+                        // reader wants to know about a tool that has just
+                        // walked their home directory.
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Reading every scope. Scanning only reads; nothing on disk changes."),
+                    )
+                    .child(
+                        v_flex().gap_4().children((0..6).map(|row| {
+                            v_flex()
+                                .id(ElementId::from(("skeleton", row as usize)))
+                                .gap_2()
+                                .child(Skeleton::new().h(rems(0.9)).w(rems(9.)))
+                                .child(Skeleton::new().h(rems(0.8)).w_full())
+                        })),
+                    )
                     .into_any_element(),
             ],
-            ScanState::Failed(error) => vec![empty_state("Could not scan", error.clone(), cx)],
+            ScanState::Failed(error) => {
+                vec![empty_state("Could not scan", error.clone(), None, cx)]
+            }
             ScanState::Ready(scan) => {
-                let mut matches = scan.filter(self.scope, &query);
-                if self.preferences.sort == SkillSort::MostUsed {
-                    // Ties fall back to the name, so the order is stable rather
-                    // than whatever the filter happened to produce — and every
-                    // skill nothing has recorded is a tie at zero, which on a
-                    // typical machine is most of them.
-                    matches.sort_by(|a, b| {
-                        self.usage_count(&b.name)
-                            .cmp(&self.usage_count(&a.name))
-                            .then_with(|| a.name.cmp(&b.name))
-                    });
-                }
+                let matches = listed(
+                    scan,
+                    self.scope,
+                    &query,
+                    self.preferences.sort,
+                    &|name| self.has_update(name),
+                    &|name| self.usage_count(name),
+                );
                 if matches.is_empty() {
-                    // Both states name the way out rather than only reporting
-                    // the absence: one points at the two commands that put a
-                    // skill here, the other at the search that is hiding them.
-                    vec![if query.is_empty() {
+                    // Both states name a way forward rather than only reporting
+                    // the absence: one points at the three commands that put a
+                    // skill here, the other offers the registry search, because
+                    // "nothing matched" here often means "it is not installed
+                    // yet" rather than "the search is hiding it".
+                    vec![if self.scope == Scope::Library(Library::Updates)
+                        && !self.checked_for_updates()
+                    {
+                        // The one scope whose emptiness is not a fact about
+                        // the machine. Saying "no skills here" would be a
+                        // different claim from "nobody has asked yet".
+                        if self.checking_for_updates() {
+                            empty_state(
+                                "Checking GitHub",
+                                "Asking what has moved on since these skills were installed."
+                                    .into(),
+                                None,
+                                cx,
+                            )
+                        } else {
+                            empty_state(
+                                "Not checked yet",
+                                "Skillbase has not asked GitHub what has moved on since these \
+                                 skills were installed."
+                                    .into(),
+                                Some(
+                                    Button::new("check-for-updates")
+                                        .outline()
+                                        .small()
+                                        .label("Check for updates")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.check_for_updates(window, cx)
+                                        })),
+                                ),
+                                cx,
+                            )
+                        }
+                    } else if query.is_empty() {
                         empty_state(
                             "No skills here",
-                            "Install one from GitHub, or create one with New skill in the \
-                             sidebar."
+                            "Four commands in the sidebar add one: Discover searches skills.sh, \
+                             Install from GitHub downloads one, Install from folder copies one \
+                             already on this machine, and New skill starts an empty one."
                                 .into(),
+                            None,
                             cx,
                         )
                     } else {
                         empty_state(
                             "Nothing matched",
                             format!(
-                                "No skill here matches “{query}”. Clear the search to see all {}.",
-                                scan.count(self.scope)
+                                "No skill here matches “{query}”. Clear the search to see all \
+                                 {}, or look for one that is not installed yet.",
+                                scan.count(self.scope, |name| self.has_update(name))
                             )
                             .into(),
+                            self.search_registry_button(&query, cx),
                             cx,
                         )
                     }]
@@ -156,22 +427,38 @@ impl Skillbase {
                     // A count is shown only when it is what the order is based
                     // on. Sorted by name it is a number with nothing to do.
                     let counts = self.preferences.sort == SkillSort::MostUsed;
-                    ordered = matches.iter().map(|skill| skill.name.clone()).collect();
+                    let marking = self.marks.len() > 1;
+                    ordered = Rc::new(matches.iter().map(|skill| skill.name.clone()).collect());
                     matches
                         .into_iter()
                         .map(|skill| {
-                            let selected = self.selected.as_ref() == Some(&skill.name);
-                            self.render_skill_row(skill, selected, list_focused, counts, cx)
+                            let state = RowState {
+                                selected: self.selected.as_ref() == Some(&skill.name),
+                                marked: self.marks.contains(&skill.name),
+                                marking,
+                                list_focused,
+                                counts,
+                                focus: &focus,
+                                ordered: &ordered,
+                            };
+                            self.render_skill_row(skill, &state, cx)
                         })
                         .collect()
                 }
             }
         };
-        let ordered = Rc::new(ordered);
 
         // What the column is showing, and how much of it there is. `None`
         // until the first scan lands, so the header does not claim zero.
-        let total = self.scan().map(|scan| scan.count(self.scope));
+        let total = if self.scope == Scope::Library(Library::Updates) && !self.checked_for_updates()
+        {
+            // Same reason as the sidebar row: before the check lands there is
+            // no number to show, and a zero would say something nobody asked.
+            None
+        } else {
+            self.scan()
+                .map(|scan| scan.count(self.scope, |name| self.has_update(name)))
+        };
         let scope_row = h_flex()
             .h_full()
             .w_full()
@@ -226,15 +513,38 @@ impl Skillbase {
             .child(self.column_band("skill-list-band", scope_row, window, cx))
             .child(
                 // Same 20pt spine as the band above and the rows below.
-                h_flex().flex_shrink_0().h_11().px_5().items_center().child(
-                    div().flex_1().min_w_0().child(
-                        Input::new(&self.search)
-                            .small()
-                            .cleanable(true)
-                            .prefix(Icon::new(IconName::Search).small()),
+                h_flex()
+                    .flex_shrink_0()
+                    .h_11()
+                    .px_5()
+                    .items_center()
+                    // Cmd-F puts the caret here; this is what lets the next
+                    // key carry on into the list instead of stopping. The
+                    // handler has to hang off an element the field sits
+                    // inside, because an action only reaches what is on the
+                    // path from the root to whatever holds focus.
+                    .key_context(SEARCH_CONTEXT)
+                    .on_action({
+                        let ordered = ordered.clone();
+                        let scroll = scroll.clone();
+                        let focus = focus.clone();
+                        cx.listener(move |this, _: &EnterList, window, cx| {
+                            if ordered.is_empty() {
+                                return;
+                            }
+                            this.move_selection(&ordered, 0, &scroll, &focus, window, cx);
+                        })
+                    })
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.search)
+                                .small()
+                                .cleanable(true)
+                                .prefix(Icon::new(IconName::Search).small()),
+                        ),
                     ),
-                ),
             )
+            .children(self.marked_band(cx))
             .child(
                 // The scroll area is built by hand rather than with
                 // `overflow_y_scrollbar`, which wraps the caller's element in
@@ -269,17 +579,21 @@ impl Skillbase {
                             .on_action({
                                 let ordered = ordered.clone();
                                 let scroll = scroll.clone();
+                                let focus = focus.clone();
                                 cx.listener(move |this, _: &SelectNext, window, cx| {
                                     let next = match this.selection_index(&ordered) {
                                         Some(index) => index + 1,
                                         None => 0,
                                     };
-                                    this.move_selection(&ordered, next, &scroll, window, cx);
+                                    this.move_selection(
+                                        &ordered, next, &scroll, &focus, window, cx,
+                                    );
                                 })
                             })
                             .on_action({
                                 let ordered = ordered.clone();
                                 let scroll = scroll.clone();
+                                let focus = focus.clone();
                                 cx.listener(move |this, _: &SelectPrev, window, cx| {
                                     let previous = match this.selection_index(&ordered) {
                                         Some(index) => index.saturating_sub(1),
@@ -288,24 +602,58 @@ impl Skillbase {
                                         // the top.
                                         None => ordered.len().saturating_sub(1),
                                     };
-                                    this.move_selection(&ordered, previous, &scroll, window, cx);
+                                    this.move_selection(
+                                        &ordered, previous, &scroll, &focus, window, cx,
+                                    );
                                 })
                             })
                             .on_action({
                                 let ordered = ordered.clone();
                                 let scroll = scroll.clone();
+                                let focus = focus.clone();
                                 cx.listener(move |this, _: &SelectFirst, window, cx| {
-                                    this.move_selection(&ordered, 0, &scroll, window, cx);
+                                    this.move_selection(&ordered, 0, &scroll, &focus, window, cx);
                                 })
                             })
                             .on_action({
                                 let ordered = ordered.clone();
                                 let scroll = scroll.clone();
+                                let focus = focus.clone();
                                 cx.listener(move |this, _: &SelectLast, window, cx| {
                                     let last = ordered.len().saturating_sub(1);
-                                    this.move_selection(&ordered, last, &scroll, window, cx);
+                                    this.move_selection(
+                                        &ordered, last, &scroll, &focus, window, cx,
+                                    );
                                 })
                             })
+                            .on_action({
+                                let ordered = ordered.clone();
+                                let scroll = scroll.clone();
+                                let focus = focus.clone();
+                                cx.listener(move |this, _: &ExtendNext, window, cx| {
+                                    this.extend_marks(&ordered, true, &scroll, &focus, window, cx);
+                                })
+                            })
+                            .on_action({
+                                let ordered = ordered.clone();
+                                let scroll = scroll.clone();
+                                let focus = focus.clone();
+                                cx.listener(move |this, _: &ExtendPrev, window, cx| {
+                                    this.extend_marks(&ordered, false, &scroll, &focus, window, cx);
+                                })
+                            })
+                            // Mark all and Clear are bound to this context, so
+                            // the keys reach them only while the list has
+                            // focus. The menu items are dispatched along
+                            // whatever holds focus instead, and are registered
+                            // on the Skillbase root; both routes end in the
+                            // same two methods.
+                            .on_action(cx.listener(|this, _: &MarkAll, _, cx| {
+                                this.mark_all(cx);
+                            }))
+                            .on_action(cx.listener(|this, _: &ClearMarks, _, cx| {
+                                this.clear_marks(cx);
+                            }))
                             .on_action({
                                 let ordered = ordered.clone();
                                 let scroll = scroll.clone();
@@ -314,9 +662,12 @@ impl Skillbase {
                                 // What it does is bring the selection back
                                 // into view, and settle a list whose selection
                                 // the last filter left behind.
+                                let focus = focus.clone();
                                 cx.listener(move |this, _: &ConfirmSelection, window, cx| {
                                     let current = this.selection_index(&ordered).unwrap_or(0);
-                                    this.move_selection(&ordered, current, &scroll, window, cx);
+                                    this.move_selection(
+                                        &ordered, current, &scroll, &focus, window, cx,
+                                    );
                                 })
                             })
                             .children(body),
@@ -374,11 +725,18 @@ impl Skillbase {
     }
 
     /// Select the row at `index`, clamped to the list, and bring it into view.
+    ///
+    /// Takes the list's focus handle and claims it. Every route to a selection
+    /// ends here — the arrows, Enter, a click on a row, and Down out of the
+    /// search field — and the arrows are bound to the list's own context, so a
+    /// selection made from anywhere else has to bring focus with it or the
+    /// next arrow key goes nowhere.
     fn move_selection(
         &mut self,
         ordered: &[SharedString],
         index: usize,
         scroll: &ScrollHandle,
+        focus: &FocusHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -386,6 +744,7 @@ impl Skillbase {
         let Some(name) = ordered.get(index) else {
             return;
         };
+        focus.focus(window, cx);
         // Asked for before the selection changes, because the handle applies
         // it during the next prepaint — the same frame the new selection is
         // painted in.
@@ -393,10 +752,122 @@ impl Skillbase {
         // The click path, so a selection made with the keyboard and one made
         // with the mouse cannot come to mean different things.
         self.select_skill(name.clone(), window, cx);
-        // `select_skill` returns early when the name has not changed, and at
-        // either end of the list that is every keystroke. The scroll still has
-        // to be drawn.
+        if self.selected.as_ref() == Some(name) {
+            // `select_skill` returns early when the name has not changed, and
+            // at either end of the list that is every keystroke. The marked set
+            // still has to come back to this one row: an arrow key is a plain
+            // selection, whatever was marked before it.
+            self.marks.reset_to(Some(name.clone()));
+        }
+        // The scroll still has to be drawn.
         cx.notify();
+    }
+
+    /// Bring the marked set back to whatever the detail pane is showing.
+    ///
+    /// Called when the scope or the search changes: the rows underneath have
+    /// changed, so a set measured against the old ones no longer describes
+    /// anything on screen.
+    pub(crate) fn reset_marks(&mut self) {
+        self.marks.reset_to(self.selected.clone());
+    }
+
+    /// Cmd-click: add this row to the marked set, or take it out.
+    ///
+    /// The detail pane is left alone. Marking is not opening, and routing it
+    /// through the selection would put the unsaved-edit question in front of a
+    /// user who is only picking rows.
+    fn toggle_mark(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        self.marks.toggle(name);
+        cx.notify();
+    }
+
+    /// Shift-click: mark everything between the anchor and this row.
+    fn extend_marks_to(
+        &mut self,
+        name: SharedString,
+        ordered: &[SharedString],
+        cx: &mut Context<Self>,
+    ) {
+        self.marks.extend_to(name, ordered);
+        cx.notify();
+    }
+
+    /// Shift with an arrow key: carry the marked set one row further and
+    /// scroll to it.
+    fn extend_marks(
+        &mut self,
+        ordered: &[SharedString],
+        forward: bool,
+        scroll: &ScrollHandle,
+        focus: &FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        focus.focus(window, cx);
+        let from = self.selection_index(ordered);
+        if let Some(index) = self.marks.step(ordered, forward, from) {
+            // Asked for before the paint, the same way `move_selection` does.
+            scroll.scroll_to_item(index);
+        }
+        cx.notify();
+    }
+
+    /// The rows the list is showing, in the order it shows them.
+    ///
+    /// The render pass collects the same order as it builds the rows and hands
+    /// it to the handlers it registers. A handler registered anywhere else has
+    /// no such pass to take it from, so it derives the order here from the same
+    /// scope, search and sort the rows were built from.
+    pub(crate) fn visible_rows(&self, cx: &App) -> Vec<SharedString> {
+        let Some(scan) = self.scan() else {
+            return Vec::new();
+        };
+        let query = self.search.read(cx).value();
+        listed(
+            scan,
+            self.scope,
+            &query,
+            self.preferences.sort,
+            &|name| self.has_update(name),
+            &|name| self.usage_count(name),
+        )
+        .into_iter()
+        .map(|skill| skill.name.clone())
+        .collect()
+    }
+
+    /// Mark every row the list is showing.
+    ///
+    /// With a search in the field that is the matches and nothing else, which
+    /// is what makes "find the stale ones, then remove them" one gesture.
+    ///
+    /// Derives the rows rather than taking them, so the menu bar's handler —
+    /// which GPUI dispatches along whatever holds focus, and so cannot live on
+    /// the list element — can call it with nothing but a context.
+    pub(crate) fn mark_all(&mut self, cx: &mut Context<Self>) {
+        let ordered = self.visible_rows(cx);
+        self.marks.mark_all(&ordered);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_marks(&mut self, cx: &mut Context<Self>) {
+        self.reset_marks();
+        cx.notify();
+    }
+
+    /// The marked skills, in the order the last scan found them.
+    ///
+    /// Scan order rather than marking order, so a confirmation lists the same
+    /// names in the same places however the set was built up.
+    fn marked_skills(&self) -> Vec<&SkillView> {
+        let Some(scan) = self.scan() else {
+            return Vec::new();
+        };
+        scan.skills
+            .iter()
+            .filter(|skill| self.marks.contains(&skill.name))
+            .collect()
     }
 
     /// The ordering control.
@@ -416,20 +887,68 @@ impl Skillbase {
             .accessibility_label("Sort the list")
             .dropdown_menu(move |menu, _, _| {
                 let this = this.clone();
-                let mut menu = menu.min_w(px(148.));
+                // Wide enough for the sentence under "Most used". A menu that
+                // wrapped it every three words would be harder to read than
+                // the number it explains.
+                let mut menu = menu.min_w(px(300.));
                 for sort in SkillSort::ALL {
                     let this = this.clone();
+                    // An element item rather than a plain one, so the ordering
+                    // whose numbers need explaining can carry the explanation.
+                    // Both orderings use it, because a menu whose two rows are
+                    // built differently lays them out differently.
+                    let description = sort.description();
                     menu = menu.item(
-                        PopupMenuItem::new(sort.label())
-                            .checked(sort == current)
-                            .on_click(move |_, window, cx| {
-                                this.update(cx, |this, cx| this.set_sort(sort, window, cx))
-                                    .ok();
-                            }),
+                        PopupMenuItem::element(move |_, cx| {
+                            v_flex()
+                                .gap_1()
+                                .child(sort.label())
+                                .children(description.clone().map(|description| {
+                                    div()
+                                        .max_w(rems(16.))
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(description)
+                                }))
+                        })
+                        .checked(sort == current)
+                        .on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| this.set_sort(sort, window, cx))
+                                .ok();
+                        }),
                     );
                 }
                 menu
             })
+    }
+
+    /// The way out of an empty search: look for the skill where it might
+    /// actually be, carrying what was typed across.
+    ///
+    /// `None` for a query skills.sh would refuse, so the button cannot land on
+    /// a page that says "type more".
+    fn search_registry_button(&self, query: &str, cx: &mut Context<Self>) -> Option<Button> {
+        if query.chars().count() < MIN_QUERY_LEN {
+            return None;
+        }
+        let query = SharedString::from(query.to_string());
+        Some(
+            Button::new("search-registry")
+                .outline()
+                .small()
+                // The query is already in the sentence above; what the button
+                // has to add is where it is about to look.
+                .label("Search skills.sh")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.discover_query
+                        .update(cx, |state, cx| state.set_value(query.clone(), window, cx));
+                    this.show_discover(window, cx);
+                    // `set_value` deliberately emits nothing, so the
+                    // subscription that normally starts a search does not
+                    // fire. Ask for it here.
+                    this.search_registry(window, cx);
+                })),
+        )
     }
 
     /// What the Library group rows mean, and how a skill lands in each.
@@ -467,18 +986,584 @@ impl Skillbase {
         });
     }
 
-    /// One row. `list_focused` is the column's own focus, not the row's: the
-    /// list is a single tab stop, so what a focus treatment has to say is
-    /// which row the arrow keys are about to move away from.
+    /// The band above the list while more than one row is marked: how many
+    /// there are, what can be done to all of them at once, and the way back to
+    /// one.
+    ///
+    /// It appears with the second mark and goes away with it, so a list with a
+    /// single selected row is the interface that was here before.
+    fn marked_band(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let count = self.marks.len();
+        if count < 2 {
+            return None;
+        }
+        let busy = self.bulk_busy;
+
+        Some(
+            v_flex()
+                .flex_shrink_0()
+                // The same 20pt spine as the band, the search field and the
+                // rows, so the marked state does not move the column.
+                .px_5()
+                .py_2()
+                .gap_2()
+                .bg(cx.theme().muted)
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{count} skills marked")),
+                        )
+                        .child(
+                            Button::new("clear-marks")
+                                .ghost()
+                                .xsmall()
+                                .label("Clear")
+                                .on_click(cx.listener(|this, _, _, cx| this.clear_marks(cx))),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            // Both open a dialog that names the agent, so both
+                            // take the ellipsis.
+                            Button::new("link-marked")
+                                .outline()
+                                .small()
+                                .label("Link…")
+                                .tooltip("Link every marked skill to one agent")
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_link_marked_dialog(true, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("unlink-marked")
+                                .outline()
+                                .small()
+                                .label("Unlink…")
+                                .tooltip("Take every marked skill's link out of one agent")
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_link_marked_dialog(false, window, cx)
+                                })),
+                        )
+                        .child(div().flex_1().min_w_0())
+                        .child(
+                            // Outline rather than danger: this opens the
+                            // confirmation, and the commitment is the Delete
+                            // button in it.
+                            Button::new("delete-marked")
+                                .outline()
+                                .small()
+                                .label("Delete…")
+                                .tooltip(
+                                    "Move every marked skill to the trash and remove its links",
+                                )
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_delete_marked(window, cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    // ------------------------------------------------- acting on the marked set
+
+    /// Run one filesystem operation over the whole marked set on a background
+    /// thread, then report it once and scan once.
+    ///
+    /// One write rather than one per skill: twenty separate calls would be
+    /// twenty background writes, twenty notifications and twenty full rescans,
+    /// with the list rebuilt between each of them.
+    fn run_on_marked<F>(
+        &mut self,
+        title: &'static str,
+        failed: &'static str,
+        op: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(Installer) -> Result<Outcome, InstallError> + Send + 'static,
+    {
+        if self.bulk_busy {
+            return;
+        }
+        let roots = self.roots.clone();
+        self.bulk_busy = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { op(Installer::new(roots)) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.bulk_busy = false;
+                report(title, failed, result, &this.roots, window, cx);
+                // Delete is the one operation run from here that writes the
+                // remote cache, and the slot it writes into is its own, so a
+                // failure waiting in it belongs to the delete just reported.
+                if let Some(reason) = take_delete_cache_failure() {
+                    window.push_notification(
+                        delete_cache_failure_notification(
+                            "The skills were deleted, but their install records could not be \
+                             removed",
+                            &reason,
+                        ),
+                        cx,
+                    );
+                }
+                // Scan again either way: a refusal still means the interface
+                // should re-read what is actually there.
+                this.rescan(None, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ask which agent, then link or unlink every marked skill to it.
+    ///
+    /// A dialog rather than a menu because the choice needs a caption per
+    /// agent: how many of the marked skills the command would actually act on
+    /// is the number that decides which row to press, and a menu row has
+    /// nowhere to put it. It is also what the menu bar's own item opens, so
+    /// there is one command with one shape.
+    pub(crate) fn open_link_marked_dialog(
+        &mut self,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let marked = self.marked_skills();
+        if marked.len() < 2 {
+            return;
+        }
+        let total = marked.len();
+        // Linking writes into the store, so it needs an origin Skillbase owns.
+        // An unmanaged skill has to be adopted first, one at a time, on its own
+        // page.
+        let unmanaged = marked.iter().filter(|skill| !skill.managed).count();
+
+        let installed = self
+            .scan()
+            .map(|scan| scan.installed.clone())
+            .unwrap_or_default();
+        // Agents that read the shared directory need no link of their own, so
+        // offering them here would promise a write that changes nothing.
+        let choices: Vec<AgentChoice> = Registry::link_targets()
+            .filter(|agent| !agent.is_shared())
+            .filter(|agent| {
+                installed.contains(agent) || marked.iter().any(|skill| skill.linked_to(agent.id))
+            })
+            .map(|agent| {
+                let acts_on = marked
+                    .iter()
+                    .filter(|skill| {
+                        if on {
+                            skill.managed && !skill.linked_to(agent.id) && !skill.via_shared(agent)
+                        } else {
+                            skill.linked_to(agent.id)
+                        }
+                    })
+                    .count();
+                AgentChoice { agent, acts_on }
+            })
+            .collect();
+
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let choices = choices.clone();
+            let this = this.clone();
+
+            dialog
+                .title(if on {
+                    format!("Link {total} skills to an agent")
+                } else {
+                    format!("Unlink {total} skills from an agent")
+                })
+                .width(px(460.))
+                .content(move |content, _, cx| {
+                    let this = this.clone();
+                    content.child(
+                        v_flex()
+                            .p_4()
+                            .gap_2()
+                            .when(on && unmanaged > 0, |column| {
+                                column.child(div().text_xs().text_color(cx.theme().warning).child(
+                                    format!(
+                                        "{unmanaged} of them sit outside the directories \
+                                         Skillbase manages. Adopt those first; they are left \
+                                         alone here.",
+                                    ),
+                                ))
+                            })
+                            .when(choices.is_empty(), |column| {
+                                column.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(
+                                            "No agent on this machine takes a link of its own. \
+                                             Agents that read ~/.agents/skills are reached \
+                                             through Shared instead.",
+                                        ),
+                                )
+                            })
+                            .children(choices.iter().map(|choice| {
+                                let agent = choice.agent;
+                                let acts_on = choice.acts_on;
+                                let this = this.clone();
+                                Button::new(ElementId::from((
+                                    ElementId::from("link-marked-agent"),
+                                    agent.id,
+                                )))
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .disabled(acts_on == 0)
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(agent_icon(agent).small())
+                                        .child(div().text_sm().child(agent.display_name))
+                                        .child(div().flex_1().min_w_0())
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(if acts_on == 0 {
+                                                    if on {
+                                                        "Already reaches all of them".to_string()
+                                                    } else {
+                                                        "Holds none of them".to_string()
+                                                    }
+                                                } else {
+                                                    format!("{acts_on} of {total}")
+                                                }),
+                                        ),
+                                )
+                                .on_click(
+                                    move |_, window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.link_marked(agent, on, window, cx)
+                                        })
+                                        .ok();
+                                        window.close_dialog(cx);
+                                    },
+                                )
+                            })),
+                    )
+                })
+                .footer(
+                    DialogFooter::new().p_4().child(
+                        DialogClose::new()
+                            .child(Button::new("cancel-link-marked").outline().label("Cancel")),
+                    ),
+                )
+        });
+    }
+
+    /// Link or unlink every marked skill to one agent, in one write.
+    fn link_marked(
+        &mut self,
+        agent: &'static AgentDef,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<LinkTarget> = self
+            .marked_skills()
+            .into_iter()
+            .filter(|skill| {
+                if on {
+                    skill.managed && !skill.linked_to(agent.id) && !skill.via_shared(agent)
+                } else {
+                    skill.linked_to(agent.id)
+                }
+            })
+            .map(|skill| LinkTarget {
+                name: skill.name.to_string(),
+                origin: skill.origin.clone(),
+                parked: skill.parked_in(agent.id),
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+
+        let (title, failed) = if on {
+            ("Linked", "Could not link")
+        } else {
+            ("Unlinked", "Could not unlink")
+        };
+        self.run_on_marked(
+            title,
+            failed,
+            move |installer| {
+                let mut done = Outcome::default();
+                for target in &targets {
+                    // Twenty skills in one write. A refusal on the ninth still
+                    // leaves the first eight linked, and the notification has
+                    // to list them rather than report the refusal alone.
+                    if let Err(source) = link_step(&installer, &mut done, target, agent, on) {
+                        return Err(InstallError::partial(done, source));
+                    }
+                }
+                Ok(done)
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Work out what deleting the marked skills would remove, then confirm
+    /// with those paths.
+    pub(crate) fn confirm_delete_marked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bulk_busy {
+            return;
+        }
+        let discovered: Vec<_> = self
+            .marked_skills()
+            .into_iter()
+            .map(SkillView::as_discovered)
+            .collect();
+        if discovered.len() < 2 {
+            return;
+        }
+        let roots = self.roots.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let plans = cx
+                .background_spawn(async move {
+                    let installer = Installer::new(roots);
+                    discovered
+                        .iter()
+                        .map(|skill| installer.plan_delete(skill))
+                        .collect::<Vec<DeletePlan>>()
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.open_delete_marked_dialog(plans, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// One confirmation for the whole set, listing every path it would remove.
+    ///
+    /// The same account the single-skill dialog gives, grouped by skill: a
+    /// delete is not reviewable against counts, and the user is the only one
+    /// who can tell whether a path in the list belongs to them.
+    fn open_delete_marked_dialog(
+        &mut self,
+        plans: Vec<DeletePlan>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let roots = self.roots.clone();
+        let this = cx.entity().downgrade();
+        let count = plans.len();
+
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let plans = plans.clone();
+            let roots = roots.clone();
+            let this = this.clone();
+
+            // The kinds are counted because a path alone does not say whether
+            // it is a directory of files or a link to one; the paths are listed
+            // because the counts alone cannot be checked.
+            let origins = plans.iter().filter(|plan| plan.origin.is_some()).count();
+            let links: usize = plans.iter().map(DeletePlan::link_count).sum();
+            let copies: usize = plans.iter().map(DeletePlan::copy_count).sum();
+            let mut kinds: Vec<String> = Vec::new();
+            if origins > 0 {
+                kinds.push(format!(
+                    "{origins} skill {}",
+                    if origins == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    }
+                ));
+            }
+            if links > 0 {
+                kinds.push(format!("{links} link{}", if links == 1 { "" } else { "s" }));
+            }
+            if copies > 0 {
+                kinds.push(format!(
+                    "{copies} duplicate director{}",
+                    if copies == 1 { "y" } else { "ies" }
+                ));
+            }
+            let kind_names: Vec<&str> = kinds.iter().map(String::as_str).collect();
+            let summary = if kinds.is_empty() {
+                "Nothing that Skillbase manages is left to remove.".to_string()
+            } else {
+                format!("Removes {}:", join_and(&kind_names))
+            };
+
+            let kept: Vec<SharedString> = plans
+                .iter()
+                .flat_map(|plan| plan.skipped.iter())
+                .map(|path| display_path(path, &roots))
+                .collect();
+
+            let description = v_flex()
+                .gap_3()
+                .text_sm()
+                .child(div().child(summary))
+                .child(
+                    // Twenty skills can be a hundred paths. The list scrolls
+                    // rather than pushing the buttons off the bottom of the
+                    // screen.
+                    div()
+                        .id("delete-marked-paths")
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .child(v_flex().gap_2().children(plans.iter().map(|plan| {
+                            let going: Vec<SharedString> = plan
+                                .origin
+                                .iter()
+                                .chain(plan.links.iter())
+                                .chain(plan.copies.iter())
+                                .map(|path| display_path(path, &roots))
+                                .collect();
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .child(SharedString::from(plan.name.clone())),
+                                )
+                                .children(going.into_iter().map(|path| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(path)
+                                }))
+                        }))),
+                )
+                // The one thing the path list cannot say: a directory is not
+                // destroyed, so a mistake here is recoverable.
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Directories move to ~/.skillbase/trash. Links are removed."),
+                )
+                .when(!kept.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().warning.opacity(0.12))
+                            .child(div().text_xs().text_color(cx.theme().warning).child(format!(
+                                "{} path{} left alone, {} outside every directory Skillbase \
+                                 manages:",
+                                kept.len(),
+                                if kept.len() == 1 { "" } else { "s" },
+                                if kept.len() == 1 {
+                                    "because it is"
+                                } else {
+                                    "because they are"
+                                },
+                            )))
+                            .children(kept.iter().map(|path| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().warning)
+                                    .child(path.clone())
+                            })),
+                    )
+                });
+
+            alert
+                .title(format!("Delete {count} skills?"))
+                .description(description)
+                .width(px(560.))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete")
+                        .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let plans = plans.clone();
+                    let roots = roots.clone();
+                    this.update(cx, |this, cx| {
+                        this.run_on_marked(
+                            "Deleted",
+                            "Could not delete",
+                            move |installer| {
+                                let mut done = Outcome::default();
+                                let mut stopped = None;
+                                for plan in &plans {
+                                    match installer.delete(plan) {
+                                        Ok(outcome) => done.changes.extend(outcome.changes),
+                                        Err(source) => {
+                                            stopped = Some(source);
+                                            break;
+                                        }
+                                    }
+                                }
+                                let result = match stopped {
+                                    Some(source) => Err(InstallError::partial(done, source)),
+                                    None => Ok(done),
+                                };
+                                // The record of a skill that is gone would
+                                // answer for the next skill to take its name.
+                                let mut cache = RemoteCache::read(&roots);
+                                if cache.forget_deleted(&plans, &result) {
+                                    remember_delete_cache_failure(cache.write(&roots));
+                                }
+                                result
+                            },
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+                    true
+                })
+        });
+    }
+
+    /// One row.
     fn render_skill_row(
         &self,
         skill: &SkillView,
-        selected: bool,
-        list_focused: bool,
-        counts: bool,
+        state: &RowState<'_>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let name = skill.name.clone();
+        let RowState {
+            selected,
+            marked,
+            marking,
+            list_focused,
+            counts,
+            focus,
+            ordered,
+        } = *state;
         let invalid = skill.parse_error.is_some();
         let subtitle = if invalid {
             skill
@@ -507,31 +1592,80 @@ impl Skillbase {
             // selection, so gaining one does not shift the text by a pixel.
             .border_1()
             .border_color(cx.theme().transparent)
+            // A marked row and the selected row share the highlight, which is
+            // what says they are one set. What separates them is the outline:
+            // the selected row is the one the detail pane is showing and the
+            // one the arrows move from, and only it is outlined. The same
+            // arrangement Finder uses for a multiple selection.
+            .when(selected || marked, |this| this.bg(cx.theme().list_active))
             .when(selected, |this| {
-                this.bg(cx.theme().list_active)
-                    // A background lightness alone is not a difference every
-                    // display, or every reader, resolves — so the selection is
-                    // outlined as well. While the list has focus that outline
-                    // takes the focus colour, which is what separates "this is
-                    // the selection" from "this is the selection and the arrow
-                    // keys are going here".
-                    .border_color(if list_focused {
-                        cx.theme().ring
-                    } else {
-                        cx.theme().list_active_border
-                    })
+                // A background lightness alone is not a difference every
+                // display, or every reader, resolves — so the selection is
+                // outlined as well. While the list has focus that outline
+                // takes the focus colour, which is what separates "this is
+                // the selection" from "this is the selection and the arrow
+                // keys are going here".
+                this.border_color(if list_focused {
+                    cx.theme().ring
+                } else {
+                    cx.theme().list_active_border
+                })
             })
-            .when(!selected, |this| {
+            .when(!selected && !marked, |this| {
                 this.hover(|this| this.bg(cx.theme().list_hover))
             })
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.select_skill(name.clone(), window, cx)),
-            )
+            .on_click({
+                let focus = focus.clone();
+                let ordered = ordered.clone();
+                cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    // The arrows are bound to the list's own context, and GPUI
+                    // delivers a key only to what holds focus. Without this a
+                    // row picked with the mouse leaves the keyboard pointing at
+                    // whatever had focus before, and the arrows do nothing.
+                    focus.focus(window, cx);
+                    let modifiers = event.modifiers();
+                    // Neither modifier touches the selection, so neither can
+                    // put the unsaved-edit question in front of someone who is
+                    // only picking rows.
+                    if modifiers.secondary() {
+                        this.toggle_mark(name.clone(), cx);
+                    } else if modifiers.shift {
+                        this.extend_marks_to(name.clone(), &ordered, cx);
+                    } else {
+                        this.select_skill(name.clone(), window, cx);
+                        if this.selected.as_ref() == Some(&name) {
+                            // `select_skill` returns early when the row is
+                            // already the selection, so on its own a click on
+                            // the selected row would leave a set built by
+                            // shift- or cmd-clicking standing. A plain click is
+                            // a plain selection, the same as an arrow key —
+                            // `move_selection` compensates for the same early
+                            // return.
+                            this.marks.reset_to(Some(name.clone()));
+                            cx.notify();
+                        }
+                    }
+                })
+            })
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
                     .min_w_0()
+                    // While a set is being built, every row reserves the same
+                    // slot, so the names stay on one spine and a check is a
+                    // mark rather than an indent. A tint alone would leave the
+                    // marked state told by colour only.
+                    .when(marking, |this| {
+                        this.child(div().flex_shrink_0().size_3().child(if marked {
+                            Icon::new(IconName::Check)
+                                .xsmall()
+                                .text_color(cx.theme().primary)
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }))
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -563,11 +1697,31 @@ impl Skillbase {
                                 ),
                         )
                     })
+                    // Same treatment as the update marker above it: a mark that
+                    // only means something once you know what it means needs a
+                    // sentence within reach.
                     .when(!skill.conflicts.is_empty(), |this| {
+                        let others = skill.conflicts.len();
                         this.child(
-                            Icon::new(IconName::Copy)
-                                .xsmall()
-                                .text_color(cx.theme().muted_foreground),
+                            div()
+                                .id(ElementId::from((
+                                    ElementId::from("duplicate-marker"),
+                                    skill.name.clone(),
+                                )))
+                                .flex_shrink_0()
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(format!(
+                                        "This name is a real directory in {others} other \
+                                         place{}",
+                                        if others == 1 { "" } else { "s" }
+                                    ))
+                                    .build(window, cx)
+                                })
+                                .child(
+                                    Icon::new(IconName::Copy)
+                                        .xsmall()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
                         )
                     })
                     .when(invalid, |this| {
@@ -579,32 +1733,123 @@ impl Skillbase {
                     })
                     .when(counts, |this| {
                         let used = self.usage_count(&skill.name);
-                        this.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if used == 0 {
-                                    SharedString::from("—")
-                                } else {
-                                    SharedString::from(used.to_string())
-                                }),
-                        )
+                        if used == 0 {
+                            // A dash where a number goes reads as zero, and
+                            // zero reads as "never used". It is not: only two
+                            // of the agents record an invocation at all, and
+                            // the one that records the most throws its
+                            // transcripts away. Say so where the mark is.
+                            this.child(
+                                div()
+                                    .id(ElementId::from((
+                                        ElementId::from("usage-count"),
+                                        skill.name.clone(),
+                                    )))
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(
+                                            "No invocation was recorded. Not every agent keeps \
+                                             session records, so this is not the same as never \
+                                             used.",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .child("—"),
+                            )
+                        } else {
+                            this.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(used.to_string()),
+                            )
+                        }
                     }),
             )
             .child(
-                div()
+                h_flex()
                     .w_full()
                     .min_w_0()
-                    .text_sm()
-                    .truncate()
-                    .text_color(if invalid {
-                        cx.theme().warning
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(subtitle),
+                    .gap_2()
+                    .items_center()
+                    // The same slot the line above reserves, so the name and
+                    // the description keep one leading edge whether or not a
+                    // set is being marked.
+                    .when(marking, |this| this.child(div().flex_shrink_0().size_3()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .truncate()
+                            .text_color(if invalid {
+                                cx.theme().warning
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(subtitle),
+                    )
+                    .child(self.reach_lane(skill, cx)),
             )
+            .into_any_element()
+    }
+
+    /// Which agents this skill reaches, as their own marks.
+    ///
+    /// This is the question the application exists to answer, and until now it
+    /// was two gestures away: select the row, then open a closed section in the
+    /// detail pane. It sits at the trailing edge of the second line rather than
+    /// beside the name, because the first line already carries the name and up
+    /// to three state marks, and at the 240pt minimum width a row of logos
+    /// there would push the name into truncating. On the second line it takes
+    /// space the description can give up, and it forms a lane down the column
+    /// that can be read without reading a word.
+    fn reach_lane(&self, skill: &SkillView, cx: &mut Context<Self>) -> AnyElement {
+        /// How many marks fit before the row stops being scannable. Past this
+        /// the rest are counted.
+        const SHOWN: usize = 4;
+
+        let id = ElementId::from((ElementId::from("skill-reach"), skill.name.clone()));
+        let agents = skill.reach();
+        if agents.is_empty() {
+            // A skill nothing can load is a fact worth a word. The lane is at
+            // the trailing edge, so saying it moves nothing else on the row.
+            return div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("No agents")
+                .into_any_element();
+        }
+
+        // A logo is only a name to someone who already knows it, and a "+2"
+        // names nothing at all.
+        let names: Vec<&'static str> = agents.iter().map(|agent| agent.display_name).collect();
+        let spoken = SharedString::from(join_and(&names));
+        let extra = agents.len().saturating_sub(SHOWN);
+
+        h_flex()
+            .id(id)
+            .flex_shrink_0()
+            .gap_1()
+            .items_center()
+            .tooltip(move |window, cx| Tooltip::new(spoken.clone()).build(window, cx))
+            .children(agents.into_iter().take(SHOWN).map(|agent| {
+                agent_icon(agent)
+                    .xsmall()
+                    .text_color(cx.theme().muted_foreground)
+            }))
+            .when(extra > 0, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("+{extra}")),
+                )
+            })
             .into_any_element()
     }
 
@@ -620,9 +1865,23 @@ impl Skillbase {
         let description_state = self.new_description.clone();
         let this = cx.entity().downgrade();
 
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let fields = (name_state.clone(), description_state.clone());
             let this = this.clone();
+
+            // Checked on the frame the character was typed. The dialog's
+            // builder runs on every frame it is on screen, so the line under
+            // the field and the state of Create always describe what is in the
+            // field now rather than what it held when the dialog opened.
+            let typed = name_state.read(cx).value();
+            let typed = typed.trim();
+            let scan = this
+                .upgrade()
+                .and_then(|entity| entity.read(cx).scan().cloned());
+            let problem = name_problem(typed, scan.as_deref());
+            let can_create = !typed.is_empty() && problem.is_none();
+            let footer_problem = problem.clone();
+
             dialog
                 .title("New skill")
                 .width(px(460.))
@@ -638,13 +1897,23 @@ impl Skillbase {
                                     .child(Label::new("Name"))
                                     .child(Input::new(name).small())
                                     .child(
+                                        // One line, in the one place: what a
+                                        // name has to look like until it does
+                                        // not, and then why. A reason under
+                                        // the field it is about is what stops
+                                        // the dialog having to be submitted to
+                                        // find out.
                                         div()
                                             .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(
+                                            .text_color(match &problem {
+                                                Some(_) => cx.theme().danger,
+                                                None => cx.theme().muted_foreground,
+                                            })
+                                            .child(problem.clone().unwrap_or_else(|| {
                                                 "kebab-case. It becomes the directory name in \
-                                                 ~/.skillbase/store.",
-                                            ),
+                                                 ~/.skillbase/store."
+                                                    .into()
+                                            })),
                                     ),
                             )
                             .child(
@@ -668,10 +1937,18 @@ impl Skillbase {
                             Button::new("confirm-new-skill")
                                 .primary()
                                 .label("Create")
+                                // Off until the name would be accepted, with
+                                // the reason showing under the field. The
+                                // dialog no longer closes here: it holds the
+                                // only copy of what was typed, so it closes in
+                                // `create_skill`, once the file is on disk.
+                                .disabled(!can_create)
+                                .when_some(footer_problem, |button, problem| {
+                                    button.tooltip(problem)
+                                })
                                 .on_click(move |_, window, cx| {
                                     this.update(cx, |this, cx| this.create_skill(window, cx))
                                         .ok();
-                                    window.close_dialog(cx);
                                 }),
                         ),
                 )
@@ -698,6 +1975,10 @@ impl Skillbase {
                     window,
                     cx,
                 ) {
+                    // Only now. A refusal leaves the dialog standing with the
+                    // name and the description still in it, which is the whole
+                    // point of not closing beside the call.
+                    window.close_dialog(cx);
                     this.rescan(Some(selected), window, cx);
                 }
             })
@@ -707,9 +1988,70 @@ impl Skillbase {
     }
 }
 
+/// One agent the marked set can be linked to or unlinked from, and how many of
+/// those skills the command would actually act on.
+///
+/// The count is what decides which row to press: an agent that already reaches
+/// all six is a row that would write nothing, and it says so rather than
+/// looking available.
+#[derive(Clone, Copy)]
+struct AgentChoice {
+    agent: &'static AgentDef,
+    /// How many of the marked skills this command would change.
+    acts_on: usize,
+}
+
+/// One skill a bulk link or unlink acts on, flattened so the whole batch can
+/// cross onto a background thread without the scan.
+struct LinkTarget {
+    name: String,
+    /// The real directory the link points at.
+    origin: PathBuf,
+    /// True when this agent's link is parked in its disabled directory, and so
+    /// has to be moved back before there is anything to unlink.
+    parked: bool,
+}
+
+/// Link or unlink one skill for one agent, writing what it did into `done`.
+///
+/// The same two steps the detail pane's own switch takes, so one skill done
+/// here and one skill done there cannot come to mean different things.
+fn link_step(
+    installer: &Installer,
+    done: &mut Outcome,
+    target: &LinkTarget,
+    agent: &'static AgentDef,
+    on: bool,
+) -> Result<(), InstallError> {
+    if on {
+        done.changes
+            .extend(installer.link(&target.name, &target.origin, agent)?.changes);
+        return Ok(());
+    }
+    // A link parked in the agent's disabled directory is not where `unlink`
+    // looks, so there is nothing to unlink until it is moved back.
+    if target.parked {
+        done.changes.extend(
+            installer
+                .enable(&target.name, &target.origin, agent)?
+                .changes,
+        );
+    }
+    done.changes
+        .extend(installer.unlink(&target.name, agent)?.changes);
+    Ok(())
+}
+
+/// What the list says when it has no rows: what is not here, and what to do
+/// about it.
+///
+/// `action` is the step forward, when there is one the sentence cannot take on
+/// its own. It sits apart from the two lines of text because it is a separate
+/// group, not a third line.
 fn empty_state(
     title: &'static str,
     detail: SharedString,
+    action: Option<Button>,
     cx: &mut Context<Skillbase>,
 ) -> AnyElement {
     v_flex()
@@ -717,15 +2059,119 @@ fn empty_state(
         // The spine the row text sits on: the scroll container has already
         // inset by 8, and a row adds 12.
         .px_3()
-        .gap_1()
-        // Weight, not colour alone, is what makes the first line the title of
-        // the second.
-        .child(div().text_sm().font_medium().child(title))
+        .gap_3()
         .child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(detail),
+            v_flex()
+                .gap_1()
+                // Weight, not colour alone, is what makes the first line the
+                // title of the second.
+                .child(div().text_sm().font_medium().child(title))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(detail),
+                ),
         )
+        // In a row of its own so the button takes its own width rather than
+        // the column's.
+        .children(action.map(|action| h_flex().child(action)))
         .into_any_element()
+}
+
+/// Why this name cannot be used, or `None` when it can.
+///
+/// An empty field is not a mistake yet, so it has no message: the line under
+/// the field already says what shape a name takes, and Create being off is
+/// what says the field is not finished.
+///
+/// `scan` is the last look at the machine, or `None` before one has landed. A
+/// name that is already a skill somewhere is refused here rather than by the
+/// installer several hundred milliseconds later, and a name that would land as
+/// a second copy of one is refused too — a duplicate is what the Duplicates
+/// group exists to report, and creating one on purpose is not a step forward.
+fn name_problem(name: &str, scan: Option<&Scan>) -> Option<SharedString> {
+    if name.is_empty() {
+        return None;
+    }
+    if name.chars().count() > MAX_NAME_LEN {
+        return Some(format!("Too long. A name is at most {MAX_NAME_LEN} characters.").into());
+    }
+    if !is_kebab_case(name) {
+        return Some(
+            "Use lowercase letters, digits, and single hyphens between them: my-new-skill.".into(),
+        );
+    }
+    if scan.is_some_and(|scan| scan.get(name).is_some()) {
+        return Some(format!("“{name}” is already a skill on this machine.").into());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scan_holding(name: &str) -> Scan {
+        Scan {
+            skills: vec![SkillView {
+                name: name.to_string().into(),
+                description: "".into(),
+                origin: PathBuf::from("/store").join(name),
+                managed: true,
+                parse_error: None,
+                issues: Vec::new(),
+                conflicts: Vec::new(),
+                locations: Vec::new(),
+                codex_disabled: false,
+                visible_to: Vec::new(),
+                in_shared: false,
+                provenance: None,
+            }],
+            ..Scan::default()
+        }
+    }
+
+    #[test]
+    fn an_empty_name_is_not_yet_a_mistake() {
+        // Nothing to complain about before anything has been typed: the line
+        // under the field is the help text, and Create is off because the
+        // caller checks for empty, not because of a message.
+        assert_eq!(name_problem("", None), None);
+    }
+
+    #[test]
+    fn a_name_that_is_not_kebab_case_says_so_before_it_is_submitted() {
+        for name in [
+            "My Skill",
+            "my_skill",
+            "-lead",
+            "trail-",
+            "double--hyphen",
+            "Ünicode",
+        ] {
+            let said =
+                name_problem(name, None).unwrap_or_else(|| panic!("{name} should be refused"));
+            assert!(said.contains("my-new-skill"), "{name}: {said}");
+        }
+        assert_eq!(name_problem("my-new-skill", None), None);
+        assert_eq!(name_problem("pdf2", None), None);
+    }
+
+    #[test]
+    fn a_name_longer_than_the_limit_is_refused_by_length_and_not_by_shape() {
+        let long = "a".repeat(MAX_NAME_LEN + 1);
+        let said = name_problem(&long, None).expect("too long");
+        assert!(said.contains("Too long"), "{said}");
+        assert_eq!(name_problem(&"a".repeat(MAX_NAME_LEN), None), None);
+    }
+
+    #[test]
+    fn a_name_already_on_the_machine_is_refused_before_the_installer_sees_it() {
+        let scan = scan_holding("pdf");
+        let said = name_problem("pdf", Some(&scan)).expect("already exists");
+        assert!(said.contains("already a skill"), "{said}");
+        assert_eq!(name_problem("pdf-two", Some(&scan)), None);
+    }
 }

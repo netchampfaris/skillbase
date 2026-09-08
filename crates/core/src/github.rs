@@ -264,6 +264,18 @@ pub struct SkillLocation {
     pub path: String,
 }
 
+/// A spec read into a location, and whether the spec named the ref itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedLocation {
+    /// Where the skill is. When `explicit_ref` is false the location's ref is
+    /// [`DEFAULT_BRANCH`], which is a guess the caller should replace with the
+    /// repository's real default branch before installing.
+    pub location: SkillLocation,
+    /// True when the spec carried its own ref, as `owner/repo@ref` or as the
+    /// `<ref>` of a `/tree/<ref>/...` URL.
+    pub explicit_ref: bool,
+}
+
 impl SkillLocation {
     /// A location from its parts. The path is trimmed of slashes.
     pub fn new(repo: RepoRef, path: impl AsRef<str>) -> Self {
@@ -271,6 +283,20 @@ impl SkillLocation {
             repo,
             path: path.as_ref().trim_matches('/').to_string(),
         }
+    }
+
+    /// Reads the spellings a user is likely to paste or type. See
+    /// [`SkillLocation::parse_spec`] for the list.
+    ///
+    /// The ref defaults to [`DEFAULT_BRANCH`] when the spelling does not carry
+    /// one, and this form cannot tell that default from a ref the user typed.
+    /// A caller that has to know — because a repository whose default branch is
+    /// `master` would otherwise be looked up at a `main` nobody asked for —
+    /// should use [`SkillLocation::parse_spec`] instead.
+    ///
+    /// Returns `None` when no `owner` and `repo` can be read.
+    pub fn parse(spec: &str) -> Option<SkillLocation> {
+        Self::parse_spec(spec).map(|parsed| parsed.location)
     }
 
     /// Reads the spellings a user is likely to paste or type:
@@ -283,8 +309,9 @@ impl SkillLocation {
     /// * `git@github.com:owner/repo.git`
     ///
     /// The ref defaults to [`DEFAULT_BRANCH`] when the spelling does not carry
-    /// one. Returns `None` when no `owner` and `repo` can be read.
-    pub fn parse(spec: &str) -> Option<SkillLocation> {
+    /// one, and [`ParsedLocation::explicit_ref`] reports which of the two
+    /// happened. Returns `None` when no `owner` and `repo` can be read.
+    pub fn parse_spec(spec: &str) -> Option<ParsedLocation> {
         let spec = spec.trim().trim_end_matches('/');
         // A trailing `@ref`, but not the `@` in `git@github.com:owner/repo`.
         // The difference is position: a ref suffix comes after the last slash.
@@ -305,11 +332,16 @@ impl SkillLocation {
             .trim_end_matches(".git")
             .trim_matches('/');
 
+        let mut explicit_ref = at_ref.is_some();
         let (reference, path) = if let Some(rest) = tail.strip_prefix("tree/") {
-            match rest.split_once('/') {
+            let (reference, path) = match rest.split_once('/') {
                 Some((reference, path)) => (reference.to_string(), path.to_string()),
                 None => (rest.to_string(), String::new()),
-            }
+            };
+            // The `<ref>` of a `/tree/<ref>/...` URL was typed just as
+            // deliberately as an `@ref` suffix.
+            explicit_ref = explicit_ref || !reference.is_empty();
+            (reference, path)
         } else {
             (
                 at_ref.clone().unwrap_or_else(|| DEFAULT_BRANCH.to_string()),
@@ -318,10 +350,10 @@ impl SkillLocation {
         };
         let reference = at_ref.unwrap_or(reference);
 
-        Some(SkillLocation::new(
-            RepoRef::new(owner, repo, reference),
-            path,
-        ))
+        Some(ParsedLocation {
+            location: SkillLocation::new(RepoRef::new(owner, repo, reference), path),
+            explicit_ref,
+        })
     }
 
     /// The last path segment, which is the directory name the skill is
@@ -762,6 +794,41 @@ impl<H: Http> GitHub<H> {
         Ok(trees.get(sha).expect("just inserted"))
     }
 
+    /// Every directory in the repository that holds a `SKILL.md`, at
+    /// `commit_sha`.
+    ///
+    /// This is what a repository holds, without knowing any skill's name
+    /// beforehand: `anthropics/skills` keeps its skills a directory down, and
+    /// nothing in the spelling a user pastes says so. The paths come back
+    /// sorted and deduplicated, with the empty string standing for the
+    /// repository root when the root itself holds a `SKILL.md`.
+    ///
+    /// One recursive tree request: the whole repository has to be searched, so
+    /// the level-at-a-time walk would cost more, not less.
+    pub fn list_skill_dirs(
+        &self,
+        repo: &RepoRef,
+        commit_sha: &str,
+    ) -> Result<Vec<String>, GitHubError> {
+        let tree = self.tree(repo, commit_sha, true)?;
+        let mut found = Vec::new();
+        for entry in &tree.tree {
+            if !entry.is_blob() || !entry.path.ends_with("SKILL.md") {
+                continue;
+            }
+            match entry.path.rsplit_once('/') {
+                Some((dir, "SKILL.md")) => found.push(dir.to_string()),
+                Some(_) => continue,
+                // A `SKILL.md` at the repository root: the repository is
+                // itself the skill.
+                None => found.push(String::new()),
+            }
+        }
+        found.sort();
+        found.dedup();
+        Ok(found)
+    }
+
     /// Every directory named `skill_id` that holds a `SKILL.md`, at
     /// `commit_sha`.
     ///
@@ -771,39 +838,24 @@ impl<H: Http> GitHub<H> {
     /// repository is itself the skill. More than one match is returned, in path
     /// order, for the caller to choose between.
     ///
-    /// One recursive tree request: the whole repository has to be searched, so
-    /// the level-at-a-time walk would cost more, not less.
+    /// Filters [`GitHub::list_skill_dirs`], so it costs the same one request.
     pub fn find_skill_dirs(
         &self,
         repo: &RepoRef,
         commit_sha: &str,
         skill_id: &str,
     ) -> Result<Vec<String>, GitHubError> {
-        let tree = self.tree(repo, commit_sha, true)?;
-        let mut found = Vec::new();
-        for entry in &tree.tree {
-            if !entry.is_blob() || !entry.path.ends_with("SKILL.md") {
-                continue;
-            }
-            let dir = match entry.path.rsplit_once('/') {
-                Some((dir, "SKILL.md")) => dir,
-                Some(_) => continue,
-                // A `SKILL.md` at the repository root: the repository is the
-                // skill, and its own name is the id to match.
-                None => {
-                    if repo.repo == skill_id {
-                        found.push(String::new());
-                    }
-                    continue;
-                }
-            };
-            if dir.rsplit('/').next() == Some(skill_id) {
-                found.push(dir.to_string());
-            }
-        }
-        found.sort();
-        found.dedup();
-        Ok(found)
+        let found = self.list_skill_dirs(repo, commit_sha)?;
+        Ok(found
+            .into_iter()
+            .filter(|dir| match dir.rsplit_once('/') {
+                Some((_, last)) => last == skill_id,
+                // At the root the repository's own name is the id to match;
+                // anywhere else the whole path is the last segment.
+                None if dir.is_empty() => repo.repo == skill_id,
+                None => dir == skill_id,
+            })
+            .collect())
     }
 
     /// Downloads the repository archive pinned to `sha`.
@@ -1109,6 +1161,35 @@ mod tests {
     }
 
     #[test]
+    fn parsing_says_whether_the_spec_named_the_ref() {
+        let cases = [
+            ("o/r", false, "main", ""),
+            ("o/r@master", true, "master", ""),
+            ("o/r/a/b@v1", true, "v1", "a/b"),
+            (
+                "https://github.com/o/r/tree/dev/skills/pdf",
+                true,
+                "dev",
+                "skills/pdf",
+            ),
+            // The `@` in an SSH URL is part of the host, not a ref.
+            ("git@github.com:o/r.git", false, "main", ""),
+        ];
+        for (spec, explicit, reference, path) in cases {
+            let parsed = SkillLocation::parse_spec(spec).unwrap_or_else(|| panic!("{spec}"));
+            assert_eq!(parsed.explicit_ref, explicit, "{spec}");
+            assert_eq!(parsed.location.repo.reference, reference, "{spec}");
+            assert_eq!(parsed.location.path, path, "{spec}");
+            assert_eq!(
+                SkillLocation::parse(spec).as_ref(),
+                Some(&parsed.location),
+                "{spec}"
+            );
+        }
+        assert_eq!(SkillLocation::parse_spec("anthropics"), None);
+    }
+
+    #[test]
     fn dir_name_falls_back_to_the_repository_at_the_root() {
         assert_eq!(
             SkillLocation::parse("o/my-skill").unwrap().dir_name(),
@@ -1304,6 +1385,53 @@ mod tests {
             .find_skill_dirs(&RepoRef::new("o", "pdf", "main"), "c1", "pdf")
             .unwrap();
         assert_eq!(found, ["", "a/pdf", "b/pdf"]);
+    }
+
+    #[test]
+    fn every_skill_in_a_repository_is_listed_whatever_it_is_called() {
+        let http = FakeHttp::new();
+        http.json(
+            "https://api.test/repos/o/skills/git/trees/c1?recursive=1",
+            r#"{"sha":"root","truncated":false,"tree":[
+                {"path":"README.md","type":"blob","sha":"b0"},
+                {"path":"document-skills","type":"tree","sha":"t1"},
+                {"path":"document-skills/pdf","type":"tree","sha":"t2"},
+                {"path":"document-skills/pdf/SKILL.md","type":"blob","sha":"b1"},
+                {"path":"document-skills/pdf/scripts/run.sh","type":"blob","sha":"b2"},
+                {"path":"document-skills/docx/SKILL.md","type":"blob","sha":"b3"},
+                {"path":"artifacts/deep/nested/SKILL.md","type":"blob","sha":"b4"},
+                {"path":"artifacts/notes.md","type":"blob","sha":"b5"}]}"#,
+        );
+        let gh = client(http);
+        let found = gh
+            .list_skill_dirs(&RepoRef::new("o", "skills", "main"), "c1")
+            .unwrap();
+        assert_eq!(
+            found,
+            [
+                "artifacts/deep/nested",
+                "document-skills/docx",
+                "document-skills/pdf",
+            ]
+        );
+        // One recursive tree request answers for the whole repository.
+        assert_eq!(gh.http().request_count(), 1);
+    }
+
+    #[test]
+    fn a_skill_at_the_repository_root_is_listed_as_the_empty_path() {
+        let http = FakeHttp::new();
+        http.json(
+            "https://api.test/repos/o/pdf/git/trees/c1?recursive=1",
+            r#"{"sha":"root","truncated":false,"tree":[
+                {"path":"SKILL.md","type":"blob","sha":"b0"},
+                {"path":"examples/one/SKILL.md","type":"blob","sha":"b1"}]}"#,
+        );
+        let gh = client(http);
+        let found = gh
+            .list_skill_dirs(&RepoRef::new("o", "pdf", "main"), "c1")
+            .unwrap();
+        assert_eq!(found, ["", "examples/one"]);
     }
 
     #[test]

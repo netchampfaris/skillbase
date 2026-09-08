@@ -1,5 +1,5 @@
 //! The sidebar column: its two header bands, a top group of Discover and the
-//! two commands that put a skill in the store, a Library group, a collapsible
+//! three commands that put a skill in the store, a Library group, a collapsible
 //! Agents group listing only the agents that exist on this machine, and
 //! Settings pinned to the bottom.
 
@@ -20,7 +20,7 @@ use gpui_kit::{
 };
 use skillbase_core::{AgentDef, Registry};
 
-use crate::app::{Skillbase, WorkArea};
+use crate::app::{Skillbase, UpdateState, WorkArea};
 
 use super::agent_icon;
 use super::model::{Library, Scope};
@@ -31,6 +31,21 @@ use super::{BAND_HEIGHT, TRAFFIC_LIGHT_INSET, drag_band};
 pub const SIDEBAR_WIDTH: f32 = 240.;
 
 impl Skillbase {
+    /// True once an update check has landed, whatever it found.
+    ///
+    /// Everything that counts skills behind upstream has to wait for this: the
+    /// answer comes over the network long after the disk has been read, and
+    /// before it arrives there is no number, not a zero.
+    pub(crate) fn checked_for_updates(&self) -> bool {
+        matches!(self.updates, UpdateState::Ready(_))
+    }
+
+    /// True while the check is in flight, which is a different sentence from
+    /// never having run one.
+    pub(crate) fn checking_for_updates(&self) -> bool {
+        matches!(self.updates, UpdateState::Checking)
+    }
+
     pub(crate) fn render_sidebar(
         &self,
         window: &mut Window,
@@ -40,7 +55,7 @@ impl Skillbase {
         let in_library = self.work_area == WorkArea::Skills;
         let scan = self.scan();
 
-        // Discover is a destination; the other two are commands that land a
+        // Discover is a destination; the other three are commands that land a
         // skill in the same store. They share a group, headed "Add skills",
         // because they are how a skill that is not here yet gets here.
         let discover = SidebarMenuItem::new("Discover")
@@ -56,12 +71,29 @@ impl Skillbase {
             .icon(IconName::Github)
             .on_click(cx.listener(|this, _, window, cx| this.open_install_dialog(window, cx)));
 
+        // Beside the GitHub row, because it answers the same question with a
+        // different source: a skill that is already on this machine — sent
+        // over, or sitting in a repository that is already cloned — and has no
+        // way into the store without it.
+        let import = SidebarMenuItem::new("Install from folder")
+            .icon(IconName::FolderOpen)
+            .on_click(cx.listener(|this, _, window, cx| this.import_from_folder(window, cx)));
+
         let library: Vec<_> =
             Library::ALL
                 .into_iter()
                 .map(|library| {
                     let target = Scope::Library(library);
-                    let total = scan.map(|scan| scan.count(target));
+                    // The Updates row is the one whose number nothing on this
+                    // machine can answer. Until the check lands it wears the
+                    // same skeleton a row wears before the scan does, because
+                    // a zero here would read as "nothing is behind upstream"
+                    // when what happened is that nobody has asked.
+                    let total = if library == Library::Updates && !self.checked_for_updates() {
+                        None
+                    } else {
+                        scan.map(|scan| scan.count(target, |name| self.has_update(name)))
+                    };
                     SidebarMenuItem::new(library.label())
                         .icon(library_icon(library))
                         .active(in_library && scope == target)
@@ -87,7 +119,7 @@ impl Skillbase {
                 .into_iter()
                 .map(|agent| {
                     let target = Scope::Agent(agent.id);
-                    let total = scan.map(|scan| scan.count(target));
+                    let total = scan.map(|scan| scan.count(target, |name| self.has_update(name)));
                     // An agent with no directory is shown in the muted weight the
                     // counts use, so the row does not claim the agent is here.
                     let absent = scan.is_some() && !installed.contains(&agent);
@@ -135,15 +167,30 @@ impl Skillbase {
                         .w_full()
                         .border_r_0()
                         .child(
-                            ScopeGroup::new("Add skills", vec![discover, new_skill, install])
-                                .leading(),
+                            ScopeGroup::new(
+                                "Add skills",
+                                vec![discover, new_skill, install, import],
+                            )
+                            .leading(),
                         )
                         .child(ScopeGroup::new("Library", library))
                         .child(
                             ScopeGroup::new("Agents", agents)
+                                // The group starts closed and lists only the
+                                // agents that are here, so without this the
+                                // reader cannot tell whether Skillbase knows
+                                // about the agent they are missing.
+                                .count(scan.map(|scan| {
+                                    SharedString::from(format!(
+                                        "{} of {}",
+                                        scan.installed.len(),
+                                        Registry::all().iter().filter(|a| !a.is_shared()).count()
+                                    ))
+                                }))
                                 .folded(self.agents_collapsed)
-                                .on_toggle(Rc::new(cx.listener(|this, _, _, cx| {
+                                .on_toggle(Rc::new(cx.listener(|this, _, window, cx| {
                                     this.agents_collapsed = !this.agents_collapsed;
+                                    this.remember_agents_group(window, cx);
                                     cx.notify();
                                 }))),
                         )
@@ -190,7 +237,7 @@ impl Skillbase {
                     .icon(Icon::new(IconName::PanelLeftClose).size_4())
                     .tooltip("Hide sidebar")
                     .accessibility_label("Hide sidebar")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx))),
             )
     }
 
@@ -238,7 +285,10 @@ impl Skillbase {
                     .ghost()
                     .small()
                     .icon(IconName::RotateCw)
-                    .tooltip("Re-scan every scope")
+                    // Said here rather than only in Settings: this is the
+                    // control someone hesitates over, and what stops them is
+                    // not knowing whether a scan writes anything.
+                    .tooltip("Re-scan every scope. Scanning only reads; nothing on disk changes")
                     .accessibility_label("Re-scan every scope")
                     // The one gesture that means "look at the machine again",
                     // which is why it is also the one that spends requests on
@@ -266,6 +316,11 @@ fn scope_menu() -> SidebarMenu {
 #[derive(Clone)]
 struct ScopeGroup {
     label: Option<SharedString>,
+    /// What the heading says about how much of the group is listed, when the
+    /// rows alone cannot say it. `None` for a group that has nothing to
+    /// report, and before the scan lands: the label beside it is short enough
+    /// that a count arriving late moves nothing.
+    count: Option<SharedString>,
     items: Vec<SidebarMenuItem>,
     /// True for the group at the top, which needs no space above it.
     leading: bool,
@@ -283,12 +338,19 @@ impl ScopeGroup {
     fn new(label: impl Into<SharedString>, items: Vec<SidebarMenuItem>) -> Self {
         Self {
             label: Some(label.into()),
+            count: None,
             items,
             leading: false,
             collapsed: false,
             folded: false,
             on_toggle: None,
         }
+    }
+
+    /// Say in the heading how much of the group is listed.
+    fn count(mut self, count: Option<SharedString>) -> Self {
+        self.count = count;
+        self
     }
 
     /// Mark the group as the first one, which needs no space above it: the
@@ -336,6 +398,7 @@ impl SidebarItem for ScopeGroup {
         let toggle = self.on_toggle.clone();
         // The rail collapse hides the heading; folding the section does not.
         let label = self.label.clone().filter(|_| !collapsed);
+        let count = self.count.clone().filter(|_| !collapsed);
         // `SidebarMenu::collapsed` does not hide rows, it renders each one
         // icon-only and centred — the look the rail collapse wants, not the
         // look a folded section wants. So a folded section skips the menu
@@ -351,7 +414,7 @@ impl SidebarItem for ScopeGroup {
             // Sections stand apart; rows within a section do not.
             .when(!leading, |this| this.pt_4())
             .when_some(label, |this, label| {
-                this.child(section_heading(label, folded, toggle, cx))
+                this.child(section_heading(label, count, folded, toggle, cx))
             })
             .when(!hide_rows, |this| {
                 this.child(
@@ -366,6 +429,7 @@ impl SidebarItem for ScopeGroup {
 
 fn section_heading(
     label: SharedString,
+    count: Option<SharedString>,
     folded: bool,
     toggle: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
     cx: &App,
@@ -380,14 +444,30 @@ fn section_heading(
         .text_xs()
         .text_color(muted)
         .child(label.clone());
+    // Read out together, because the count is part of what the heading says.
+    let spoken = match &count {
+        Some(count) => SharedString::from(format!("{label}, {count}")),
+        None => label.clone(),
+    };
+    // The same size and colour as the label: this is part of the heading, not
+    // a second thing beside it.
+    let count = count.map(|count| {
+        div()
+            .flex_shrink_0()
+            .text_xs()
+            .text_color(muted)
+            .child(count)
+    });
 
     let Some(toggle) = toggle else {
         return h_flex()
             .flex_shrink_0()
             .h_6()
             .px_2()
+            .gap_2()
             .items_center()
             .child(text)
+            .children(count)
             .into_any_element();
     };
 
@@ -401,11 +481,12 @@ fn section_heading(
         .ghost()
         .small()
         .w_full()
-        .accessibility_label(label)
+        .accessibility_label(spoken)
         // Expanded, not selected: what the control reports is whether the rows
         // under it are showing.
         .toggled(!folded)
         .child(text)
+        .children(count)
         .child(
             Icon::new(if folded {
                 IconName::ChevronRight
@@ -430,6 +511,9 @@ fn library_icon(library: Library) -> IconName {
         Library::Shared => IconName::Network,
         Library::Managed => IconName::CircleCheck,
         Library::Unmanaged => IconName::Folder,
+        // The same glyph the list rows mark an update with, so the row and the
+        // group cannot be read as two different facts.
+        Library::Updates => IconName::ArrowDown,
         Library::Invalid => IconName::TriangleAlert,
         Library::Conflicts => IconName::Copy,
     }

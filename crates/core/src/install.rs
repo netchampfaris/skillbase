@@ -12,8 +12,9 @@
 //!    [`Installer::ensure_in_scope`] first. A path outside the store, the
 //!    private directory and the agent directories is refused, including one
 //!    that tries to climb out with `..`.
-//! 2. Deleting never follows a symlink. A link is unlinked; only a directory
-//!    proven real is removed recursively.
+//! 2. Deleting never follows a symlink. A link is unlinked; a directory proven
+//!    real is moved into `~/.skillbase/trash`, never destroyed, so a skill
+//!    somebody wrote by hand can be got back out of Finder.
 //! 3. A real directory is never removed by an operation that expected a link.
 //!    Under [`LinkMode::Copy`] a copy is only removed when it carries the
 //!    marker file this crate wrote, so a copy Skillbase did not make is left
@@ -22,13 +23,13 @@
 //! The roots come in as a [`Roots`], so tests run against a temporary home and
 //! can never touch the user's own.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
-
-use thiserror::Error;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::discovery::DiscoveredSkill;
 use crate::doc::SkillDoc;
@@ -36,28 +37,31 @@ use crate::error::SkillError;
 use crate::frontmatter::SkillFrontmatter;
 use crate::registry::{AgentDef, DisableMode, LinkMode, Roots};
 use crate::skill::{SKILL_FILE_NAME, Skill};
-use crate::slug::is_kebab_case;
+use crate::slug::{is_kebab_case, slugify};
 
 /// Written into every directory Skillbase copies, so that removing a copy can
 /// be justified rather than guessed.
 pub const COPY_MARKER: &str = ".skillbase-copy";
 
 /// Anything that can go wrong while changing the filesystem.
-#[derive(Debug, Error)]
+///
+/// [`Display`] writes every path in full. [`InstallError::describe_under`]
+/// writes the same message with the home directory as `~`, which is what the
+/// interface shows; the two are one function so a message can never be written
+/// twice and drift.
+///
+/// [`Display`]: std::fmt::Display
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum InstallError {
     /// The path is not inside the store or an agent directory. Refused before
     /// anything was touched.
-    #[error(
-        "{path} is outside every directory Skillbase manages. Move it under ~/.agents/skills, or delete it in Finder."
-    )]
     OutsideScope {
         /// The path that was refused.
         path: PathBuf,
     },
 
     /// A path that had to be a symlink is a real file or directory.
-    #[error("A real {kind} already sits at {path}. Rename or remove it, then try again.")]
     NotALink {
         /// The path in the way.
         path: PathBuf,
@@ -67,56 +71,107 @@ pub enum InstallError {
 
     /// A directory could not be shown to be a copy Skillbase made, so it was
     /// left alone.
-    #[error(
-        "{path} is not a copy Skillbase made, so it was left alone. Remove it in Finder if you no longer want it."
-    )]
     NotACopy {
         /// The directory that was left alone.
         path: PathBuf,
     },
 
     /// The destination is occupied.
-    #[error("{path}: already exists")]
     AlreadyExists {
         /// The occupied path.
         path: PathBuf,
     },
 
     /// The origin is missing or is not a directory.
-    #[error("{path}: no skill directory here")]
     MissingOrigin {
         /// The path that was expected to hold a skill.
         path: PathBuf,
     },
 
+    /// A path picked for [`Installer::import`] does not hold a skill.
+    ///
+    /// The `hint` says which of the near misses it was — a path that is not
+    /// there, a file rather than a directory, a directory with no `SKILL.md` —
+    /// because "that is not a skill" on its own leaves the user to guess what
+    /// would have been.
+    NotASkill {
+        /// The path that was picked.
+        path: PathBuf,
+        /// What to do instead, one sentence.
+        hint: &'static str,
+    },
+
+    /// A path picked for [`Installer::import`] is already inside a directory
+    /// Skillbase manages, so importing it would make a second copy of a skill
+    /// the user already has.
+    AlreadyManaged {
+        /// The path that was picked.
+        path: PathBuf,
+    },
+
     /// This agent's directory is the shared directory, so it has no link of its
     /// own.
-    #[error("{agent} reads the shared directory; link the skill to Shared instead")]
     CoveredByShared {
         /// The agent's display name.
         agent: &'static str,
     },
 
     /// A skill name that is not kebab-case.
-    #[error("skill name `{name}` is not kebab-case")]
     InvalidName {
         /// The rejected name.
         name: String,
     },
 
     /// A filesystem call failed.
-    #[error("{path}: {source}")]
     Io {
         /// The path being changed.
         path: PathBuf,
         /// The underlying error.
-        #[source]
         source: std::io::Error,
     },
 
+    /// An operation stopped after it had already changed the filesystem.
+    ///
+    /// Deleting a skill unlinks it from up to fourteen agents before it touches
+    /// the origin, so "Permission denied" on the ninth link can mean eight
+    /// links are already gone. Carrying what was done keeps the message honest:
+    /// the interface lists the changes that stand and then says why the rest
+    /// did not happen.
+    ///
+    /// Build it with [`InstallError::partial`], never by hand: an operation
+    /// that failed before it changed anything must stay the plain error.
+    Partial {
+        /// What the operation had already done.
+        done: Box<Outcome>,
+        /// Why it stopped.
+        source: Box<InstallError>,
+    },
+
+    /// An operation failed, and putting things back failed too.
+    ///
+    /// Both halves have to be said. The first names why the operation stopped;
+    /// without the second the user is told about a failure while the skill sits
+    /// in a state that neither the failure nor the operation describes.
+    ///
+    /// `cause` carries what still stands, as an [`InstallError::Partial`],
+    /// whenever the operation knew: this is the one error where the disk is
+    /// certainly not what the list shows, and [`InstallError::completed`] says
+    /// so for every rollback whether the cause recorded the detail or not.
+    Rollback {
+        /// Why the operation stopped.
+        cause: Box<InstallError>,
+        /// Why undoing it failed.
+        undo: Box<InstallError>,
+        /// Where the skill's files are now, so the user can find them.
+        at: PathBuf,
+        /// True when the undo left symlinks pointing at a path that is gone,
+        /// which the message has to say: the files being back where they were
+        /// is not the whole state.
+        dangling_links: bool,
+    },
+
     /// Reading or writing a `SKILL.md` failed.
-    #[error(transparent)]
-    Skill(#[from] SkillError),
+    Skill(SkillError),
 }
 
 impl InstallError {
@@ -125,6 +180,203 @@ impl InstallError {
             path: path.into(),
             source,
         }
+    }
+
+    /// Attaches what an operation had already done to the error that stopped
+    /// it.
+    ///
+    /// An operation that failed before it changed anything returns the plain
+    /// error, so the ordinary refusal reads exactly as it always did.
+    ///
+    /// A `source` that is itself a [`InstallError::Partial`] is folded in
+    /// rather than nested: a step of an operation can report its own
+    /// half-finished work, and nesting would print two "Then it stopped" lines
+    /// with a list of changes buried between them, and hide the inner changes
+    /// from [`InstallError::completed`].
+    pub fn partial(mut done: Outcome, source: InstallError) -> Self {
+        if let Self::Partial {
+            done: inner,
+            source,
+        } = source
+        {
+            done.changes.extend(inner.changes);
+            return Self::partial(done, *source);
+        }
+        if done.is_noop() {
+            return source;
+        }
+        Self::Partial {
+            done: Box::new(done),
+            source: Box::new(source),
+        }
+    }
+
+    /// What the operation had already done before it failed, when it had done
+    /// anything.
+    ///
+    /// `Some` means the filesystem is not what the caller last read, so the
+    /// caller has to read it again. Every [`InstallError::Rollback`] answers
+    /// `Some`, because a rollback is by definition a change that could not be
+    /// put back: it reports the changes its `cause` recorded when there are
+    /// any, and otherwise a single [`Change::NotUndone`] naming where the
+    /// files were left.
+    ///
+    /// Borrowed except for that synthesized case, which is why it is a
+    /// [`Cow`].
+    pub fn completed(&self) -> Option<Cow<'_, Outcome>> {
+        match self {
+            Self::Partial { done, .. } => Some(Cow::Borrowed(done)),
+            Self::Rollback { cause, at, .. } => Some(cause.completed().unwrap_or_else(|| {
+                Cow::Owned(Outcome::one(Change::NotUndone {
+                    path: at.to_path_buf(),
+                }))
+            })),
+            _ => None,
+        }
+    }
+
+    /// The message with `home` written as `~`.
+    ///
+    /// A refusal that spells out `/Users/someone/.claude/skills/x` is read less
+    /// carefully than one that says `~/.claude/skills/x`, and the rest of the
+    /// interface already abbreviates. The abbreviation is presentation, so it
+    /// is a second rendering of the message rather than a change to the paths.
+    pub fn describe_under(&self, home: &Path) -> String {
+        let mut out = String::new();
+        // Writing into a String cannot fail.
+        let _ = self.write(&mut out, Some(home));
+        out
+    }
+
+    fn write(&self, f: &mut impl std::fmt::Write, home: Option<&Path>) -> std::fmt::Result {
+        let p = |path: &Path| match home {
+            Some(home) => abbreviate(path, home),
+            None => path.display().to_string(),
+        };
+        match self {
+            Self::OutsideScope { path } => write!(
+                f,
+                "{} is outside every directory Skillbase manages. Move it under ~/.agents/skills, \
+                 or delete it in Finder.",
+                p(path)
+            ),
+            Self::NotALink { path, kind } => write!(
+                f,
+                "A real {kind} already sits at {}. Rename or remove it, then try again.",
+                p(path)
+            ),
+            Self::NotACopy { path } => write!(
+                f,
+                "{} is not a copy Skillbase made, so it was left alone. Remove it in Finder if you \
+                 no longer want it.",
+                p(path)
+            ),
+            Self::AlreadyExists { path } => write!(
+                f,
+                "{} is already taken. Rename or remove what is there, then try again.",
+                p(path)
+            ),
+            Self::MissingOrigin { path } => write!(
+                f,
+                "There is no skill directory at {}. Reload the list to see what is actually there.",
+                p(path)
+            ),
+            Self::NotASkill { path, hint } => {
+                write!(f, "{} is not a skill. {hint}", p(path))
+            }
+            Self::AlreadyManaged { path } => write!(
+                f,
+                "{} is a directory Skillbase already manages, or holds one, so importing it \
+                 would make a second copy of a skill you already have. Open the skill in the \
+                 list and use Adopt instead.",
+                p(path)
+            ),
+            Self::CoveredByShared { agent } => write!(
+                f,
+                "{agent} reads the shared directory; link the skill to Shared instead"
+            ),
+            Self::InvalidName { name } => {
+                write!(
+                    f,
+                    "`{name}` is not a usable skill name. Use lower-case words joined by hyphens, \
+                     like `code-review`."
+                )
+            }
+            Self::Io { path, source } => {
+                if source.kind() == std::io::ErrorKind::PermissionDenied {
+                    write!(
+                        f,
+                        "Skillbase is not allowed to write to {}. Check that path in Finder with \
+                         File > Get Info, give yourself write access, then try again.",
+                        p(path)
+                    )
+                } else {
+                    write!(f, "{}: {source}", p(path))
+                }
+            }
+            Self::Partial { done, source } => {
+                let listed = match home {
+                    Some(home) => done.describe_under(home),
+                    None => done.describe(),
+                };
+                writeln!(f, "{listed}")?;
+                write!(f, "Then it stopped: ")?;
+                source.write(f, home)
+            }
+            Self::Rollback {
+                cause,
+                undo,
+                at,
+                dangling_links,
+            } => {
+                cause.write(f, home)?;
+                writeln!(f)?;
+                write!(f, "Putting things back failed too: ")?;
+                undo.write(f, home)?;
+                writeln!(f)?;
+                if *dangling_links {
+                    write!(
+                        f,
+                        "The skill's files are at {}, but some links to it may still point at the \
+                         path it was moved to, which is no longer there. Check that path in \
+                         Finder before trying again.",
+                        p(at)
+                    )
+                } else {
+                    write!(
+                        f,
+                        "The skill's files are at {}. Check that path in Finder before trying \
+                         again.",
+                        p(at)
+                    )
+                }
+            }
+            Self::Skill(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write(f, None)
+    }
+}
+
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Partial { source, .. } => Some(source),
+            Self::Rollback { cause, .. } => Some(cause),
+            Self::Skill(source) => source.source(),
+            _ => None,
+        }
+    }
+}
+
+impl From<SkillError> for InstallError {
+    fn from(source: SkillError) -> Self {
+        Self::Skill(source)
     }
 }
 
@@ -151,10 +403,12 @@ pub enum Change {
         /// The copy.
         to: PathBuf,
     },
-    /// A real directory was removed, with everything in it.
-    RemovedDirectory {
-        /// The directory that is gone.
-        path: PathBuf,
+    /// A real directory was moved into the trash instead of being destroyed.
+    MovedToTrash {
+        /// Where the directory was.
+        from: PathBuf,
+        /// Where it is now, under `~/.skillbase/trash`.
+        to: PathBuf,
     },
     /// A directory or link was moved.
     Moved {
@@ -179,6 +433,16 @@ pub enum Change {
         path: PathBuf,
         /// Why nothing happened.
         reason: &'static str,
+    },
+    /// An operation changed the filesystem and could not put it back.
+    ///
+    /// No operation pushes this. [`InstallError::completed`] reports it for an
+    /// [`InstallError::Rollback`] whose cause did not record what it had done,
+    /// so a caller asking whether the disk changed is told yes rather than no.
+    /// What changed is in the error's own message.
+    NotUndone {
+        /// Where the skill's files were left.
+        path: PathBuf,
     },
 }
 
@@ -206,11 +470,16 @@ impl Change {
             }
             Self::RemovedSymlink { path } => write!(f, "removed the link {}", p(path)),
             Self::Copied { from, to } => write!(f, "copied {} to {}", p(from), p(to)),
-            Self::RemovedDirectory { path } => write!(f, "deleted {}", p(path)),
+            Self::MovedToTrash { from, to } => {
+                write!(f, "moved {} to the trash at {}", p(from), p(to))
+            }
             Self::Moved { from, to } => write!(f, "moved {} to {}", p(from), p(to)),
             Self::CreatedDirectory { path } => write!(f, "created {}", p(path)),
             Self::WroteFile { path } => write!(f, "wrote {}", p(path)),
             Self::NoChange { path, reason } => write!(f, "{} was already {reason}", p(path)),
+            Self::NotUndone { path } => {
+                write!(f, "changed {} and could not put it back", p(path))
+            }
         }
     }
 }
@@ -300,8 +569,18 @@ impl Outcome {
 pub struct DeletePlan {
     /// The skill being removed.
     pub name: String,
-    /// The real directory holding the bytes, when it is inside a managed scope.
+    /// The real directory holding the bytes, when it is inside a managed scope
+    /// and still on disk.
     pub origin: Option<PathBuf>,
+    /// True when the origin is inside a managed scope but is no longer a
+    /// directory: it went away between the scan and the plan.
+    ///
+    /// The other reason [`DeletePlan::origin`] is empty is an origin outside
+    /// every managed scope, and that one is listed under
+    /// [`DeletePlan::skipped`] instead. The two have to stay apart because
+    /// they say opposite things about the disk: here the skill's bytes are
+    /// already gone, there they are still where they were.
+    pub origin_missing: bool,
     /// Symlinks pointing at it, including any parked in a disabled directory.
     pub links: Vec<PathBuf>,
     /// Real directories that duplicate it.
@@ -570,6 +849,44 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+/// How to import a directory from outside every managed scope.
+///
+/// The default takes the name from the skill's own frontmatter and refuses a
+/// name that is taken, so an import never overwrites without being told to.
+/// The two overrides are the two answers to that refusal: [`Self::named`] keeps
+/// both, [`Self::replacing`] replaces. They are the same pair
+/// [`InstallOptions`] offers a GitHub install, so the interface can put the
+/// same question to the user either way.
+///
+/// [`InstallOptions`]: crate::InstallOptions
+#[derive(Debug, Clone, Default)]
+pub struct ImportOptions {
+    /// Import under this name instead of the one in the frontmatter.
+    pub name: Option<String>,
+    /// Replace a skill of the same name already in the store. Off by default.
+    pub replace: bool,
+}
+
+impl ImportOptions {
+    /// The default: take the name from the skill, and refuse to overwrite.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Import under an explicit name, which is how "keep both" is asked for.
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Replace a skill of the same name, moving the old directory to the trash
+    /// first rather than destroying it.
+    pub fn replacing(mut self) -> Self {
+        self.replace = true;
+        self
+    }
+}
+
 /// Creates, moves and removes the links that make a skill visible, and moves
 /// the origins of the skills Skillbase owns.
 ///
@@ -594,13 +911,16 @@ impl Installer {
     }
 
     /// Rejects any path that is not strictly inside the store, the private
-    /// directory or an agent directory.
+    /// directory, the trash or an agent directory.
     ///
     /// The path is normalized textually first, so `<store>/../../..` is refused
     /// even though nothing on disk was consulted. The normalized path comes
     /// back, and it is the one the caller must act on.
     ///
-    /// Called at the top of every operation that writes.
+    /// Called at the top of every operation that writes. That is why the trash
+    /// counts here: a delete has to write into it. Whether Skillbase *manages*
+    /// a path is the separate question `overlaps_managed` asks, and the trash
+    /// is not in that list.
     pub fn ensure_in_scope(&self, path: &Path) -> Result<PathBuf, InstallError> {
         let normalized = normalize_lexical(path).ok_or_else(|| InstallError::OutsideScope {
             path: path.to_path_buf(),
@@ -774,10 +1094,21 @@ impl Installer {
                 outcome.changes.extend(linked.changes);
                 Ok(outcome)
             }
-            Err(e) => {
-                // Put it back rather than leave the skill in a third state.
-                let _ = fs::rename(&dest, &origin);
-                Err(e)
+            Err(cause) => {
+                // Put it back rather than leave the skill in a third state —
+                // and if it will not go back, say where it ended up, because
+                // the skill is now neither where it was nor where it was going.
+                match fs::rename(&dest, &origin) {
+                    Ok(()) => Err(cause),
+                    // The move stands, so it is carried on the cause: the
+                    // caller has to know the origin is at `dest` now.
+                    Err(e) => Err(InstallError::Rollback {
+                        cause: Box::new(InstallError::partial(outcome, cause)),
+                        undo: Box::new(InstallError::io(&dest, e)),
+                        at: dest,
+                        dangling_links: false,
+                    }),
+                }
             }
         }
     }
@@ -813,9 +1144,24 @@ impl Installer {
         }
 
         if let Err(e) = fs::rename(&source, &dest) {
-            // Restore the link so the skill stays reachable.
-            let _ = self.place_symlink(&dest, &source);
-            return Err(InstallError::io(&source, e));
+            let cause = InstallError::io(&source, e);
+            // Restore the link so the skill stays reachable. If that fails the
+            // link this call removed is gone for good, so the message has to
+            // name the store as where the skill still is.
+            if outcome.is_noop() {
+                return Err(cause);
+            }
+            return Err(match self.place_symlink(&dest, &source) {
+                Ok(_) => cause,
+                // The removed link stays removed, so it is carried on the
+                // cause rather than dropped.
+                Err(undo) => InstallError::Rollback {
+                    cause: Box::new(InstallError::partial(outcome, cause)),
+                    undo: Box::new(undo),
+                    at: source,
+                    dangling_links: false,
+                },
+            });
         }
         outcome.push(Change::Moved {
             from: source,
@@ -879,7 +1225,9 @@ impl Installer {
     ///
     /// Each location is classified by what it is on disk right now, not by what
     /// discovery called it, and anything outside a managed scope is listed
-    /// under [`DeletePlan::skipped`] instead of being removed.
+    /// under [`DeletePlan::skipped`] instead of being removed. The origin is
+    /// read the same way: one that is no longer a directory leaves
+    /// [`DeletePlan::origin`] empty and sets [`DeletePlan::origin_missing`].
     pub fn plan_delete(&self, skill: &DiscoveredSkill) -> DeletePlan {
         let mut plan = DeletePlan {
             name: skill.name.clone(),
@@ -904,6 +1252,10 @@ impl Installer {
         if origin.is_none() && !skill.origin.as_os_str().is_empty() {
             plan.skipped.push(skill.origin.clone());
         }
+        // Recorded before `origin` is emptied, because afterwards there is no
+        // way to tell an origin that is gone from one outside every scope, and
+        // a caller that acts on the skill being gone needs to know which it is.
+        plan.origin_missing = origin.as_ref().is_some_and(|path| !path.is_dir());
         plan.origin = origin.filter(|p| p.is_dir());
         plan
     }
@@ -912,9 +1264,24 @@ impl Installer {
     ///
     /// Links go first, then duplicate directories, then the origin, so a
     /// failure part-way never leaves a link pointing at nothing that the user
-    /// cannot see. Symlinks are unlinked, never followed.
+    /// cannot see. Symlinks are unlinked, never followed; a real directory is
+    /// moved into the trash rather than destroyed.
+    ///
+    /// A delete that stops part-way fails with [`InstallError::Partial`],
+    /// carrying the links and directories it had already dealt with. Without
+    /// that the user is told "Permission denied" and left to guess whether six
+    /// agents have lost the skill.
     pub fn delete(&self, plan: &DeletePlan) -> Result<Outcome, InstallError> {
         let mut outcome = Outcome::default();
+        match self.delete_into(plan, &mut outcome) {
+            Ok(()) => Ok(outcome),
+            Err(e) => Err(InstallError::partial(outcome, e)),
+        }
+    }
+
+    /// The body of [`Installer::delete`], writing what it did into `outcome` as
+    /// it goes so that a failure can still report it.
+    fn delete_into(&self, plan: &DeletePlan, outcome: &mut Outcome) -> Result<(), InstallError> {
         for path in &plan.links {
             let path = self.ensure_in_scope(path)?;
             if let Ok(meta) = fs::symlink_metadata(&path) {
@@ -932,7 +1299,7 @@ impl Installer {
             let path = self.ensure_in_scope(path)?;
             outcome.changes.extend(self.remove_real_dir(&path)?.changes);
         }
-        Ok(outcome)
+        Ok(())
     }
 
     /// Works out what consolidating this skill would replace, without
@@ -1020,11 +1387,29 @@ impl Installer {
     /// Each replacement removes the duplicate and then links it, in that order,
     /// so a failure leaves at worst a missing copy whose bytes are still at the
     /// origin — never a link pointing at nothing.
+    /// A consolidation that stops part-way fails with
+    /// [`InstallError::Partial`], carrying the directories it had already moved
+    /// to the trash and the links it had already written. It has to: by the
+    /// time anything can fail it has usually taken a real directory away, and a
+    /// message that says only why it stopped hides that.
     pub fn consolidate(&self, plan: &ConsolidatePlan) -> Result<Outcome, InstallError> {
+        let mut outcome = Outcome::default();
+        match self.consolidate_into(plan, &mut outcome) {
+            Ok(()) => Ok(outcome),
+            Err(e) => Err(InstallError::partial(outcome, e)),
+        }
+    }
+
+    /// The body of [`Installer::consolidate`], writing what it did into
+    /// `outcome` as it goes so that a failure can still report it.
+    fn consolidate_into(
+        &self,
+        plan: &ConsolidatePlan,
+        outcome: &mut Outcome,
+    ) -> Result<(), InstallError> {
         let origin = self.ensure_in_scope(plan.origin())?;
         require_dir(&origin)?;
 
-        let mut outcome = Outcome::default();
         for duplicate in plan.duplicates() {
             let path = self.ensure_in_scope(duplicate.path())?;
             if path == origin || origin.starts_with(&path) {
@@ -1069,7 +1454,7 @@ impl Installer {
                 .changes
                 .extend(self.place_symlink(&path, &origin)?.changes);
         }
-        Ok(outcome)
+        Ok(())
     }
 
     /// Creates a new skill in the store from a template.
@@ -1115,6 +1500,229 @@ impl Installer {
         ))
     }
 
+    /// Copies a skill directory from anywhere on disk into the store, so
+    /// Skillbase manages it from then on.
+    ///
+    /// This is the route in for a skill that is already on the machine and
+    /// nowhere Skillbase looks: a directory in `~/Downloads`, or one inside a
+    /// repository the user has cloned. The alternative is copying it into
+    /// `~/.agents/skills` in Finder, which is a thing the interface can hardly
+    /// ask for.
+    ///
+    /// It **copies**. The user's directory is left exactly where it is, so a
+    /// skill imported out of a checkout is still in the checkout afterwards.
+    /// That is the difference from [`Installer::adopt`], which moves the origin
+    /// and leaves a symlink, and the returned [`Change::Copied`] is what says
+    /// which of the two happened.
+    ///
+    /// The name is the frontmatter `name`, the same name discovery would show,
+    /// slugified when it is not already kebab-case, and taken from the
+    /// directory name when the frontmatter has none. [`ImportOptions::named`]
+    /// overrides it. Either way the name is validated the way
+    /// [`Installer::create`] validates one, because it becomes a directory
+    /// name.
+    ///
+    /// Returns the new directory and what was copied.
+    ///
+    /// # Refusals
+    ///
+    /// Everything is checked before anything is written:
+    ///
+    /// - A path that is not there, is not a directory, or holds no readable
+    ///   `SKILL.md` is [`InstallError::NotASkill`], carrying a sentence that
+    ///   says what to pick instead. Picking a repository rather than the skill
+    ///   inside it is the common mistake, and it is the one that sentence is
+    ///   written for.
+    /// - A path inside a directory Skillbase already manages is
+    ///   [`InstallError::AlreadyManaged`]. Importing it would leave the user
+    ///   with two copies of one skill; [`Installer::adopt`] is the operation
+    ///   for that directory, and the message says so.
+    /// - A name already taken in the store is [`InstallError::AlreadyExists`],
+    ///   the same refusal a GitHub install gives, so the interface can offer
+    ///   the same two answers: [`ImportOptions::named`] to keep both,
+    ///   [`ImportOptions::replacing`] to replace. Replacing moves the old
+    ///   directory to the trash first.
+    ///
+    /// # What is copied
+    ///
+    /// The tree, minus `.git`, which is the checkout's bookkeeping rather than
+    /// part of the skill and is routinely larger than everything around it.
+    /// Nothing is followed: a symlink inside the tree pointing back into the
+    /// tree is recreated as written, and one pointing anywhere else is left
+    /// behind rather than followed, so an import can only ever copy what is
+    /// under the directory the user picked.
+    ///
+    /// A copy that fails part-way takes the half-written directory back out of
+    /// the store, so a failed import leaves nothing an agent could load.
+    pub fn import(
+        &self,
+        source: &Path,
+        options: &ImportOptions,
+    ) -> Result<(PathBuf, Outcome), InstallError> {
+        let source = self.import_source(source)?;
+        let name = match &options.name {
+            Some(name) => name.clone(),
+            None => import_name(&source),
+        };
+        if !is_kebab_case(&name) {
+            return Err(InstallError::InvalidName { name });
+        }
+
+        let dest = self.ensure_in_scope(&self.roots.store_dir().join(&name))?;
+        let mut outcome = Outcome::default();
+        if fs::symlink_metadata(&dest).is_ok() {
+            if !options.replace {
+                return Err(InstallError::AlreadyExists { path: dest });
+            }
+            outcome
+                .changes
+                .extend(self.clear_for_import(&dest)?.changes);
+        }
+        create_dir_all(&self.roots.store_dir())?;
+
+        if let Err(cause) = copy_tree(&source, &dest, CopyRule::Import { root: &source }) {
+            let cause = InstallError::partial(outcome, cause);
+            // The destination did not exist a moment ago and every byte in it
+            // was written by the line above, so removing it destroys nothing
+            // of the user's. Leaving it would leave a half-copied skill in the
+            // directory every agent reads.
+            return Err(match fs::remove_dir_all(&dest) {
+                Ok(()) => cause,
+                Err(e) => InstallError::Rollback {
+                    cause: Box::new(cause),
+                    undo: Box::new(InstallError::io(&dest, e)),
+                    at: dest,
+                    dangling_links: false,
+                },
+            });
+        }
+
+        outcome.push(Change::Copied {
+            from: source,
+            to: dest.clone(),
+        });
+        Ok((dest, outcome))
+    }
+
+    /// Checks that `source` is a directory holding a skill, and that it is not
+    /// one Skillbase already manages. Returns it canonicalized.
+    ///
+    /// Canonicalizing first is what makes the scope check honest: a symlink in
+    /// `~/Downloads` pointing at `~/.agents/skills/pdf` is that skill, and
+    /// importing through it would make a second copy of it just the same.
+    fn import_source(&self, source: &Path) -> Result<PathBuf, InstallError> {
+        let source = fs::canonicalize(source).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => InstallError::NotASkill {
+                path: source.to_path_buf(),
+                hint: "There is nothing at that path. Check it in Finder, then try again.",
+            },
+            _ => InstallError::io(source, e),
+        })?;
+        if !fs::metadata(&source).map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(InstallError::NotASkill {
+                path: source,
+                hint: "A skill is a folder, so pick the folder that holds the SKILL.md rather \
+                       than a file inside it.",
+            });
+        }
+        if self.overlaps_managed(&source) {
+            return Err(InstallError::AlreadyManaged { path: source });
+        }
+        match fs::read_to_string(source.join(SKILL_FILE_NAME)) {
+            Ok(_) => Ok(source),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(InstallError::NotASkill {
+                path: source,
+                hint: "A skill is a folder with a SKILL.md in it. If you picked a repository, \
+                       look one level down: its skills are usually in a folder like `skills`.",
+            }),
+            Err(e) => Err(InstallError::io(source.join(SKILL_FILE_NAME), e)),
+        }
+    }
+
+    /// True when `path` and a directory Skillbase manages are the same
+    /// directory, or either holds the other.
+    ///
+    /// Reads [`Roots::managed_roots`] rather than [`Roots::scope_roots`],
+    /// because the question here is what the user already has, not where a
+    /// write is allowed. The trash is the difference: a deleted skill is not
+    /// in the list, so it cannot be adopted, and importing it back is the only
+    /// way to get it back.
+    ///
+    /// Wider than [`Installer::ensure_in_scope`] in both directions.
+    /// [`Installer::ensure_in_scope`] refuses a root itself, because a root is
+    /// not a skill to be operated on; here the root counts, since importing
+    /// `~/.claude/skills` is as much a second copy as importing one directory
+    /// inside it. And a path *holding* a root counts too: a home directory
+    /// with a stray `SKILL.md` in it is a directory, and copying it into the
+    /// store would copy the store into itself.
+    ///
+    /// [`Roots::managed_roots`]: crate::registry::Roots::managed_roots
+    /// [`Roots::scope_roots`]: crate::registry::Roots::scope_roots
+    fn overlaps_managed(&self, path: &Path) -> bool {
+        self.roots
+            .managed_roots()
+            .iter()
+            .any(|root| path.starts_with(root) || root.starts_with(path))
+    }
+
+    /// Takes away what is already at `dest` before an import replaces it.
+    ///
+    /// A symlink is unlinked, because it holds no bytes of its own. Anything
+    /// else goes to [`Installer::remove_real_dir`], which moves the directory
+    /// into the trash: the skill being replaced may be one the user wrote, and
+    /// a replace they did not mean has to be recoverable.
+    fn clear_for_import(&self, dest: &Path) -> Result<Outcome, InstallError> {
+        let meta = fs::symlink_metadata(dest).map_err(|e| InstallError::io(dest, e))?;
+        if meta.file_type().is_symlink() {
+            fs::remove_file(dest).map_err(|e| InstallError::io(dest, e))?;
+            return Ok(Outcome::one(Change::RemovedSymlink {
+                path: dest.to_path_buf(),
+            }));
+        }
+        self.remove_real_dir(dest)
+    }
+
+    /// Renames a skill's directory, taking every symlink that pointed at it
+    /// along.
+    ///
+    /// The directory keeps its parent, so a rename never changes whether a
+    /// skill is shared, hidden or owned by an agent: only the last segment of
+    /// the path changes. Returns the directory the skill now lives in.
+    ///
+    /// A skill's name is its frontmatter `name`, and discovery reads it from
+    /// there rather than from the path. Renaming one is therefore two writes —
+    /// this, and the `SKILL.md` the caller saves — and the two must both land
+    /// or the skill ends up with a directory that disagrees with its own name,
+    /// which is the state that sends an update into a second directory beside
+    /// the first.
+    ///
+    /// Refuses a name that is not kebab-case before it touches anything, and a
+    /// destination that is already occupied. A rename that fails part-way puts
+    /// the directory and its links back; see [`Installer::move_origin`].
+    pub fn rename(&self, from: &Path, new_name: &str) -> Result<(PathBuf, Outcome), InstallError> {
+        if !is_kebab_case(new_name) {
+            return Err(InstallError::InvalidName {
+                name: new_name.to_string(),
+            });
+        }
+        let from = self.ensure_in_scope(from)?;
+        let parent = from
+            .parent()
+            .ok_or_else(|| InstallError::OutsideScope { path: from.clone() })?;
+        let to = parent.join(new_name);
+        if to == from {
+            return Ok((
+                from.clone(),
+                Outcome::one(Change::NoChange {
+                    path: from,
+                    reason: "already the directory's name",
+                }),
+            ));
+        }
+        let outcome = self.move_origin(&from, &to)?;
+        Ok((to, outcome))
+    }
+
     /// Moves a skill's origin between two directories Skillbase owns, taking
     /// every symlink that pointed at it along.
     ///
@@ -1123,7 +1731,9 @@ impl Installer {
     /// each one is broken only for the length of one rename.
     ///
     /// If a link cannot be repointed the origin is moved back and every link is
-    /// restored, so a failure leaves the skill where it was.
+    /// put back, so a failure leaves the skill where it was. A link that will
+    /// not go back does not stop the ones after it; see
+    /// [`Installer::undo_move_origin`].
     fn move_origin(&self, from: &Path, to: &Path) -> Result<Outcome, InstallError> {
         let from = self.ensure_in_scope(from)?;
         let to = self.ensure_in_scope(to)?;
@@ -1144,16 +1754,66 @@ impl Installer {
         for link in &links {
             match self.place_symlink(link, &to) {
                 Ok(placed) => outcome.changes.extend(placed.changes),
-                Err(e) => {
-                    let _ = fs::rename(&to, &from);
-                    for link in &links {
-                        let _ = self.place_symlink(link, &from);
-                    }
-                    return Err(e);
+                Err(cause) => {
+                    return Err(self.undo_move_origin(&from, &to, &links, outcome, cause));
                 }
             }
         }
         Ok(outcome)
+    }
+
+    /// Puts an origin and the links to it back where they were after a move
+    /// failed part-way.
+    ///
+    /// Returns `cause` unchanged when everything went back. When the undo
+    /// itself failed it returns an [`InstallError::Rollback`] naming both
+    /// failures and where the skill's files ended up, because a message that
+    /// reports only `cause` describes a state the disk is no longer in.
+    ///
+    /// `done` is what the move had managed before it stopped, and it is
+    /// carried on the returned error in the one case where it still stands:
+    /// the directory would not go back.
+    fn undo_move_origin(
+        &self,
+        from: &Path,
+        to: &Path,
+        links: &[PathBuf],
+        done: Outcome,
+        cause: InstallError,
+    ) -> InstallError {
+        if let Err(e) = fs::rename(to, from) {
+            // The directory is still at `to`, so the move and every link
+            // already repointed at it stand.
+            return InstallError::Rollback {
+                cause: Box::new(InstallError::partial(done, cause)),
+                undo: Box::new(InstallError::io(to, e)),
+                at: to.to_path_buf(),
+                dangling_links: false,
+            };
+        }
+        // Every link is tried even after one has failed. The links past the
+        // failure point at `to`, which no longer exists, and each one that
+        // does go back is one fewer dangling link for the user to repair by
+        // hand.
+        let mut undo = None;
+        for link in links {
+            if let Err(e) = self.place_symlink(link, from)
+                && undo.is_none()
+            {
+                undo = Some(e);
+            }
+        }
+        match undo {
+            // The directory went back, so `done` no longer describes the disk;
+            // what stands is the links that would not follow it.
+            Some(undo) => InstallError::Rollback {
+                cause: Box::new(cause),
+                undo: Box::new(undo),
+                at: from.to_path_buf(),
+                dangling_links: true,
+            },
+            None => cause,
+        }
     }
 
     /// Every symlink in a directory Skillbase manages that resolves to
@@ -1168,7 +1828,10 @@ impl Installer {
     /// the same order every time.
     fn links_pointing_at(&self, target: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
-        for root in self.roots.scope_roots() {
+        // The managed roots, not the scope roots: a link in the trash was
+        // deleted along with the skill it belonged to, and repointing it would
+        // put a live link back into a directory nothing reads.
+        for root in self.roots.managed_roots() {
             let Ok(entries) = fs::read_dir(&root) else {
                 continue;
             };
@@ -1282,24 +1945,67 @@ impl Installer {
         })
     }
 
-    /// Removes a directory that has been shown to be real, never a symlink.
-    fn remove_real_dir(&self, path: &Path) -> Result<Outcome, InstallError> {
+    /// Takes away a directory that has been shown to be real, never a symlink,
+    /// by moving it into the trash.
+    ///
+    /// Nothing here calls [`fs::remove_dir_all`] on a user's directory. A skill
+    /// Skillbase did not download is the only copy of something a person wrote,
+    /// and a confirmation cannot promise the delete is recoverable unless the
+    /// delete actually is. The directory is renamed under
+    /// [`Roots::trash_dir`], and the change reports where it landed.
+    ///
+    /// [`Roots::trash_dir`]: crate::registry::Roots::trash_dir
+    pub(crate) fn remove_real_dir(&self, path: &Path) -> Result<Outcome, InstallError> {
         let path = self.ensure_in_scope(path)?;
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => Err(InstallError::NotALink {
                 path,
                 kind: "symlink",
             }),
-            Ok(meta) if meta.is_dir() => {
-                fs::remove_dir_all(&path).map_err(|e| InstallError::io(&path, e))?;
-                Ok(Outcome::one(Change::RemovedDirectory { path }))
-            }
+            Ok(meta) if meta.is_dir() => self.move_to_trash(&path),
             Ok(_) => Err(InstallError::NotALink { path, kind: "file" }),
             Err(_) => Ok(Outcome::one(Change::NoChange {
                 path,
                 reason: "not there",
             })),
         }
+    }
+
+    /// Renames a directory into `~/.skillbase/trash/<name>-<unix timestamp>`.
+    ///
+    /// A rename is atomic and costs nothing however large the skill is. It only
+    /// fails outright across a filesystem boundary — an agent directory on an
+    /// external volume, say — and that is the one case that falls back to
+    /// copying the tree and then removing the original. If that removal fails
+    /// the error carries the copy, because otherwise the user is left with the
+    /// same skill in two places and nothing that says so.
+    fn move_to_trash(&self, path: &Path) -> Result<Outcome, InstallError> {
+        let trash = self.roots.trash_dir();
+        create_dir_all(&trash)?;
+        let dest = self.ensure_in_scope(&trash.join(trash_name(path, &trash)))?;
+
+        if let Err(rename_error) = fs::rename(path, &dest) {
+            if !crosses_filesystems(&rename_error) {
+                return Err(InstallError::io(path, rename_error));
+            }
+            copy_dir(path, &dest)?;
+            if let Err(e) = fs::remove_dir_all(path) {
+                // The copy is in the trash and the original is still where it
+                // was. Reporting the copy is what keeps the user from a
+                // duplicate nothing told them about.
+                return Err(InstallError::partial(
+                    Outcome::one(Change::Copied {
+                        from: path.to_path_buf(),
+                        to: dest.clone(),
+                    }),
+                    InstallError::io(path, e),
+                ));
+            }
+        }
+        Ok(Outcome::one(Change::MovedToTrash {
+            from: path.to_path_buf(),
+            to: dest,
+        }))
     }
 
     /// Moves a link or directory between two managed directories.
@@ -1450,25 +2156,145 @@ fn create_dir_all(path: &Path) -> Result<(), InstallError> {
     fs::create_dir_all(path).map_err(|e| InstallError::io(path, e))
 }
 
+/// The name a directory takes in the trash: `<name>-<unix timestamp>`.
+///
+/// The timestamp is what tells one delete of `code-review` from the next. It is
+/// not enough on its own: deleting a skill that was copied into eight agent
+/// directories moves nine directories with the same name within one second, so
+/// a name already taken gets a counter as well.
+fn trash_name(path: &Path, trash: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "skill".to_string());
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let stamped = format!("{name}-{seconds}");
+    if fs::symlink_metadata(trash.join(&stamped)).is_err() {
+        return stamped;
+    }
+    for n in 2u32.. {
+        let candidate = format!("{stamped}-{n}");
+        if fs::symlink_metadata(trash.join(&candidate)).is_err() {
+            return candidate;
+        }
+    }
+    stamped
+}
+
+/// True when a rename failed because the two paths are on different
+/// filesystems, which is the one failure a copy can still get past.
+pub(crate) fn crosses_filesystems(error: &std::io::Error) -> bool {
+    // EXDEV, 18 on every platform this runs on. Matched by number as well as by
+    // kind because the kind was only classified recently and an older libc
+    // still reports it as `Uncategorized`.
+    error.kind() == std::io::ErrorKind::CrossesDevices || error.raw_os_error() == Some(18)
+}
+
+/// The name a checkout keeps its history under, which an import leaves behind.
+const GIT_DIR: &str = ".git";
+
+/// What a copy takes with it.
+#[derive(Debug, Clone, Copy)]
+enum CopyRule<'a> {
+    /// Every entry, symlinks recreated exactly as they were written. Used for
+    /// directories that are already inside a managed scope, where the tree is
+    /// one Skillbase or an agent put there.
+    Everything,
+    /// A skill being imported from outside every scope, whose tree is the
+    /// user's own and may hold anything: `.git` and [`COPY_MARKER`] are left
+    /// behind, and so is a symlink that points out of `root`, so a copy can
+    /// only ever take what is under the directory the user picked.
+    Import {
+        /// The canonicalized root of the tree being copied.
+        root: &'a Path,
+    },
+}
+
+impl CopyRule<'_> {
+    /// True when an entry of this name is not copied at all.
+    fn skips(&self, name: &std::ffi::OsStr) -> bool {
+        match self {
+            Self::Everything => false,
+            Self::Import { .. } => name == GIT_DIR || name == COPY_MARKER,
+        }
+    }
+
+    /// True when a symlink at `at`, written as `target`, is copied.
+    ///
+    /// Never followed either way: this decides between recreating the link and
+    /// leaving it out.
+    fn keeps_link(&self, at: &Path, target: &Path) -> bool {
+        let root = match self {
+            Self::Everything => return true,
+            Self::Import { root } => root,
+        };
+        let absolute = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            match at.parent() {
+                Some(parent) => parent.join(target),
+                None => return false,
+            }
+        };
+        normalize_lexical(&absolute).is_some_and(|resolved| resolved.starts_with(root))
+    }
+}
+
 /// Copies a directory tree, following nothing.
-fn copy_dir(from: &Path, to: &Path) -> Result<(), InstallError> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<(), InstallError> {
+    copy_tree(from, to, CopyRule::Everything)
+}
+
+/// Copies a directory tree, following nothing and taking the entries `rule`
+/// allows.
+fn copy_tree(from: &Path, to: &Path, rule: CopyRule<'_>) -> Result<(), InstallError> {
     create_dir_all(to)?;
     let entries = fs::read_dir(from).map_err(|e| InstallError::io(from, e))?;
     for entry in entries {
         let entry = entry.map_err(|e| InstallError::io(from, e))?;
+        if rule.skips(&entry.file_name()) {
+            continue;
+        }
         let source = entry.path();
         let target = to.join(entry.file_name());
         let meta = fs::symlink_metadata(&source).map_err(|e| InstallError::io(&source, e))?;
         if meta.is_dir() {
-            copy_dir(&source, &target)?;
+            copy_tree(&source, &target, rule)?;
         } else if meta.file_type().is_symlink() {
             let link = fs::read_link(&source).map_err(|e| InstallError::io(&source, e))?;
+            if !rule.keeps_link(&source, &link) {
+                continue;
+            }
             symlink(&link, &target).map_err(|e| InstallError::io(&target, e))?;
         } else {
             fs::copy(&source, &target).map_err(|e| InstallError::io(&source, e))?;
         }
     }
     Ok(())
+}
+
+/// The name an imported directory takes: the one discovery would show it under,
+/// in the shape a directory name has to be.
+///
+/// The frontmatter `name` wins, because that is the name the agents use and the
+/// name the user will look for. It is slugified when it is not already
+/// kebab-case — `My Skill` becomes `my-skill` rather than being refused — and
+/// the directory's own name stands in when the frontmatter has no usable one,
+/// which is what discovery falls back to as well.
+fn import_name(source: &Path) -> String {
+    let frontmatter = fs::read_to_string(source.join(SKILL_FILE_NAME))
+        .ok()
+        .and_then(|text| SkillDoc::parse(&text).ok())
+        .and_then(|doc| doc.frontmatter.name().map(str::to_owned))
+        .filter(|name| !name.trim().is_empty());
+    match frontmatter {
+        Some(name) if is_kebab_case(&name) => name,
+        Some(name) => slugify(&name),
+        None => slugify(&source.file_name().unwrap_or_default().to_string_lossy()),
+    }
 }
 
 /// What a single path in a skill directory is, for the purpose of comparing
@@ -2311,6 +3137,143 @@ mod tests {
         assert!(outside.is_dir());
     }
 
+    // -- rename ---------------------------------------------------------------
+
+    #[test]
+    fn rename_moves_the_directory_and_repoints_every_link_to_it() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let origin = fx.store().join("shared-one");
+        // Two links and one parked in a disabled directory, so the repoint has
+        // to cover more than the one agent the fixture starts with.
+        installer.link("shared-one", &origin, cursor()).unwrap();
+        fx.link_rel(
+            ".claude/skills-disabled/shared-one",
+            "../../.agents/skills/shared-one",
+        );
+
+        let (to, outcome) = installer.rename(&origin, "shared-uno").unwrap();
+
+        assert_eq!(to, fx.store().join("shared-uno"));
+        assert_eq!(
+            outcome.changes[0],
+            Change::Moved {
+                from: origin.clone(),
+                to: to.clone(),
+            }
+        );
+        assert!(!origin.exists(), "the old directory is gone");
+        assert!(to.join(SKILL_FILE_NAME).is_file());
+        // The links keep their old names — they are named for the skill the
+        // frontmatter has not been rewritten to yet — and they resolve to the
+        // directory under its new one.
+        for link in [
+            fx.agent("claude-code").join("shared-one"),
+            fx.agent("cursor").join("shared-one"),
+            fx.home().join(".claude/skills-disabled/shared-one"),
+        ] {
+            assert_eq!(
+                fs::canonicalize(&link).unwrap(),
+                to,
+                "{} follows the directory",
+                link.display()
+            );
+        }
+        assert_eq!(
+            fs::read_link(fx.agent("cursor").join("shared-one")).unwrap(),
+            Path::new("../../.agents/skills/shared-uno"),
+            "and the new target is relative, like every other link"
+        );
+    }
+
+    #[test]
+    fn rename_keeps_the_parent_so_a_hidden_skill_stays_hidden() {
+        let fx = Fixture::realistic();
+        let (to, _) = fx
+            .installer()
+            .rename(&fx.private().join("hidden-one"), "hidden-uno")
+            .unwrap();
+
+        assert_eq!(to, fx.private().join("hidden-uno"));
+        assert!(
+            !fx.store().join("hidden-uno").exists(),
+            "renaming does not share a hidden skill"
+        );
+    }
+
+    #[test]
+    fn rename_refuses_a_name_that_is_not_kebab_case_and_changes_nothing() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+
+        for name in ["Shared One", "shared_one", "", "-shared", "shared/one"] {
+            assert!(
+                matches!(
+                    fx.installer().rename(&fx.store().join("shared-one"), name),
+                    Err(InstallError::InvalidName { .. })
+                ),
+                "{name} should have been refused"
+            );
+        }
+        assert_eq!(before, listing(fx.home()), "a refusal changes nothing");
+    }
+
+    #[test]
+    fn rename_refuses_a_name_another_directory_already_holds() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+
+        let err = fx
+            .installer()
+            .rename(&fx.store().join("shared-one"), "shared-two")
+            .unwrap_err();
+
+        assert!(matches!(err, InstallError::AlreadyExists { .. }));
+        assert_eq!(before, listing(fx.home()), "a refusal changes nothing");
+    }
+
+    #[test]
+    fn renaming_to_the_name_it_already_has_does_nothing() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+
+        let (to, outcome) = fx
+            .installer()
+            .rename(&fx.store().join("shared-one"), "shared-one")
+            .unwrap();
+
+        assert_eq!(to, fx.store().join("shared-one"));
+        assert!(outcome.is_noop());
+        assert_eq!(before, listing(fx.home()));
+    }
+
+    #[test]
+    fn rename_refuses_a_path_outside_the_scopes() {
+        let fx = Fixture::realistic();
+        let outside = fx.home().join("Documents/secret");
+
+        assert!(matches!(
+            fx.installer().rename(&outside, "not-a-secret"),
+            Err(InstallError::OutsideScope { .. })
+        ));
+        assert!(outside.is_dir());
+    }
+
+    #[test]
+    fn rename_and_rename_back_leaves_the_tree_as_it_was() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+        let installer = fx.installer();
+
+        let (to, _) = installer
+            .rename(&fx.store().join("shared-one"), "shared-uno")
+            .unwrap();
+        assert_ne!(before, listing(fx.home()));
+
+        installer.rename(&to, "shared-one").unwrap();
+        assert_eq!(before, listing(fx.home()));
+    }
+
     // -- disable and enable -------------------------------------------------
 
     #[test]
@@ -2446,6 +3409,45 @@ mod tests {
         assert_eq!(plan.link_count(), 1, "a parked link still counts");
     }
 
+    /// Both leave `origin` empty, and a caller that has to know whether the
+    /// skill's bytes are still somewhere cannot tell them apart from that.
+    #[test]
+    fn plan_delete_separates_an_origin_that_is_gone_from_one_out_of_scope() {
+        let fx = Fixture::realistic();
+        // A skill Claude Code reaches through a link into a directory Skillbase
+        // does not manage, so discovery resolves its origin outside every
+        // scope.
+        fx.skill("Documents/skills/outside-one", "outside-one");
+        fx.link_rel(
+            ".claude/skills/outside-one",
+            "../../Documents/skills/outside-one",
+        );
+        let installer = fx.installer();
+        let scan = fx.scan();
+
+        let plan = installer.plan_delete(scan.get("shared-one").unwrap());
+        assert_eq!(plan.origin, Some(fx.shared().join("shared-one")));
+        assert!(!plan.origin_missing);
+
+        // Outside every scope: the directory is untouched and still there, so
+        // the plan lists it as left alone rather than as gone.
+        let outside = scan.get("outside-one").unwrap();
+        let plan = installer.plan_delete(outside);
+        assert_eq!(plan.origin, None);
+        assert!(!plan.origin_missing);
+        assert!(plan.skipped.contains(&outside.origin));
+
+        // Removed between the scan and the plan.
+        fs::remove_dir_all(fx.shared().join("shared-one")).unwrap();
+        let plan = installer.plan_delete(scan.get("shared-one").unwrap());
+        assert_eq!(plan.origin, None);
+        assert!(plan.origin_missing);
+        assert!(
+            plan.skipped.is_empty(),
+            "the origin was in scope, so nothing was left alone for being outside one"
+        );
+    }
+
     #[test]
     fn delete_removes_every_link_and_then_the_origin() {
         let fx = Fixture::realistic();
@@ -2495,6 +3497,462 @@ mod tests {
             Err(InstallError::NotALink { .. })
         ));
         assert!(fx.agent("claude-code").join("claude-only").is_dir());
+    }
+
+    // -- delete is recoverable -------------------------------------------------
+
+    /// The one entry in the trash, as (name, path).
+    fn trashed(fx: &Fixture) -> Vec<(String, PathBuf)> {
+        let mut found: Vec<_> = fs::read_dir(fx.roots().trash_dir())
+            .expect("the trash directory")
+            .flatten()
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn delete_moves_the_origin_to_the_trash_instead_of_destroying_it() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let plan = installer.plan_delete(fx.scan().get("shared-one").unwrap());
+
+        let outcome = installer.delete(&plan).unwrap();
+
+        assert!(
+            !fx.shared().join("shared-one").exists(),
+            "gone from the store"
+        );
+        let entries = trashed(&fx);
+        assert_eq!(entries.len(), 1);
+        let (name, path) = &entries[0];
+        assert!(
+            name.starts_with("shared-one-"),
+            "the trashed name carries the skill's name: {name}"
+        );
+        assert!(
+            name.trim_start_matches("shared-one-")
+                .chars()
+                .all(|c| c.is_ascii_digit()),
+            "and a unix timestamp: {name}"
+        );
+        assert!(
+            fs::read_to_string(path.join(SKILL_FILE_NAME))
+                .unwrap()
+                .contains("shared-one"),
+            "the bytes are still there to be got back"
+        );
+        assert!(
+            outcome.changes.contains(&Change::MovedToTrash {
+                from: fx.shared().join("shared-one"),
+                to: path.clone(),
+            }),
+            "and the outcome names where it went: {:?}",
+            outcome.changes
+        );
+        assert!(
+            outcome
+                .describe_under(fx.home())
+                .contains("moved ~/.agents/skills/shared-one to the trash at ~/.skillbase/trash/"),
+            "{}",
+            outcome.describe_under(fx.home())
+        );
+    }
+
+    #[test]
+    fn deleting_two_directories_of_the_same_name_keeps_both_in_the_trash() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        // `copied-around` is the origin in the store plus one real copy under
+        // Gemini: one delete, two directories of the same name, one second.
+        let plan = installer.plan_delete(fx.scan().get("copied-around").unwrap());
+        assert_eq!(plan.copy_count(), 1);
+
+        installer.delete(&plan).unwrap();
+
+        let entries = trashed(&fx);
+        assert_eq!(
+            entries.len(),
+            2,
+            "neither one overwrote the other: {entries:?}"
+        );
+        for (_, path) in &entries {
+            assert!(path.join(SKILL_FILE_NAME).is_file());
+        }
+    }
+
+    #[test]
+    fn a_deleted_skill_can_be_imported_back_out_of_the_trash() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let plan = installer.plan_delete(fx.scan().get("shared-one").unwrap());
+        installer.delete(&plan).unwrap();
+        let entries = trashed(&fx);
+        assert_eq!(entries.len(), 1);
+        let (_, trashed_dir) = &entries[0];
+
+        // The delete told the user the skill can be got back, and this is the
+        // operation that gets it back: the trash is not a directory Skillbase
+        // manages, so importing out of it is an import like any other.
+        let (dir, outcome) = installer
+            .import(trashed_dir, &ImportOptions::new())
+            .expect("a trashed directory imports");
+
+        assert_eq!(dir, fx.store().join("shared-one"));
+        assert_eq!(
+            outcome.changes,
+            vec![Change::Copied {
+                from: trashed_dir.clone(),
+                to: dir.clone(),
+            }]
+        );
+        assert!(
+            fx.scan().get("shared-one").is_some(),
+            "it is back in the list"
+        );
+        assert!(
+            trashed_dir.join(SKILL_FILE_NAME).is_file(),
+            "an import copies, so the trashed directory is still there"
+        );
+    }
+
+    #[test]
+    fn a_deleted_skill_does_not_come_back_in_a_scan() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let plan = installer.plan_delete(fx.scan().get("shared-one").unwrap());
+        installer.delete(&plan).unwrap();
+        assert!(
+            fx.scan().get("shared-one").is_none(),
+            "the trash is a scope Skillbase writes to, never one it reads"
+        );
+    }
+
+    // -- a half-finished operation reports the damage --------------------------
+
+    #[test]
+    fn delete_reports_the_links_it_removed_before_it_stopped() {
+        let fx = Fixture::realistic();
+        let plan = DeletePlan {
+            name: "shared-one".into(),
+            origin: None,
+            // The second path is a real directory, so the delete refuses it —
+            // after the first link is already gone.
+            links: vec![
+                fx.agent("claude-code").join("shared-one"),
+                fx.agent("claude-code").join("claude-only"),
+            ],
+            ..DeletePlan::default()
+        };
+
+        let error = fx.installer().delete(&plan).unwrap_err();
+
+        let done = error.completed().expect("the removed link is reported");
+        assert_eq!(
+            done.changes,
+            [Change::RemovedSymlink {
+                path: fx.agent("claude-code").join("shared-one")
+            }]
+        );
+        assert!(matches!(
+            error,
+            InstallError::Partial { ref source, .. } if matches!(**source, InstallError::NotALink { .. })
+        ));
+        let message = error.describe_under(fx.home());
+        assert!(
+            message.starts_with("removed the link ~/.claude/skills/shared-one\nThen it stopped: "),
+            "{message}"
+        );
+        assert!(message.contains("A real directory already sits at ~/.claude/skills/claude-only"));
+    }
+
+    #[test]
+    fn a_delete_that_changed_nothing_stays_the_plain_refusal() {
+        let fx = Fixture::realistic();
+        let plan = DeletePlan {
+            name: "claude-only".into(),
+            origin: None,
+            links: vec![fx.agent("claude-code").join("claude-only")],
+            ..DeletePlan::default()
+        };
+        let error = fx.installer().delete(&plan).unwrap_err();
+        assert!(matches!(error, InstallError::NotALink { .. }));
+        assert!(error.completed().is_none(), "nothing to report");
+    }
+
+    #[test]
+    fn consolidate_reports_the_copy_it_took_away_before_it_stopped() {
+        let fx = Fixture::realistic();
+        fan_out(&fx);
+        // A file where a duplicate directory should be: the second entry is
+        // refused, after the first has already been replaced.
+        let blocked = fx.write_file(".cursor/skills/blocked", "not a directory\n");
+        let origin = fx.shared().join("fanned-out");
+        let plan = ConsolidatePlan {
+            name: "fanned-out".into(),
+            origin: origin.clone(),
+            duplicates: vec![
+                Duplicate {
+                    path: fx.agent("claude-code").join("fanned-out"),
+                    agent_id: "claude-code",
+                    diff: ContentDiff::default(),
+                    forced: false,
+                },
+                Duplicate {
+                    path: blocked.clone(),
+                    agent_id: "cursor",
+                    diff: ContentDiff::default(),
+                    forced: false,
+                },
+            ],
+            skipped: Vec::new(),
+        };
+
+        let error = fx.installer().consolidate(&plan).unwrap_err();
+
+        let done = error.completed().expect("the replaced copy is reported");
+        assert!(
+            matches!(done.changes[0], Change::MovedToTrash { .. }),
+            "{:?}",
+            done.changes
+        );
+        assert!(matches!(done.changes[1], Change::CreatedSymlink { .. }));
+        let message = error.describe_under(fx.home());
+        assert!(
+            message.contains("moved ~/.claude/skills/fanned-out to the trash at"),
+            "{message}"
+        );
+        assert!(message.contains("Then it stopped: "), "{message}");
+        assert!(blocked.is_file(), "the file that was refused is untouched");
+    }
+
+    // -- messages that name a next step ---------------------------------------
+
+    #[test]
+    fn a_permission_failure_names_the_path_and_what_to_do_about_it() {
+        let error = InstallError::io(
+            Path::new("/Users/someone/.claude/skills/thing"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let message = error.describe_under(Path::new("/Users/someone"));
+        assert_eq!(
+            message,
+            "Skillbase is not allowed to write to ~/.claude/skills/thing. Check that path in \
+             Finder with File > Get Info, give yourself write access, then try again."
+        );
+        assert!(
+            !message.contains("os error"),
+            "the errno is not a next step"
+        );
+    }
+
+    #[test]
+    fn an_io_failure_that_is_not_a_permission_failure_still_names_the_error() {
+        let error = InstallError::io(
+            Path::new("/Users/someone/.claude/skills/thing"),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert!(
+            error
+                .describe_under(Path::new("/Users/someone"))
+                .starts_with("~/.claude/skills/thing: ")
+        );
+    }
+
+    #[test]
+    fn a_refusal_writes_the_home_directory_as_a_tilde() {
+        let home = Path::new("/Users/someone");
+        let error = InstallError::AlreadyExists {
+            path: home.join(".agents/skills/thing"),
+        };
+        assert_eq!(
+            error.describe_under(home),
+            "~/.agents/skills/thing is already taken. Rename or remove what is there, then try \
+             again."
+        );
+        assert!(
+            error.to_string().contains("/Users/someone/.agents"),
+            "Display still writes the path in full, for a log"
+        );
+        assert_eq!(
+            InstallError::AlreadyExists {
+                path: PathBuf::from("/opt/skills/thing")
+            }
+            .describe_under(home),
+            "/opt/skills/thing is already taken. Rename or remove what is there, then try again.",
+            "a path outside home is left alone"
+        );
+    }
+
+    #[test]
+    fn a_failed_rollback_names_both_failures_and_where_the_skill_ended_up() {
+        let home = Path::new("/Users/someone");
+        let error = InstallError::Rollback {
+            cause: Box::new(InstallError::NotALink {
+                path: home.join(".claude/skills/thing"),
+                kind: "directory",
+            }),
+            undo: Box::new(InstallError::io(
+                home.join(".agents/skills/thing"),
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            )),
+            at: home.join(".agents/skills/thing"),
+            dangling_links: false,
+        };
+
+        let message = error.describe_under(home);
+        let lines: Vec<&str> = message.lines().collect();
+        assert_eq!(
+            lines[0],
+            "A real directory already sits at ~/.claude/skills/thing. Rename or remove it, then \
+             try again."
+        );
+        assert!(
+            lines[1]
+                .starts_with("Putting things back failed too: Skillbase is not allowed to write"),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(
+            lines[2],
+            "The skill's files are at ~/.agents/skills/thing. Check that path in Finder before \
+             trying again."
+        );
+    }
+
+    #[test]
+    fn a_rollback_that_left_links_behind_says_so() {
+        let home = Path::new("/Users/someone");
+        let error = InstallError::Rollback {
+            cause: Box::new(InstallError::NotALink {
+                path: home.join(".claude/skills/thing"),
+                kind: "directory",
+            }),
+            undo: Box::new(InstallError::io(
+                home.join(".claude/skills/thing"),
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            )),
+            at: home.join(".agents/skills/thing"),
+            dangling_links: true,
+        };
+
+        let last = error
+            .describe_under(home)
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            last,
+            "The skill's files are at ~/.agents/skills/thing, but some links to it may still \
+             point at the path it was moved to, which is no longer there. Check that path in \
+             Finder before trying again.",
+            "the files being back is not the whole state"
+        );
+    }
+
+    #[test]
+    fn a_rollback_reports_the_changes_its_cause_recorded() {
+        let home = Path::new("/Users/someone");
+        let moved = Change::Moved {
+            from: home.join(".agents/skills/shared-one"),
+            to: home.join(".agents/skills/shared-uno"),
+        };
+        let error = InstallError::Rollback {
+            cause: Box::new(InstallError::partial(
+                Outcome::one(moved.clone()),
+                InstallError::NotALink {
+                    path: home.join(".claude/skills/shared-one"),
+                    kind: "directory",
+                },
+            )),
+            undo: Box::new(InstallError::io(
+                home.join(".agents/skills/shared-uno"),
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            )),
+            at: home.join(".agents/skills/shared-uno"),
+            dangling_links: false,
+        };
+
+        let done = error
+            .completed()
+            .expect("a rollback always changed the disk");
+        assert_eq!(done.changes, [moved], "the rename that still stands");
+        assert!(!done.is_noop());
+    }
+
+    #[test]
+    fn a_rollback_whose_cause_recorded_nothing_still_reports_a_change() {
+        let home = Path::new("/Users/someone");
+        let error = InstallError::Rollback {
+            cause: Box::new(InstallError::NotALink {
+                path: home.join(".claude/skills/thing"),
+                kind: "directory",
+            }),
+            undo: Box::new(InstallError::io(
+                home.join(".agents/skills/thing"),
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            )),
+            at: home.join(".agents/skills/thing"),
+            dangling_links: false,
+        };
+
+        let done = error
+            .completed()
+            .expect("a rollback always changed the disk");
+        assert_eq!(
+            done.changes,
+            [Change::NotUndone {
+                path: home.join(".agents/skills/thing")
+            }]
+        );
+        assert!(
+            !done.is_noop(),
+            "a caller asking whether to re-read the list has to be told yes"
+        );
+    }
+
+    #[test]
+    fn release_puts_the_link_back_when_the_move_fails_and_reports_the_move() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let dest = fx.agent("claude-code").join("shared-one");
+        let store = fx.store();
+
+        // A read-only store lets the link come off and then refuses the move,
+        // which is the shape the rollback exists for.
+        let before = fs::metadata(&store).unwrap().permissions();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::write(store.join(".probe"), "").is_ok() {
+            // Running as a user the permission bits do not stop, so there is
+            // nothing here to fail.
+            fs::remove_file(store.join(".probe")).ok();
+            fs::set_permissions(&store, before).unwrap();
+            return;
+        }
+
+        let error = installer.release("shared-one", &dest).unwrap_err();
+        fs::set_permissions(&store, before).unwrap();
+
+        assert!(matches!(error, InstallError::Io { .. }), "{error}");
+        assert!(
+            fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link went back, so the skill is still reachable"
+        );
+        assert_eq!(
+            fs::canonicalize(&dest).unwrap(),
+            fx.store().join("shared-one")
+        );
     }
 
     // -- consolidate ----------------------------------------------------------
@@ -2604,9 +4062,10 @@ mod tests {
             outcome
                 .changes
                 .iter()
-                .filter(|c| matches!(c, Change::RemovedDirectory { .. }))
+                .filter(|c| matches!(c, Change::MovedToTrash { .. }))
                 .count(),
-            2
+            2,
+            "the copies went to the trash, not to nowhere"
         );
     }
 
@@ -2931,7 +4390,7 @@ mod tests {
         let home = Path::new("/Users/someone");
         let mut outcome = Outcome::default();
         for n in 0..9 {
-            outcome.push(Change::RemovedDirectory {
+            outcome.push(Change::RemovedSymlink {
                 path: home.join(format!(".claude/skills/skill-{n}")),
             });
         }
@@ -2940,20 +4399,20 @@ mod tests {
         let lines: Vec<&str> = described.lines().collect();
 
         assert_eq!(lines.len(), Outcome::MAX_DESCRIBED + 1);
-        assert_eq!(lines[0], "deleted ~/.claude/skills/skill-0");
+        assert_eq!(lines[0], "removed the link ~/.claude/skills/skill-0");
         assert_eq!(lines[Outcome::MAX_DESCRIBED], "and 3 more changes");
         assert!(!described.contains("/Users/someone"));
     }
 
     #[test]
     fn describe_under_leaves_a_path_outside_home_alone() {
-        let outcome = Outcome::one(Change::RemovedDirectory {
+        let outcome = Outcome::one(Change::RemovedSymlink {
             path: PathBuf::from("/opt/skills/thing"),
         });
 
         assert_eq!(
             outcome.describe_under(Path::new("/Users/someone")),
-            "deleted /opt/skills/thing"
+            "removed the link /opt/skills/thing"
         );
     }
 
@@ -3062,6 +4521,327 @@ mod tests {
                 .unwrap()
                 .visible_to()
                 .contains(&"claude-code")
+        );
+    }
+    // -- import ---------------------------------------------------------------
+
+    #[test]
+    fn import_copies_a_directory_from_outside_into_the_store() {
+        let fx = Fixture::realistic();
+        let source = fx.skill("Downloads/my-skill", "my-skill");
+        fx.write_file("Downloads/my-skill/references/notes.md", "notes\n");
+
+        let (dir, outcome) = fx
+            .installer()
+            .import(&source, &ImportOptions::new())
+            .unwrap();
+
+        assert_eq!(dir, fx.store().join("my-skill"));
+        assert_eq!(
+            outcome.changes,
+            vec![Change::Copied {
+                from: source.clone(),
+                to: dir.clone(),
+            }],
+            "the one change says copied, not moved, because that is what happened"
+        );
+        assert!(dir.join("references/notes.md").is_file());
+        assert!(
+            source.join(SKILL_FILE_NAME).is_file(),
+            "an import leaves the user's own directory exactly where it was"
+        );
+
+        let found = fx.scan();
+        let imported = found.get("my-skill").unwrap();
+        assert!(imported.managed);
+        assert_eq!(imported.origin, dir);
+    }
+
+    #[test]
+    fn import_names_the_skill_from_its_frontmatter() {
+        let fx = Fixture::realistic();
+        let source = fx.skill("Downloads/downloaded-42", "pdf-tools");
+        let (dir, _) = fx
+            .installer()
+            .import(&source, &ImportOptions::new())
+            .unwrap();
+        assert_eq!(
+            dir,
+            fx.store().join("pdf-tools"),
+            "the frontmatter name is the name the agents use, so it is the directory's too"
+        );
+    }
+
+    #[test]
+    fn import_falls_back_when_the_frontmatter_has_no_usable_name() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+
+        let loud = fx.skill("Downloads/loud", "My Skill");
+        let (dir, _) = installer.import(&loud, &ImportOptions::new()).unwrap();
+        assert_eq!(dir, fx.store().join("my-skill"), "a name is slugified");
+
+        fx.write_file("Downloads/Some Folder/SKILL.md", "# No frontmatter\n");
+        let unparsed = fx.home().join("Downloads/Some Folder");
+        let (dir, _) = installer.import(&unparsed, &ImportOptions::new()).unwrap();
+        assert_eq!(
+            dir,
+            fx.store().join("some-folder"),
+            "with nothing in the frontmatter the directory's own name stands in"
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_directory_that_holds_no_skill_and_says_what_to_look_for() {
+        let fx = Fixture::realistic();
+        let repo = fx.dir("Downloads/some-repo");
+        fx.skill("Downloads/some-repo/skills/the-real-one", "the-real-one");
+        let before = listing(fx.home());
+
+        let error = fx
+            .installer()
+            .import(&repo, &ImportOptions::new())
+            .unwrap_err();
+
+        assert!(matches!(error, InstallError::NotASkill { .. }));
+        let message = error.describe_under(fx.home());
+        assert!(message.contains("~/Downloads/some-repo"), "{message}");
+        assert!(message.contains("SKILL.md"), "{message}");
+        assert!(
+            message.contains("skills"),
+            "picking the repository is the common mistake, so the message names the way \
+             out of it: {message}"
+        );
+        assert_eq!(before, listing(fx.home()), "nothing was written");
+    }
+
+    #[test]
+    fn import_refuses_a_file_and_points_at_the_folder_around_it() {
+        let fx = Fixture::realistic();
+        let source = fx.skill("Downloads/my-skill", "my-skill");
+        let error = fx
+            .installer()
+            .import(&source.join(SKILL_FILE_NAME), &ImportOptions::new())
+            .unwrap_err();
+
+        assert!(matches!(error, InstallError::NotASkill { .. }));
+        assert!(
+            error.describe_under(fx.home()).contains("folder"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_path_that_is_not_there() {
+        let fx = Fixture::realistic();
+        let error = fx
+            .installer()
+            .import(&fx.home().join("Downloads/gone"), &ImportOptions::new())
+            .unwrap_err();
+
+        assert!(matches!(error, InstallError::NotASkill { .. }));
+        assert!(
+            error.describe_under(fx.home()).contains("nothing at"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_source_that_is_already_managed_and_points_at_adopt() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let before = listing(fx.home());
+
+        for path in [
+            fx.store().join("shared-one"),
+            fx.private().join("hidden-one"),
+            fx.agent("claude-code").join("claude-only"),
+            fx.store(),
+            fx.agent("claude-code"),
+            // A directory that holds the store rather than sitting in it:
+            // copying it in would copy the store into itself.
+            fx.home().to_path_buf(),
+        ] {
+            let error = installer.import(&path, &ImportOptions::new()).unwrap_err();
+            assert!(
+                matches!(error, InstallError::AlreadyManaged { .. }),
+                "{} should have been refused, got {error}",
+                path.display()
+            );
+            assert!(
+                error.describe_under(fx.home()).contains("Adopt"),
+                "the message has to name the operation that does apply: {error}"
+            );
+        }
+        assert_eq!(before, listing(fx.home()));
+    }
+
+    #[test]
+    fn import_refuses_a_symlink_that_leads_back_into_a_managed_directory() {
+        let fx = Fixture::realistic();
+        fx.dir("Downloads");
+        let source = fx.home().join("Downloads/looks-outside");
+        symlink(fx.store().join("shared-one"), &source).unwrap();
+
+        let error = fx
+            .installer()
+            .import(&source, &ImportOptions::new())
+            .unwrap_err();
+        assert!(
+            matches!(error, InstallError::AlreadyManaged { .. }),
+            "a link is the skill it points at, and importing through one would make a \
+             second copy of it: {error}"
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_name_that_is_taken_and_keeps_both_when_asked() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let source = fx.dir("Downloads/shared-two");
+        fs::write(
+            source.join(SKILL_FILE_NAME),
+            "---\nname: shared-two\ndescription: The imported one.\n---\n",
+        )
+        .unwrap();
+
+        let error = installer
+            .import(&source, &ImportOptions::new())
+            .unwrap_err();
+        assert!(
+            matches!(&error, InstallError::AlreadyExists { path } if *path == fx.store().join("shared-two")),
+            "{error}"
+        );
+        assert!(
+            !fs::read_to_string(fx.store().join("shared-two/SKILL.md"))
+                .unwrap()
+                .contains("imported"),
+            "the skill that was there is untouched"
+        );
+
+        let (dir, _) = installer
+            .import(&source, &ImportOptions::new().named("shared-two-2"))
+            .unwrap();
+        assert_eq!(dir, fx.store().join("shared-two-2"));
+        assert!(
+            fs::read_to_string(dir.join(SKILL_FILE_NAME))
+                .unwrap()
+                .contains("imported")
+        );
+    }
+
+    #[test]
+    fn import_replaces_only_when_told_to_and_the_old_skill_is_recoverable() {
+        let fx = Fixture::realistic();
+        let source = fx.dir("Downloads/shared-two");
+        fs::write(
+            source.join(SKILL_FILE_NAME),
+            "---\nname: shared-two\ndescription: The imported one.\n---\n",
+        )
+        .unwrap();
+
+        let (dir, outcome) = fx
+            .installer()
+            .import(&source, &ImportOptions::new().replacing())
+            .unwrap();
+
+        assert_eq!(dir, fx.store().join("shared-two"));
+        assert!(
+            fs::read_to_string(dir.join(SKILL_FILE_NAME))
+                .unwrap()
+                .contains("imported")
+        );
+        let trashed = match outcome.changes.first() {
+            Some(Change::MovedToTrash { to, .. }) => to.clone(),
+            other => panic!("the skill that was replaced has to be recoverable: {other:?}"),
+        };
+        assert!(
+            fs::read_to_string(trashed.join(SKILL_FILE_NAME))
+                .unwrap()
+                .contains("The shared-two skill"),
+            "the old directory is in the trash, not gone"
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_name_override_that_is_not_a_usable_name() {
+        let fx = Fixture::realistic();
+        let source = fx.skill("Downloads/my-skill", "my-skill");
+        let before = listing(fx.home());
+
+        for name in ["Not Kebab", "under_score", "", "../escape"] {
+            let error = fx
+                .installer()
+                .import(&source, &ImportOptions::new().named(name))
+                .unwrap_err();
+            assert!(
+                matches!(error, InstallError::InvalidName { .. }),
+                "`{name}` should have been refused, got {error}"
+            );
+        }
+        assert_eq!(before, listing(fx.home()));
+    }
+
+    #[test]
+    fn import_leaves_the_checkouts_git_directory_behind() {
+        let fx = Fixture::realistic();
+        let source = fx.skill("Downloads/my-skill", "my-skill");
+        fx.write_file("Downloads/my-skill/.git/config", "[core]\n");
+        fx.write_file("Downloads/my-skill/.gitignore", "target\n");
+
+        let (dir, _) = fx
+            .installer()
+            .import(&source, &ImportOptions::new())
+            .unwrap();
+
+        assert!(
+            fs::symlink_metadata(dir.join(".git")).is_err(),
+            "the history is the checkout's, not the skill's"
+        );
+        assert!(
+            dir.join(".gitignore").is_file(),
+            "only the history is left behind, not everything with a dot"
+        );
+    }
+
+    #[test]
+    fn import_does_not_follow_a_symlink_out_of_the_source_tree() {
+        let fx = Fixture::realistic();
+        let source = fx.skill("Downloads/my-skill", "my-skill");
+        fx.write_file("Downloads/my-skill/references/inside.md", "inside\n");
+        fx.dir("Downloads/my-skill/scripts");
+        symlink("../references/inside.md", source.join("scripts/near.md")).unwrap();
+        symlink(
+            source.join("references/inside.md"),
+            source.join("also-inside.md"),
+        )
+        .unwrap();
+        symlink(fx.home().join("Documents/secret"), source.join("secret")).unwrap();
+        symlink("../../../Documents/secret", source.join("climbing-out")).unwrap();
+
+        let (dir, _) = fx
+            .installer()
+            .import(&source, &ImportOptions::new())
+            .unwrap();
+
+        assert!(
+            fs::symlink_metadata(dir.join("scripts/near.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a link that stays inside the tree is recreated as it was written"
+        );
+        assert!(fs::symlink_metadata(dir.join("also-inside.md")).is_ok());
+        for escaping in ["secret", "climbing-out"] {
+            assert!(
+                fs::symlink_metadata(dir.join(escaping)).is_err(),
+                "`{escaping}` points out of the tree, so it is left behind rather than \
+                 followed"
+            );
+        }
+        assert!(
+            !dir.join("secret/keep-me.txt").exists(),
+            "nothing outside the picked directory was copied"
         );
     }
 }
