@@ -35,6 +35,16 @@ pub const STORE_DIR: &str = SHARED_SKILLS_DIR;
 /// is reachable only through the links agents hold to it.
 pub const PRIVATE_DIR: &str = ".skillbase/private";
 
+/// Where a deleted directory is moved to instead of being destroyed, relative
+/// to the home directory.
+///
+/// Deleting a skill Skillbase did not download is deleting the only copy of
+/// something a person wrote, so nothing under a managed scope is removed
+/// recursively: it is renamed into here, under `<name>-<unix timestamp>`, and
+/// the notification names the path it landed at. Skillbase never empties this
+/// directory; the user does, in Finder, once they are sure.
+pub const TRASH_DIR: &str = ".skillbase/trash";
+
 /// The id of the shared scope, which is the `~/.agents/skills` directory itself
 /// rather than an agent that reads it.
 ///
@@ -445,6 +455,15 @@ impl Roots {
         self.home.join(PRIVATE_DIR)
     }
 
+    /// `~/.skillbase/trash`, where a deleted directory is moved to.
+    ///
+    /// In [`Roots::scope_roots`] so a delete is allowed to write into it, and
+    /// out of [`Roots::managed_roots`] so nothing that lands here counts as a
+    /// skill the user has.
+    pub fn trash_dir(&self) -> PathBuf {
+        self.home.join(TRASH_DIR)
+    }
+
     /// `~/.codex/config.toml`.
     pub fn codex_config(&self) -> PathBuf {
         self.home.join(".codex/config.toml")
@@ -462,14 +481,20 @@ impl Roots {
     }
 
     /// Every directory a destructive operation is allowed to touch: the store,
-    /// the private directory, each agent's global directory, and each disabled
-    /// directory.
+    /// the private directory, the trash, each agent's global directory, and
+    /// each disabled directory.
     ///
     /// Deduplicated and in registry order, with the store first. The store is
     /// also the shared scope's directory, so the shared entry adds nothing and
     /// is dropped by the deduplication.
+    ///
+    /// This is where writes are allowed, which is not the same question as
+    /// what Skillbase has: the trash is in this list because a delete has to
+    /// be able to write into it, and out of [`Roots::managed_roots`] because
+    /// nothing reads it. Ask this one before writing; ask the other before
+    /// deciding whether a directory is a skill the user already has.
     pub fn scope_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![self.store_dir(), self.private_dir()];
+        let mut roots = vec![self.store_dir(), self.private_dir(), self.trash_dir()];
         for agent in Registry::all() {
             let dir = self.agent_dir(agent);
             if !roots.contains(&dir) {
@@ -482,6 +507,22 @@ impl Roots {
             }
         }
         roots
+    }
+
+    /// Every directory whose content Skillbase manages: [`Roots::scope_roots`]
+    /// without the trash.
+    ///
+    /// A skill directory in one of these is one the user has, and discovery
+    /// finds it. A directory in the trash is neither: discovery never scans
+    /// the trash, so a deleted skill is not in the list, nothing can be
+    /// adopted out of it, and importing a folder that sits in it is an import
+    /// like any other.
+    pub fn managed_roots(&self) -> Vec<PathBuf> {
+        let trash = self.trash_dir();
+        self.scope_roots()
+            .into_iter()
+            .filter(|root| *root != trash)
+            .collect()
     }
 }
 
@@ -590,6 +631,7 @@ mod tests {
             roots.private_dir(),
             Path::new("/fake/home/.skillbase/private")
         );
+        assert_eq!(roots.trash_dir(), Path::new("/fake/home/.skillbase/trash"));
     }
 
     #[test]
@@ -598,6 +640,11 @@ mod tests {
         let paths = roots.scope_roots();
         assert_eq!(paths[0], Path::new("/fake/home/.agents/skills"));
         assert_eq!(paths[1], Path::new("/fake/home/.skillbase/private"));
+        assert_eq!(
+            paths[2],
+            Path::new("/fake/home/.skillbase/trash"),
+            "a delete has to be allowed to write into the trash"
+        );
         assert!(paths.contains(&PathBuf::from("/fake/home/.claude/skills-disabled")));
         let shared = PathBuf::from("/fake/home/.agents/skills");
         assert_eq!(
@@ -609,6 +656,25 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), paths.len());
+    }
+
+    #[test]
+    fn managed_roots_are_the_scope_roots_without_the_trash() {
+        let roots = Roots::new("/fake/home");
+        let managed = roots.managed_roots();
+        assert!(
+            !managed.contains(&roots.trash_dir()),
+            "a directory in the trash is not a skill Skillbase has: {managed:?}"
+        );
+        assert_eq!(managed[0], Path::new("/fake/home/.agents/skills"));
+        assert_eq!(managed[1], Path::new("/fake/home/.skillbase/private"));
+        assert!(managed.contains(&PathBuf::from("/fake/home/.claude/skills")));
+        assert!(managed.contains(&PathBuf::from("/fake/home/.claude/skills-disabled")));
+        assert_eq!(
+            managed.len(),
+            roots.scope_roots().len() - 1,
+            "the trash is the only difference"
+        );
     }
 
     #[test]

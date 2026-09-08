@@ -8,15 +8,21 @@
 //! the root view scans again, so the interface never asserts a state the
 //! filesystem does not back up.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::slice;
 
 use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{DialogButtonProps, DialogClose, DialogFooter};
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, TextareaState};
+use gpui_kit::component::input::{
+    Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
+};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::link::Link;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
@@ -33,21 +39,31 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, rems,
 };
 use skillbase_core::{
-    AgentDef, ConsolidatePlan, DeletePlan, DisableMode, Duplicate, InstallError, InstallOptions,
-    Installer, LocalState, LocationKind, Outcome, PRIVATE_ID, Provenance, Registry, RemoteCache,
-    RepoRef, Roots, SKILL_FILE_NAME, Skill, SkillDoc, SkillError, SkillLocation, UpdateReport,
-    UpdateStatus, local_state, repo_key,
+    AgentDef, Change, ConsolidatePlan, DeletePlan, DisableMode, Duplicate, InstallError,
+    InstallOptions, Installer, LocalState, LocationKind, MAX_NAME_LEN, Outcome, PRIVATE_ID,
+    Provenance, Registry, RemoteCache, RepoRef, Roots, SKILL_FILE_NAME, Skill, SkillDoc,
+    SkillError, SkillLocation, UpdateReport, UpdateStatus, content_digest, is_kebab_case,
+    local_state, repo_key,
 };
 
 use super::model::{
     Issue, Scan, SkillView, agent_label, ago, display_path, has_disable_state, short_sha,
 };
 use super::{
-    BAND_HEIGHT, PROSE_MAX_WIDTH, agent_icon, drag_band, install_skill, report, report_install,
+    BAND_HEIGHT, PROSE_MAX_WIDTH, agent_icon, cache_failure_notification,
+    delete_cache_failure_notification, drag_band, install_skill, remember_delete_cache_failure,
+    report, report_install, take_delete_cache_failure,
 };
 
 /// How many differing paths a duplicate lists before it starts counting.
 const DIFF_PATHS: usize = 6;
+
+/// What runs once the unsaved edits in the active tab have been dealt with.
+///
+/// Every way out of an edit — another skill, another scope, closing the window,
+/// quitting — is one of these, held until the user has said whether to save,
+/// discard, or stay.
+pub(crate) type Proceed = Box<dyn FnOnce(&mut Window, &mut App) + 'static>;
 
 /// What this pane tells the root view.
 pub enum DetailEvent {
@@ -101,6 +117,26 @@ struct Origin {
     /// Seconds since the Unix epoch when this repository was last asked about,
     /// or 0 when it never has been.
     checked_at: i64,
+    /// The commit sha the ref pointed at when this copy was installed.
+    ///
+    /// The commit, not the tree sha the update check compares: the tree sha
+    /// answers "has upstream changed?" and nothing else, while this is the one
+    /// GitHub's compare view will resolve. Empty for a skill installed before
+    /// Skillbase recorded it, and for one another tool installed; see
+    /// [`Upstream`] for what is offered instead.
+    recorded_commit: String,
+}
+
+/// The link out to GitHub under the update sentence.
+///
+/// Two shapes, and the label goes with the shape rather than being written
+/// once and reused: one of them is a comparison and the other is a directory
+/// listing, and a link that says "See what changed" over a listing is a link
+/// that lies.
+#[derive(Clone)]
+struct Upstream {
+    url: SharedString,
+    label: &'static str,
 }
 
 /// One entry in a skill directory, flattened depth-first.
@@ -179,8 +215,10 @@ pub struct DetailPane {
     scan: Option<Rc<Scan>>,
     skill: Option<SkillView>,
     source: Source,
-    /// The frontmatter description as it was when the file was read, so that a
-    /// form field can be told apart from one the user has not touched.
+    /// The frontmatter name and description as they were when the file was
+    /// read, so that a form field the user changed can be told apart from one
+    /// they never touched.
+    loaded_name: SharedString,
     loaded_description: SharedString,
     /// Everything in the skill directory, flattened depth-first. The rows the
     /// user clicks to open a file.
@@ -195,6 +233,10 @@ pub struct DetailPane {
     open: Vec<OpenFile>,
     /// The skill's duplicate directories and how each compares to the origin.
     duplicates: Duplicates,
+    /// The duplicate directories whose differing-path list has been asked for
+    /// in full. Empty by default: a copy that differs in ninety files would
+    /// otherwise push everything below it off the pane.
+    expanded_diffs: HashSet<PathBuf>,
     /// Whether the "Visible to" section is open. Closed on every selection,
     /// because the pane's usual job is the editor below it.
     visibility_open: bool,
@@ -214,6 +256,18 @@ pub struct DetailPane {
     /// dialog opens, so an acknowledgement never carries over to another
     /// skill or another day.
     update_acknowledged: bool,
+    /// What the discard confirmation should do once it is answered. Held here
+    /// rather than captured by the dialog, because the dialog's builder runs on
+    /// every frame and a continuation can only run once.
+    pending: Option<Proceed>,
+    name: Entity<InputState>,
+    /// Whether the directory a rename would move to is occupied, worked out
+    /// when the Name field changes rather than while the pane renders: the
+    /// answer costs a `symlink_metadata` call, and rendering asks for it on
+    /// every frame the user is typing in. `None` when the destination is free,
+    /// when the name is one the cheap rules refuse anyway, or when there is no
+    /// skill.
+    name_taken: Option<SharedString>,
     description: Entity<TextareaState>,
     body: Entity<EditorState>,
     dirty: bool,
@@ -229,6 +283,7 @@ impl EventEmitter<DetailEvent> for DetailPane {}
 
 impl DetailPane {
     pub fn new(roots: Roots, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("my-skill"));
         let description = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("What the skill does, and when an agent should load it.")
@@ -236,6 +291,9 @@ impl DetailPane {
         let body = cx.new(|cx| EditorState::new(window, cx).language("markdown"));
 
         let subscriptions = vec![
+            cx.subscribe(&name, |this, _, event: &InputEvent, cx| {
+                this.mark_name_edited(event, cx)
+            }),
             cx.subscribe(&description, |this, _, event: &InputEvent, cx| {
                 this.mark_edited(event, cx)
             }),
@@ -249,18 +307,23 @@ impl DetailPane {
             scan: None,
             skill: None,
             source: Source::Empty,
+            loaded_name: SharedString::default(),
             loaded_description: SharedString::default(),
             tree: Vec::new(),
             showing: Showing::Overview,
             tab_scroll: ScrollHandle::new(),
             open: Vec::new(),
             duplicates: Duplicates::None,
+            expanded_diffs: HashSet::new(),
             duplicates_generation: 0,
             remote: Remote::None,
             remote_generation: 0,
             updates: None,
             update_acknowledged: false,
             visibility_open: false,
+            pending: None,
+            name,
+            name_taken: None,
             description,
             body,
             dirty: false,
@@ -287,12 +350,19 @@ impl DetailPane {
         };
         self.scan = Some(scan);
         self.skill = skill;
+        // Both halves of the answer depend on the skill and the scan that have
+        // just arrived, and the disk half is not asked for again until the next
+        // keystroke.
+        self.refresh_name_taken(cx);
         if !same_file {
             // A different skill is a fresh question, so the section closes
             // again. Re-showing the same file — which is what follows every
             // mutation — leaves it as the user left it, or a switch flipped
             // inside it would close the section under the pointer.
             self.visibility_open = false;
+            // The expansions belong to the paths of the skill that was
+            // showing, and another skill's duplicates are other directories.
+            self.expanded_diffs.clear();
             // The open files belong to the skill that was showing. Another
             // skill's directory has its own, so the tabs close with it and the
             // pane comes back to the Overview.
@@ -330,7 +400,7 @@ impl DetailPane {
         let Some(skill) = self.skill.clone() else {
             self.source = Source::Empty;
             self.tree.clear();
-            self.set_fields("", "", window, cx);
+            self.set_fields("", "", "", window, cx);
             cx.notify();
             return;
         };
@@ -358,7 +428,7 @@ impl DetailPane {
                     Err(error) => {
                         this.tree.clear();
                         this.source = Source::Failed(error.to_string().into());
-                        this.set_fields("", "", window, cx);
+                        this.set_fields("", "", "", window, cx);
                         cx.notify();
                     }
                 }
@@ -449,10 +519,15 @@ impl DetailPane {
                     let checked_at = repo_ref_of(&provenance)
                         .and_then(|repo| cache.repo(&repo_key(&repo)).map(|r| r.checked_at))
                         .unwrap_or(0);
+                    let recorded_commit = cache
+                        .skill(&name)
+                        .map(|record| record.commit_sha.clone())
+                        .unwrap_or_default();
                     Origin {
                         local: local_state(&cache, &name, &dir),
                         provenance,
                         checked_at,
+                        recorded_commit,
                     }
                 })
                 .await;
@@ -466,6 +541,29 @@ impl DetailPane {
             .ok();
         })
         .detach();
+    }
+
+    /// Where to look at upstream, when there is a page worth opening.
+    ///
+    /// `None` when there is nothing upstream worth opening: a check that found
+    /// nothing new, or a source that is not a GitHub repository. The URL
+    /// itself is [`upstream_for`].
+    fn upstream_link(&self) -> Option<Upstream> {
+        let Remote::Ready(origin) = &self.remote else {
+            return None;
+        };
+        if !matches!(
+            self.update_status()?,
+            UpdateStatus::UpdateAvailable { .. } | UpdateStatus::NoBaseline { .. }
+        ) {
+            return None;
+        }
+        Some(upstream_for(
+            &repo_ref_of(&origin.provenance)?.slug(),
+            &origin.provenance.reference,
+            &origin.provenance.path,
+            &origin.recorded_commit,
+        ))
     }
 
     /// What the last check said about the selected skill.
@@ -496,6 +594,27 @@ impl DetailPane {
         skill.origin == self.roots.store_dir().join(skill.name.as_ref())
     }
 
+    /// True when the header offers Update, and so when the menu item does
+    /// anything. The two read the same conditions, so the menu never promises
+    /// an update the pane is not offering.
+    fn can_update(&self) -> bool {
+        self.skill
+            .as_ref()
+            .is_some_and(|skill| self.update_available() && self.updates_in_place(skill))
+    }
+
+    /// Open the "Visible to" section.
+    ///
+    /// Called after an install: the skill is on disk but no agent can see it
+    /// yet, and which agents get it is the next thing the user came here to
+    /// decide.
+    pub(crate) fn open_visibility(&mut self, cx: &mut Context<Self>) {
+        if !self.visibility_open {
+            self.visibility_open = true;
+            cx.notify();
+        }
+    }
+
     /// Accept, or take back, losing one divergent duplicate's edits.
     ///
     /// Nothing happens on disk here. It only changes what the confirmation
@@ -512,22 +631,29 @@ impl DetailPane {
         cx.notify();
     }
 
-    /// Put the file into the editor and the Description field.
+    /// Put the file into the editor and the Name and Description fields.
     fn adopt_source(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let description = SkillDoc::parse(text)
-            .ok()
+        let parsed = SkillDoc::parse(text).ok();
+        let name = parsed
+            .as_ref()
+            .and_then(|doc| doc.frontmatter.name().map(str::to_string))
+            .unwrap_or_default();
+        let description = parsed
+            .as_ref()
             .and_then(|doc| doc.frontmatter.description().map(str::to_string))
             .unwrap_or_default();
 
+        self.loaded_name = name.clone().into();
         self.loaded_description = description.clone().into();
         self.source = Source::Loaded;
         self.dirty = false;
-        self.set_fields(&description, text, window, cx);
+        self.set_fields(&name, &description, text, window, cx);
         cx.notify();
     }
 
     fn set_fields(
         &mut self,
+        name: &str,
         description: &str,
         body: &str,
         window: &mut Window,
@@ -535,12 +661,18 @@ impl DetailPane {
     ) {
         // `set_value` does not emit a change event, so loading never marks the
         // pane dirty.
+        self.name.update(cx, |state, cx| {
+            state.set_value(name.to_string(), window, cx)
+        });
         self.description.update(cx, |state, cx| {
             state.set_value(description.to_string(), window, cx)
         });
         self.body.update(cx, |state, cx| {
             state.set_value(body.to_string(), window, cx)
         });
+        // `set_value` emits no change event, so the check the change would have
+        // run is run here: this is where a new skill's name arrives.
+        self.refresh_name_taken(cx);
     }
 
     fn mark_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
@@ -548,6 +680,38 @@ impl DetailPane {
             self.dirty = true;
             cx.notify();
         }
+    }
+
+    /// [`Self::mark_edited`] for the Name field, which redraws on every
+    /// keystroke rather than only the first.
+    ///
+    /// What the field says about itself — the reason a name is refused, and
+    /// whether Save is offered — is worked out from its value while the pane
+    /// renders, so the pane has to render again each time that value changes.
+    /// The one part of that answer which touches the disk is worked out here
+    /// instead, once per keystroke rather than once per frame.
+    fn mark_name_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
+        if matches!(event, InputEvent::Change) {
+            self.dirty = true;
+            self.refresh_name_taken(cx);
+            cx.notify();
+        }
+    }
+
+    /// Ask the filesystem whether the rename now typed has anywhere to land,
+    /// and keep the answer for the frames that follow.
+    ///
+    /// Only asked for a name the cheap rules already accept, so an empty or
+    /// malformed name never reaches the disk.
+    fn refresh_name_taken(&mut self, cx: &mut Context<Self>) {
+        let typed = self.name.read(cx).value();
+        let typed = typed.trim();
+        self.name_taken = self.skill.as_ref().and_then(|skill| {
+            if name_rules(typed, skill, self.scan.as_deref()).is_some() {
+                return None;
+            }
+            destination_taken(typed, skill, &self.roots)
+        });
     }
 
     // ---------------------------------------------------------------- saving
@@ -563,7 +727,178 @@ impl DetailPane {
     ///
     /// A file that does not parse cannot be saved; the parse error comes back
     /// as a notification and nothing is written.
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// The Name field is the exception to "the editor holds the document": a
+    /// skill's name is also its directory's name, so changing it moves a real
+    /// directory. It is checked before anything is written and confirmed before
+    /// the move, and only then does the write run.
+    ///
+    /// `then` runs once the write has landed. The write is a background task,
+    /// so anything waiting on it — the quit the user chose Save from, the skill
+    /// they were switching to — has to be carried into its completion rather
+    /// than run beside it. A failed write runs nothing: the notification says
+    /// why, and the edits are still there.
+    fn save_then(&mut self, then: Option<Proceed>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.skill.is_none() || self.busy {
+            return;
+        }
+        let Some(new_name) = self.name_edit(cx) else {
+            self.write_source(None, then, window, cx);
+            return;
+        };
+        // Refused here rather than by the installer a moment later, so the
+        // reason arrives while the field that caused it is still on screen.
+        // Reachable from the File menu as well as the Save button, which is why
+        // disabling Save is not enough on its own.
+        if let Some(problem) = self.name_problem_now(cx) {
+            window.push_notification(Notification::error(problem).title("Could not save"), cx);
+            return;
+        }
+        self.confirm_rename(new_name, then, window, cx);
+    }
+
+    /// The name in the field when it differs from the one the file was loaded
+    /// with, and `None` when the user has not touched it.
+    fn name_edit(&self, cx: &App) -> Option<String> {
+        let typed = self.name.read(cx).value();
+        let typed = typed.trim();
+        (typed != self.loaded_name.as_ref()).then(|| typed.to_string())
+    }
+
+    /// Why the name in the field cannot be used, or `None` when it can.
+    ///
+    /// Rendered on every frame, so the rules are applied here and the one
+    /// answer that costs a syscall comes from [`Self::name_taken`], which was
+    /// worked out when the field last changed.
+    fn name_problem(&self, cx: &App) -> Option<SharedString> {
+        let typed = self.name.read(cx).value();
+        let skill = self.skill.as_ref()?;
+        name_rules(typed.trim(), skill, self.scan.as_deref()).or_else(|| self.name_taken.clone())
+    }
+
+    /// [`Self::name_problem`], asking the disk again rather than trusting the
+    /// answer from the last keystroke.
+    ///
+    /// A directory can appear between the keystroke and the save, and this runs
+    /// once per save rather than once per frame.
+    fn name_problem_now(&self, cx: &App) -> Option<SharedString> {
+        let typed = self.name.read(cx).value();
+        rename_problem(
+            typed.trim(),
+            self.skill.as_ref()?,
+            self.scan.as_deref(),
+            &self.roots,
+        )
+    }
+
+    /// True when the tab showing writes `SKILL.md` and the Name field holds a
+    /// name that would be refused, so there is nothing Save can do.
+    fn name_blocked(&self, cx: &App) -> bool {
+        self.showing_file() == SKILL_FILE_NAME
+            && self.name_edit(cx).is_some()
+            && self.name_problem(cx).is_some()
+    }
+
+    /// Confirm what renaming moves, and where to.
+    ///
+    /// The name is the directory's name as well as the frontmatter's, so saving
+    /// the field moves a real directory. It gets the same confirmation shape as
+    /// adopting and releasing: name the source, name the destination, and say
+    /// what follows the skill.
+    fn confirm_rename(
+        &mut self,
+        new_name: String,
+        then: Option<Proceed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(skill) = self.skill.clone() else {
+            return;
+        };
+        // Held on the pane rather than captured by the dialog, because the
+        // dialog's builder runs on every frame and a continuation can only run
+        // once. Both buttons deal with it, so a cancelled rename leaves nothing
+        // behind for the next one to pick up.
+        self.pending = then;
+
+        let old = skill.name.clone();
+        let new_name = SharedString::from(new_name);
+        let from = display_path(&skill.origin, &self.roots);
+        let to = display_path(&skill.origin.with_file_name(new_name.as_ref()), &self.roots);
+        // The links are repointed by the move, so an agent holding one keeps
+        // the skill. That is the question a move on disk raises, and only the
+        // count answers it.
+        let links = skill
+            .locations
+            .iter()
+            .filter(|location| matches!(location.kind, LocationKind::Symlink { .. }))
+            .count();
+        let this = cx.entity().downgrade();
+
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let (from, to) = (from.clone(), to.clone());
+            let new_name = new_name.clone();
+            let (ok, cancel) = (this.clone(), this.clone());
+
+            let description = v_flex()
+                .gap_3()
+                .text_sm()
+                .child(div().child(format!(
+                    "Moves {from} to {to}, and writes {new_name} into the frontmatter."
+                )))
+                .when(links > 0, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{links} symlink{} point at the directory and move with it, so \
+                                 the agents holding one keep the skill.",
+                                if links == 1 { "" } else { "s" }
+                            )),
+                    )
+                });
+
+            alert
+                .title(format!("Rename {old} to {new_name}?"))
+                .description(description)
+                .width(px(520.))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Rename")
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
+                )
+                .on_cancel(move |_, _, cx| {
+                    cancel.update(cx, |this, _| this.pending = None).ok();
+                    true
+                })
+                .on_ok(move |_, window, cx| {
+                    let new_name = new_name.clone();
+                    ok.update(cx, |this, cx| {
+                        let then = this.pending.take();
+                        this.write_source(Some(new_name.to_string()), then, window, cx);
+                    })
+                    .ok();
+                    true
+                })
+        });
+    }
+
+    /// Write `SKILL.md`, moving the directory first when the skill is being
+    /// renamed.
+    ///
+    /// The move comes first because [`Installer::rename`] puts the directory
+    /// back when it cannot finish: a `SKILL.md` written before it would name a
+    /// skill that is not where it says it is. If the write is what fails, the
+    /// directory is moved back for the same reason.
+    fn write_source(
+        &mut self,
+        rename_to: Option<String>,
+        then: Option<Proceed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (Some(skill), false) = (self.skill.clone(), self.busy) else {
             return;
         };
@@ -584,19 +919,62 @@ impl DetailPane {
                     if description_edited {
                         doc.frontmatter.set_description(&description_field);
                     }
-                    Skill::new(&dir, doc).save()?;
+
+                    let installer = Installer::new(roots.clone());
+                    let mut dir = dir;
+                    let mut moved = None;
+                    if let Some(new_name) = &rename_to {
+                        doc.frontmatter.set_name(new_name.as_str());
+                        let previous = dir
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned());
+                        let (landed, outcome) = installer.rename(&dir, new_name)?;
+                        dir = landed;
+                        moved = Some((outcome, previous));
+                    }
+
+                    if let Err(cause) = Skill::new(&dir, doc).save() {
+                        // The directory has moved and still holds the file it
+                        // held before, which names the old skill. Put it back
+                        // rather than leave the two disagreeing; if that fails
+                        // too, the error below is the one worth reporting and
+                        // the scan that follows shows where things are.
+                        if let Some((_, Some(previous))) = &moved {
+                            installer.rename(&dir, previous).ok();
+                        }
+                        return Err(cause.into());
+                    }
+
+                    // The remote cache is keyed by skill name, so the record
+                    // has to follow the rename or the skill loses its digest
+                    // and its shas. After the save, not before: the digest is
+                    // taken of the directory as it now stands, frontmatter
+                    // name included, and the rollback above has already run.
+                    let mut cache_failure = None;
+                    if let (Some(new_name), Some((_, Some(previous)))) = (&rename_to, &moved) {
+                        let mut cache = RemoteCache::read(&roots);
+                        if cache.rename_skill(previous, new_name, content_digest(&dir).ok()) {
+                            cache_failure = cache.write(&roots).map(|error| error.to_string());
+                        }
+                    }
+
                     // Read it back: what the pane shows next is what the disk
                     // holds, not what was sent to it.
                     let file = dir.join(SKILL_FILE_NAME);
                     let after = fs::read_to_string(&file).map_err(|e| SkillError::io(&file, e))?;
-                    Ok::<_, SkillError>((file, after))
+                    Ok::<_, InstallError>((
+                        file,
+                        after,
+                        moved.map(|(outcome, _)| outcome),
+                        cache_failure,
+                    ))
                 })
                 .await;
 
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match written {
-                    Ok((file, after)) => {
+                    Ok((file, after, moved, cache_failure)) => {
                         this.adopt_source(&after, window, cx);
                         let name = SkillDoc::parse(&after)
                             .ok()
@@ -610,11 +988,33 @@ impl DetailPane {
                             .title("Saved"),
                             cx,
                         );
+                        // The move named in full, the way every other move this
+                        // pane makes is: the directory it landed in, and each
+                        // link that followed it there.
+                        if let Some(outcome) = moved {
+                            window.push_notification(
+                                Notification::success(outcome.describe_under(this.roots.home()))
+                                    .title("Renamed"),
+                                cx,
+                            );
+                        }
+                        if let Some(reason) = cache_failure {
+                            window.push_notification(
+                                cache_failure_notification(
+                                    "The skill was renamed, but its install record could not be \
+                                     moved with it",
+                                    &reason,
+                                ),
+                                cx,
+                            );
+                        }
                         cx.emit(DetailEvent::Changed { select: name });
+                        run_after(then, window, cx);
                     }
                     Err(error) => {
                         window.push_notification(
-                            Notification::error(error.to_string()).title("Could not save"),
+                            Notification::error(error.describe_under(this.roots.home()))
+                                .title("Could not save"),
                             cx,
                         );
                         cx.notify();
@@ -622,7 +1022,6 @@ impl DetailPane {
                 }
             })
             .ok();
-            drop(roots);
         })
         .detach();
     }
@@ -658,6 +1057,18 @@ impl DetailPane {
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 report(title, failed, result, &this.roots, window, cx);
+                // Delete is the one operation run from here that writes the
+                // remote cache, and the slot it writes into is its own, so a
+                // failure waiting in it belongs to the delete just reported.
+                if let Some(reason) = take_delete_cache_failure() {
+                    window.push_notification(
+                        delete_cache_failure_notification(
+                            "The skill was deleted, but its install record could not be removed",
+                            &reason,
+                        ),
+                        cx,
+                    );
+                }
                 // Scan again either way: a refusal still means the interface
                 // should re-read what is actually there.
                 cx.emit(DetailEvent::Changed { select });
@@ -694,20 +1105,83 @@ impl DetailPane {
             title,
             failed,
             move |installer| {
-                if on {
-                    installer.link(&name, &origin, agent)
-                } else {
-                    let mut outcome = Outcome::default();
-                    if parked {
-                        outcome
-                            .changes
-                            .extend(installer.enable(&name, &origin, agent)?.changes);
-                    }
-                    outcome
-                        .changes
-                        .extend(installer.unlink(&name, agent)?.changes);
-                    Ok(outcome)
+                let mut done = Outcome::default();
+                match set_present_step(&installer, &mut done, &name, &origin, agent, on, parked) {
+                    Ok(()) => Ok(done),
+                    // Unparking has already moved the link out of the agent's
+                    // disabled directory when `unlink` is what failed.
+                    // Reporting only "Could not unlink" would leave that
+                    // unsaid, and the skill is now switched *on* for an agent
+                    // the user was switching it off for.
+                    // `InstallError::partial` returns the plain refusal when
+                    // nothing had been done, so an ordinary failure is
+                    // unchanged.
+                    Err(source) => Err(InstallError::partial(done, source)),
                 }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Link or unlink a whole set of agents in one write.
+    ///
+    /// One [`Self::run`] rather than one per agent: eight separate calls would
+    /// be eight background writes, eight notifications and eight full rescans,
+    /// with the pane disabled between each of them.
+    fn set_present_all(
+        &mut self,
+        agents: Vec<&'static AgentDef>,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(skill) = self.skill.clone() else {
+            return;
+        };
+        if agents.is_empty() {
+            return;
+        }
+        let name = skill.name.to_string();
+        let origin = skill.origin.clone();
+        // An agent whose link is parked in its disabled directory has nothing
+        // to unlink until the link is moved back, exactly as one row's own
+        // switch handles it.
+        let parked: Vec<&'static AgentDef> = agents
+            .iter()
+            .copied()
+            .filter(|agent| skill.parked_in(agent.id))
+            .collect();
+        let (title, failed) = if on {
+            ("Linked", "Could not link")
+        } else {
+            ("Unlinked", "Could not unlink")
+        };
+
+        self.run(
+            title,
+            failed,
+            move |installer| {
+                let mut done = Outcome::default();
+                for agent in agents {
+                    let step = set_present_step(
+                        &installer,
+                        &mut done,
+                        &name,
+                        &origin,
+                        agent,
+                        on,
+                        parked.contains(&agent),
+                    );
+                    // As many as fourteen agents in one write. A refusal on the
+                    // ninth still leaves the first eight linked, and the
+                    // notification has to list them rather than report the
+                    // refusal alone.
+                    if let Err(source) = step {
+                        return Err(InstallError::partial(done, source));
+                    }
+                }
+                Ok(done)
             },
             window,
             cx,
@@ -749,6 +1223,60 @@ impl DetailPane {
         );
     }
 
+    /// Confirm what adopting moves, and where to.
+    ///
+    /// Adopting moves a real directory on one click, and the only thing that
+    /// said so was a tooltip — which named the wrong directory. It gets the
+    /// same confirmation shape as a delete: name the source, name the
+    /// destination, say what is left behind.
+    fn confirm_adopt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(skill), false) = (self.skill.clone(), self.busy) else {
+            return;
+        };
+        let name = skill.name.clone();
+        let from = display_path(&skill.origin, &self.roots);
+        let to = display_path(
+            &self.roots.store_dir().join(skill.name.as_ref()),
+            &self.roots,
+        );
+        let this = cx.entity().downgrade();
+
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let this = this.clone();
+            let (from, to) = (from.clone(), to.clone());
+
+            let description = v_flex()
+                .gap_3()
+                .text_sm()
+                .child(div().child(format!("Moves {from} to {to}.")))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "A symlink is left at {from}, so whatever reads that path still \
+                             finds the skill. Skillbase then owns the directory, and the \
+                             visibility switches stop being read-only."
+                        )),
+                );
+
+            alert
+                .title(format!("Adopt {name}?"))
+                .description(description)
+                .width(px(520.))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Adopt")
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.adopt(window, cx)).ok();
+                    true
+                })
+        });
+    }
+
     fn adopt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(skill) = self.skill.clone() else {
             return;
@@ -764,20 +1292,113 @@ impl DetailPane {
         );
     }
 
+    /// Where releasing would put the directory: the link adoption left behind.
+    ///
+    /// Any link outside the store will do and the first one is the one
+    /// adoption wrote, but "the first one" is a rule the user cannot see, so
+    /// the confirmation names the path it picked and says how many others
+    /// there were.
+    fn release_destination(&self, skill: &SkillView) -> Option<PathBuf> {
+        skill
+            .locations
+            .iter()
+            .find(|l| !l.path.starts_with(self.roots.store_dir()))
+            .map(|l| l.path.clone())
+    }
+
+    /// Confirm what releasing moves, where to, and which link it chose.
+    fn confirm_release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(skill), false) = (self.skill.clone(), self.busy) else {
+            return;
+        };
+        let Some(dest) = self.release_destination(&skill) else {
+            window.push_notification(
+                Notification::error(
+                    "This skill has no link outside the store, so there is nowhere to release it \
+                     to. Link it to an agent first.",
+                )
+                .title("Cannot release"),
+                cx,
+            );
+            return;
+        };
+
+        let name = skill.name.clone();
+        let from = display_path(
+            &self.roots.store_dir().join(skill.name.as_ref()),
+            &self.roots,
+        );
+        let to = display_path(&dest, &self.roots);
+        // Every other link that points at this skill. They are not moved, and
+        // after the move they point at a directory that is no longer there,
+        // which is the fact the tooltip never mentioned.
+        let others: Vec<SharedString> = skill
+            .locations
+            .iter()
+            .filter(|l| !l.path.starts_with(self.roots.store_dir()) && l.path != dest)
+            .map(|l| display_path(&l.path, &self.roots))
+            .collect();
+        let this = cx.entity().downgrade();
+
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let this = this.clone();
+            let (from, to) = (from.clone(), to.clone());
+            let others = others.clone();
+
+            let description = v_flex()
+                .gap_3()
+                .text_sm()
+                .child(div().child(format!(
+                    "Moves {from} to {to}, replacing the symlink there. Skillbase stops owning \
+                     the directory, and the visibility switches become read-only."
+                )))
+                .when(!others.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().warning.opacity(0.12))
+                            .child(div().text_xs().text_color(cx.theme().warning).child(format!(
+                                "{to} was chosen because it is the first link outside the store. \
+                                 {} other link{} not moved, and {} point at the directory this \
+                                 one leaves behind:",
+                                others.len(),
+                                if others.len() == 1 { " is" } else { "s are" },
+                                if others.len() == 1 { "it will" } else { "they will" },
+                            )))
+                            .children(others.iter().map(|path| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().warning)
+                                    .child(path.clone())
+                            })),
+                    )
+                });
+
+            alert
+                .title(format!("Release {name}?"))
+                .description(description)
+                .width(px(520.))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Release")
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.release(window, cx)).ok();
+                    true
+                })
+        });
+    }
+
     fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(skill) = self.skill.clone() else {
             return;
         };
         let name = skill.name.to_string();
-        // Release puts the origin back where adoption found it: the symlink it
-        // left behind. Any link outside the store will do; the first one is the
-        // one adoption wrote.
-        let Some(dest) = skill
-            .locations
-            .iter()
-            .find(|l| !l.path.starts_with(self.roots.store_dir()))
-            .map(|l| l.path.clone())
-        else {
+        let Some(dest) = self.release_destination(&skill) else {
             window.push_notification(
                 Notification::error(
                     "This skill has no link outside the store, so there is nowhere to release it \
@@ -797,8 +1418,8 @@ impl DetailPane {
         );
     }
 
-    /// Count what a delete would remove, then confirm with those numbers.
-    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Count what a delete would remove, then confirm with those paths.
+    pub(crate) fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(skill), false) = (self.skill.clone(), self.busy) else {
             return;
         };
@@ -825,36 +1446,91 @@ impl DetailPane {
     ) {
         let roots = self.roots.clone();
         let name = plan.name.clone();
-        let origin_line = match &plan.origin {
-            Some(path) => format!("the directory {}", display_path(path, &roots)),
-            None => "nothing that Skillbase owns".to_string(),
-        };
-        // The title names the skill, so the body opens on what goes rather
-        // than repeating the name a line below it.
-        let summary = format!(
-            "Removes {origin_line}, {} link{}, and {} duplicate director{}.{}",
-            plan.link_count(),
-            if plan.link_count() == 1 { "" } else { "s" },
-            plan.copy_count(),
-            if plan.copy_count() == 1 { "y" } else { "ies" },
-            if plan.skipped.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " {} path{} outside every directory Skillbase manages will be left alone.",
-                    plan.skipped.len(),
-                    if plan.skipped.len() == 1 { "" } else { "s" }
-                )
-            }
-        );
-
         let this = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+
+        window.open_alert_dialog(cx, move |alert, _, cx| {
             let plan = plan.clone();
+            let roots = roots.clone();
             let this = this.clone();
+
+            // Every path, the way the consolidate confirmation lists them: a
+            // delete is not reviewable against counts, and the user is the only
+            // one who can tell whether a path in the list belongs to them.
+            let going: Vec<SharedString> = plan
+                .origin
+                .iter()
+                .chain(plan.links.iter())
+                .chain(plan.copies.iter())
+                .map(|path| display_path(path, &roots))
+                .collect();
+            let kept: Vec<SharedString> = plan
+                .skipped
+                .iter()
+                .map(|path| display_path(path, &roots))
+                .collect();
+
+            // The title names the skill, so the body opens on what goes rather
+            // than repeating the name a line below it. The kinds are counted
+            // because a path alone does not say whether it is a directory of
+            // files or a link to one; the paths are listed because the counts
+            // alone cannot be checked.
+            let mut kinds: Vec<String> = Vec::new();
+            if plan.origin.is_some() {
+                kinds.push("the directory it lives in".to_string());
+            }
+            match plan.link_count() {
+                0 => {}
+                1 => kinds.push("1 link".to_string()),
+                count => kinds.push(format!("{count} links")),
+            }
+            match plan.copy_count() {
+                0 => {}
+                1 => kinds.push("1 duplicate directory".to_string()),
+                count => kinds.push(format!("{count} duplicate directories")),
+            }
+            let summary = if kinds.is_empty() {
+                "Nothing that Skillbase manages is left to remove.".to_string()
+            } else {
+                format!("Removes {}:", in_a_list(&kinds))
+            };
+
+            let description = v_flex()
+                .gap_3()
+                .text_sm()
+                .child(div().child(summary))
+                .child(v_flex().gap_1().children(going.iter().map(|path| {
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(path.clone())
+                })))
+                .when(!kept.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().warning.opacity(0.12))
+                            .child(div().text_xs().text_color(cx.theme().warning).child(format!(
+                                "{} path{} left alone, {} outside every directory Skillbase \
+                                 manages:",
+                                kept.len(),
+                                if kept.len() == 1 { "" } else { "s" },
+                                if kept.len() == 1 { "because it is" } else { "because they are" },
+                            )))
+                            .children(kept.iter().map(|path| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().warning)
+                                    .child(path.clone())
+                            })),
+                    )
+                });
+
             alert
                 .title(format!("Delete {name}?"))
-                .description(summary.clone())
+                .description(description)
+                .width(px(520.))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Delete")
@@ -865,10 +1541,20 @@ impl DetailPane {
                 .on_ok(move |_, window, cx| {
                     this.update(cx, |this, cx| {
                         let plan = plan.clone();
+                        let roots = roots.clone();
                         this.run(
                             "Deleted",
                             "Could not delete",
-                            move |installer| installer.delete(&plan),
+                            move |installer| {
+                                let result = installer.delete(&plan);
+                                // The record of a skill that is gone would
+                                // answer for the next skill to take its name.
+                                let mut cache = RemoteCache::read(&roots);
+                                if cache.forget_deleted(slice::from_ref(&plan), &result) {
+                                    remember_delete_cache_failure(cache.write(&roots));
+                                }
+                                result
+                            },
                             window,
                             cx,
                         );
@@ -1036,10 +1722,16 @@ impl DetailPane {
     /// asking: nothing is lost, and the notification names what was written.
     /// Anything else stops and confirms, because the one thing an update must
     /// never do is throw away work without saying so first.
-    fn update_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn update_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(skill), false) = (self.skill.clone(), self.busy) else {
             return;
         };
+        // Reachable from the File menu, which is drawn whether or not this
+        // skill has anywhere to update from. The header's button is only shown
+        // when this holds, so the two agree.
+        if !self.can_update() {
+            return;
+        }
         let local = match &self.remote {
             Remote::Ready(origin) => origin.local,
             _ => LocalState::Unknown,
@@ -1076,26 +1768,38 @@ impl DetailPane {
             .map(|repo| repo.slug().into())
             .unwrap_or_else(|| "the repository it came from".into());
         let edited = local == LocalState::Edited;
+        let upstream = self.upstream_link();
+        // Named as a directory, not as the file that will land in it: the
+        // installer stamps a timestamp onto the name it moves the old copy to,
+        // and only the notification that follows can say which one.
+        let trash = display_path(&self.roots.trash_dir(), &self.roots);
         let this = cx.entity().downgrade();
 
         // The builder runs on every frame the dialog is up, so the confirm
         // button's disabled state is read from the view each time rather than
         // captured once when the dialog opened.
         window.open_dialog(cx, move |dialog, _, cx| {
+            // Says what happens to the directory and where it goes.
+            // `replace_existing` in `skillbase-core` routes through
+            // `Installer::remove_real_dir`, which moves the old directory into
+            // `~/.skillbase/trash` rather than deleting it, so the recovery
+            // path is one this pane can name — and the notification after a
+            // successful update names the exact directory it landed in.
             let consequence = if edited {
                 format!(
-                    "This copy has been edited since it was installed. Updating deletes {dir} \
-                     and writes the copy from {repo} in its place. Those edits are not kept \
-                     anywhere else."
+                    "This copy has been edited since it was installed. Updating moves {dir} to \
+                     {trash} and writes the copy from {repo} in its place. Nothing is merged, so \
+                     the edits stay in the moved copy and nowhere else."
                 )
             } else {
                 format!(
                     "Skillbase has no record of what was installed here, so it cannot tell \
-                     whether this copy has been edited. Updating deletes {dir} and writes the \
-                     copy from {repo} in its place."
+                     whether this copy has been edited. Updating moves {dir} to {trash} and \
+                     writes the copy from {repo} in its place."
                 )
             };
             let this = this.clone();
+            let upstream = upstream.clone();
 
             dialog
                 .title(format!("Update {name}?"))
@@ -1112,11 +1816,21 @@ impl DetailPane {
                                 .p_4()
                                 .gap_3()
                                 .child(div().text_sm().child(consequence.clone()))
+                                // Above the checkbox, because agreeing to put
+                                // an edited copy in the trash is a decision the
+                                // user can only make after seeing what they
+                                // would be taking in exchange.
+                                .when_some(upstream.clone(), |content, upstream| {
+                                    content.child(upstream_element("compare-in-update", upstream))
+                                })
                                 .when(edited, |content| {
                                     content.child(
                                         Checkbox::new("acknowledge-update")
                                             .checked(acknowledged)
-                                            .label("Replace anyway, discarding those edits")
+                                            // Not "discarding those edits":
+                                            // they go to the trash, and the
+                                            // sentence above says where.
+                                            .label("Replace anyway")
                                             .on_click(move |checked: &bool, _, cx| {
                                                 let checked = *checked;
                                                 this.update(cx, |this, cx| {
@@ -1191,14 +1905,44 @@ impl DetailPane {
 
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;
-                match report_install(
+                // Read before the result is handed over, because the change
+                // list goes with it. The confirmation promised the old copy
+                // would go to `~/.skillbase/trash`; this is the half of that
+                // promise the confirmation could not make, because the
+                // installer stamps the directory it lands in with a timestamp
+                // it does not choose until the move. Nothing is said when
+                // there was nothing to replace, such as a first install.
+                let kept = installed
+                    .as_ref()
+                    .ok()
+                    .and_then(|installed| {
+                        installed
+                            .outcome
+                            .changes
+                            .iter()
+                            .find_map(|change| match change {
+                                Change::MovedToTrash { to, .. } => Some(to.clone()),
+                                _ => None,
+                            })
+                    })
+                    .map(|path| display_path(&path, &this.roots));
+
+                let landed = report_install(
                     "Updated",
                     "Could not update",
                     installed,
                     &this.roots,
                     window,
                     cx,
-                ) {
+                );
+                if let Some(path) = kept {
+                    window.push_notification(
+                        Notification::info(format!("The copy it replaced is at {path}."))
+                            .title("Previous copy kept"),
+                        cx,
+                    );
+                }
+                match landed {
                     Some(select) => cx.emit(DetailEvent::Updated {
                         select: Some(select),
                     }),
@@ -1214,11 +1958,16 @@ impl DetailPane {
         .detach();
     }
 
-    fn reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(skill) = self.skill.clone() else {
             return;
         };
-        let dir = skill.origin.clone();
+        self.reveal_path(skill.origin.clone(), window, cx);
+    }
+
+    /// Reveal one directory, which is not always the selected skill's own: a
+    /// duplicate row reveals the copy it names.
+    fn reveal_path(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move { open_in_file_manager(&dir) })
@@ -1227,6 +1976,33 @@ impl DetailPane {
                 this.update_in(cx, |_, window, cx| {
                     window.push_notification(
                         Notification::error(error).title("Could not reveal the folder"),
+                        cx,
+                    );
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Open the skill directory in the user's own editor.
+    ///
+    /// A skill with reference files, scripts and a long `SKILL.md` is more work
+    /// than one pane of tabs is built for, and the editor the user already has
+    /// open is where that work belongs.
+    fn edit_externally(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(skill) = self.skill.clone() else {
+            return;
+        };
+        let dir = skill.origin.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { open_in_editor(&dir) })
+                .await;
+            if let Err(error) = result {
+                this.update_in(cx, |_, window, cx| {
+                    window.push_notification(
+                        Notification::error(error).title("Could not open the editor"),
                         cx,
                     );
                 })
@@ -1302,6 +2078,11 @@ impl DetailPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // Read once: the same answer decides whether Save is offered and what
+        // it says when it is not.
+        let blocked = self.name_blocked(cx);
+        let problem = blocked.then(|| self.name_problem(cx)).flatten();
+
         drag_band("detail-header", window, cx)
             .flex_shrink_0()
             .h(BAND_HEIGHT)
@@ -1363,7 +2144,10 @@ impl DetailPane {
                             .primary()
                             .small()
                             .label("Save")
-                            .disabled(!self.showing_dirty() || self.busy)
+                            // Off while the Name field holds a name that would
+                            // be refused, with the reason under the field.
+                            .disabled(!self.showing_dirty() || self.busy || blocked)
+                            .when_some(problem, |button, problem| button.tooltip(problem))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.save_active(window, cx)),
                             ),
@@ -1433,6 +2217,13 @@ impl DetailPane {
         let agents: Vec<&'static AgentDef> = Registry::link_targets()
             .filter(|agent| !agent.is_shared())
             .filter(|agent| installed.contains(agent) || skill.linked_to(agent.id))
+            .collect();
+        // The other side of that filter. It used to be dropped silently, so a
+        // user looking for Cursor found no row and no sentence saying why.
+        let absent: Vec<&'static str> = Registry::link_targets()
+            .filter(|agent| !agent.is_shared())
+            .filter(|agent| !installed.contains(agent) && !skill.linked_to(agent.id))
+            .map(|agent| agent.display_name)
             .collect();
 
         v_flex()
@@ -1566,15 +2357,122 @@ impl DetailPane {
                                         .child(shared_effect),
                                 ),
                         )
+                        // Nothing to act on when no agent below needs a link
+                        // of its own; a pair of dead buttons over an empty
+                        // list would be worse than no control.
+                        .when(!agents.is_empty(), |this| {
+                            this.child(self.link_all_row(skill, &agents, cx))
+                        })
                         .child(
                             v_flex().gap_2().children(
                                 agents
-                                    .into_iter()
+                                    .iter()
+                                    .copied()
                                     .map(|agent| self.agent_row(skill, agent, cx)),
                             ),
-                        ),
+                        )
+                        .when(!absent.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .max_w(px(PROSE_MAX_WIDTH))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(absent_sentence(&absent)),
+                            )
+                        }),
                 )
             })
+    }
+
+    /// The one control above the agent rows that acts on all of them.
+    ///
+    /// Giving a skill to every agent used to be a click per row, and each
+    /// click was a background write and a full rescan with the pane disabled
+    /// in between. These two buttons do the whole set in one operation, one
+    /// notification and one scan.
+    ///
+    /// "All" is the agents listed below, minus the ones already reached
+    /// through Shared: linking those would write a link that changes nothing
+    /// and contradict the note in their own row. The Shared switch above is
+    /// their control, and the caption says so.
+    fn link_all_row(
+        &self,
+        skill: &SkillView,
+        agents: &[&'static AgentDef],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // An agent that reads the shared directory already sees the skill, so
+        // linking it would write a link that changes nothing and contradict
+        // the note in its own row. "All" here means the agents that are not
+        // reached yet.
+        let to_link: Vec<&'static AgentDef> = agents
+            .iter()
+            .copied()
+            .filter(|agent| !skill.linked_to(agent.id) && !skill.via_shared(agent))
+            .collect();
+        let to_unlink: Vec<&'static AgentDef> = agents
+            .iter()
+            .copied()
+            .filter(|agent| skill.linked_to(agent.id))
+            .collect();
+        // The tooltips name the agents rather than counting them: "Link all"
+        // is only safe to press when the reader can see what "all" is.
+        let link_names = names_of(&to_link);
+        let unlink_names = names_of(&to_unlink);
+        let locked = !skill.managed || self.busy;
+
+        h_flex()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .max_w(px(PROSE_MAX_WIDTH))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Acts on the agents below that need a link of their own. The ones \
+                         reached through Shared are left alone; the Shared switch above is \
+                         their control.",
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .child(
+                        Button::new("link-all")
+                            .outline()
+                            .small()
+                            .label("Link all")
+                            .tooltip(if link_names.is_empty() {
+                                "Every agent below already reaches this skill".to_string()
+                            } else {
+                                format!("Links {link_names}, in one write")
+                            })
+                            .disabled(locked || to_link.is_empty())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_present_all(to_link.clone(), true, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("unlink-all")
+                            .outline()
+                            .small()
+                            .label("Unlink all")
+                            .tooltip(if unlink_names.is_empty() {
+                                "No agent below has a link to remove".to_string()
+                            } else {
+                                format!("Removes the links at {unlink_names}, in one write")
+                            })
+                            .disabled(locked || to_unlink.is_empty())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_present_all(to_unlink.clone(), false, window, cx)
+                            })),
+                    ),
+            )
     }
 
     /// One agent's row: its mark and name, what a switch there would do, and
@@ -1588,12 +2486,12 @@ impl DetailPane {
     /// switches now sit on one line in fixed lanes, and the explanation is a
     /// tooltip on the switch it explains.
     ///
-    /// The row's own sentence is a tooltip for the same reason. "Reached
-    /// through Shared. A switch here would also link ~/.claude/skills/foo."
-    /// under a dozen rows is a page of near-identical text differing only in
-    /// one path segment, and it pushed everything below the fold. Only the two
-    /// states that say something the switches do not — a copy that is not a
-    /// link, and a directory parked out of the way — stay on screen.
+    /// The row's own sentence is a tooltip where the switches already say the
+    /// same thing: "Linked at ~/.claude/skills/foo" under a dozen rows is a
+    /// page of near-identical text differing in one path segment. It comes
+    /// back on screen for the states the switches cannot say — a copy that is
+    /// not a link, a directory parked out of the way, and an agent reached
+    /// through Shared, whose switch is not what controls it.
     fn agent_row(
         &self,
         skill: &SkillView,
@@ -1602,29 +2500,39 @@ impl DetailPane {
     ) -> AnyElement {
         let managed = skill.managed;
         let present = skill.linked_to(agent.id);
+        // `via_shared` goes false the moment the agent has a link of its own,
+        // so these two are exclusive: reached only through Shared, and reached
+        // through Shared as well as by a link.
         let via_shared = skill.via_shared(agent);
+        let also_shared = present && agent.reads_shared && skill.in_shared;
         let dir = display_path(
             &self.roots.agent_dir(agent).join(skill.name.as_ref()),
             &self.roots,
         );
 
         let kind = skill.location_kind(agent.id);
+        // What the row has to say without being hovered. A copy is not a link,
+        // a parked directory is not where the switch says it is, and a row
+        // whose switch cannot be its own control has to say what is.
+        let note: Option<String> = match kind {
+            Some(LocationKind::Copy) => Some(format!("A separate copy at {dir}, not a link")),
+            Some(LocationKind::Disabled) => Some(format!("Parked out of the way; {dir} is empty")),
+            _ if via_shared => Some(format!(
+                "Reached through Shared: {} reads the shared directory, so it sees this skill \
+                 without a link of its own. The Shared switch above is the control.",
+                agent.display_name
+            )),
+            _ if also_shared => Some(format!(
+                "Also reached through Shared, so removing this link does not hide it from {}.",
+                agent.display_name
+            )),
+            _ => None,
+        };
         let effect = match kind {
             Some(LocationKind::Origin) => format!("The origin directory itself, at {dir}"),
             Some(LocationKind::Symlink { .. }) => format!("Linked at {dir}"),
-            Some(LocationKind::Copy) => format!("A separate copy at {dir}, not a link"),
-            Some(LocationKind::Disabled) => format!("Parked out of the way; {dir} is empty"),
-            None if via_shared => {
-                format!("Reached through Shared. A switch here would also link {dir}.")
-            }
-            None => format!("Links {dir}"),
+            _ => format!("Links {dir}"),
         };
-        // A copy is not a link and a parked directory is not where the switch
-        // says it is: those two the reader has to be told without hovering.
-        let inline = matches!(
-            kind,
-            Some(LocationKind::Copy) | Some(LocationKind::Disabled)
-        );
 
         let switchable = has_disable_state(agent) && (present || via_shared);
         // Codex's off state is a line in its own config file, so writing it
@@ -1642,8 +2550,7 @@ impl DetailPane {
                     .id(ElementId::from((ElementId::from("agent-row"), agent.id)))
                     .gap_3()
                     .items_center()
-                    .when(!inline, |this| {
-                        let effect = effect.clone();
+                    .when(note.is_none(), |this| {
                         this.tooltip(move |window, cx| {
                             Tooltip::new(effect.clone()).build(window, cx)
                         })
@@ -1698,24 +2605,45 @@ impl DetailPane {
                             // same question asked twice.
                             Switch::new((ElementId::from("visible"), agent.id))
                                 .small()
-                                .checked(present)
-                                .disabled(!managed || self.busy)
+                                // On for an agent that is reached through
+                                // Shared, because it is. The section header
+                                // has always counted those agents as reached;
+                                // the row used to sit at Off beside it and say
+                                // the opposite about the same agent.
+                                .checked(present || via_shared)
+                                // ...and not the control that put it there, so
+                                // it does not offer to change it. The note
+                                // below the row says where the control is.
+                                .disabled(!managed || self.busy || via_shared)
                                 .label("Linked")
-                                .accessibility_label(format!("{} linked", agent.display_name))
+                                .accessibility_label(if via_shared {
+                                    format!(
+                                        "{} reached through Shared, not linked separately",
+                                        agent.display_name
+                                    )
+                                } else {
+                                    format!("{} linked", agent.display_name)
+                                })
                                 .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                                    // What is written to disk is unchanged.
+                                    // The switch is clickable only where what
+                                    // it shows *is* the link state, so
+                                    // `checked` is never the Shared reading
+                                    // and this cannot write a link the row
+                                    // did not ask for.
                                     this.set_present(agent, *checked, window, cx)
                                 })),
                         ),
                     ),
             )
-            .when(inline, |this| {
+            .when_some(note, |this, note| {
                 this.child(
                     div()
                         .pl_6()
                         .max_w(px(PROSE_MAX_WIDTH))
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(effect),
+                        .child(note),
                 )
             })
             .into_any_element()
@@ -1789,6 +2717,12 @@ impl DetailPane {
                             })
                             .child(self.update_sentence(&provenance.reference)),
                     )
+                    // The only place in this section that shows what the
+                    // update actually is. A `Link`, not a Button: it leaves
+                    // the application for github.com.
+                    .when_some(self.upstream_link(), |this, upstream| {
+                        this.child(upstream_element("compare-upstream", upstream))
+                    })
                     .when(origin.local == LocalState::Edited, |this| {
                         this.child(
                             div()
@@ -1924,37 +2858,52 @@ impl DetailPane {
                                     .outline()
                                     .small()
                                     .icon(IconName::FolderOpen)
-                                    .label("Reveal in Finder")
+                                    // The macOS gesture selects the folder in
+                                    // its parent window; elsewhere the file
+                                    // manager opens the folder itself, and the
+                                    // label says which one it is.
+                                    .label(if cfg!(target_os = "macos") {
+                                        "Reveal in Finder"
+                                    } else {
+                                        "Open folder"
+                                    })
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.reveal(window, cx)),
                                     ),
                             )
+                            .child(
+                                Button::new("open-in-editor")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::SquareTerminal)
+                                    .label("Open in editor")
+                                    .tooltip("Open the whole directory with $VISUAL or $EDITOR")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.edit_externally(window, cx)
+                                    })),
+                            )
+                            // Both open a confirmation, so both take the
+                            // ellipsis: each moves a real directory, and the
+                            // dialog is where the source and destination are
+                            // named.
                             .child(if skill.managed {
                                 Button::new("release")
                                     .outline()
                                     .small()
-                                    .label("Release")
-                                    .tooltip(
-                                        "Move the directory back out of the store, to where its \
-                                         link points",
-                                    )
+                                    .label("Release…")
                                     .disabled(self.busy)
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.release(window, cx)),
-                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_release(window, cx)
+                                    }))
                             } else {
                                 Button::new("adopt")
                                     .primary()
                                     .small()
-                                    .label("Adopt")
-                                    .tooltip(
-                                        "Move the directory into ~/.skillbase/store and leave a \
-                                         symlink behind",
-                                    )
+                                    .label("Adopt…")
                                     .disabled(self.busy)
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.adopt(window, cx)),
-                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_adopt(window, cx)
+                                    }))
                             }),
                     ),
             )
@@ -2113,7 +3062,7 @@ impl DetailPane {
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .truncate()
-                            .child(shown),
+                            .child(shown.clone()),
                     )
                     .child(
                         div()
@@ -2125,19 +3074,45 @@ impl DetailPane {
                             } else {
                                 duplicate.diff().summary()
                             }),
+                    )
+                    // The origin has a Reveal button in Location; a copy about
+                    // to be replaced had none, so the only way to see what was
+                    // in it was to retype the path somewhere else.
+                    .child(
+                        Button::new(ElementId::from((
+                            ElementId::from("reveal-duplicate"),
+                            id.clone(),
+                        )))
+                        .ghost()
+                        .xsmall()
+                        .flex_shrink_0()
+                        .icon(IconName::FolderOpen)
+                        .tooltip(if cfg!(target_os = "macos") {
+                            "Reveal this copy in Finder"
+                        } else {
+                            "Open this copy's folder"
+                        })
+                        .accessibility_label(format!("Reveal {shown}"))
+                        .on_click(cx.listener({
+                            let path = path.clone();
+                            move |this, _, window, cx| this.reveal_path(path.clone(), window, cx)
+                        })),
                     ),
             )
             .when(!identical, |this| {
                 // Name the files, then offer the only way to overwrite them.
                 // Not offering it would leave the user stuck; offering it
                 // without naming what goes would be worse than not offering it.
+                let total = duplicate.diff().total();
+                let expanded = self.expanded_diffs.contains(&path);
+                let shown = if expanded { total } else { DIFF_PATHS };
                 let paths: Vec<SharedString> = duplicate
                     .diff()
                     .paths()
-                    .take(DIFF_PATHS)
+                    .take(shown)
                     .map(|path| SharedString::from(path.display().to_string()))
                     .collect();
-                let more = duplicate.diff().total().saturating_sub(paths.len());
+                let hidden = total.saturating_sub(paths.len());
 
                 this.child(
                     v_flex()
@@ -2147,17 +3122,36 @@ impl DetailPane {
                             h_flex()
                                 .flex_wrap()
                                 .gap_1()
+                                .items_center()
                                 .children(
                                     paths
                                         .into_iter()
                                         .map(|path| Tag::secondary().xsmall().child(path)),
                                 )
-                                .when(more > 0, |this| {
+                                // A bare "+3" named nothing and did nothing.
+                                // The rest of the list is one click away, and
+                                // the same click puts it back.
+                                .when(hidden > 0 || expanded, |this| {
                                     this.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("+{more}")),
+                                        Button::new(ElementId::from((
+                                            ElementId::from("more-diffs"),
+                                            id.clone(),
+                                        )))
+                                        .ghost()
+                                        .xsmall()
+                                        .label(if expanded {
+                                            format!("Show first {DIFF_PATHS}")
+                                        } else {
+                                            format!("Show {hidden} more")
+                                        })
+                                        .on_click(
+                                            cx.listener({
+                                                let path = path.clone();
+                                                move |this, _, _, cx| {
+                                                    this.toggle_diff_paths(&path, cx)
+                                                }
+                                            }),
+                                        ),
                                     )
                                 }),
                         )
@@ -2173,6 +3167,15 @@ impl DetailPane {
                 )
             })
             .into_any_element()
+    }
+
+    /// Show a duplicate's whole differing-path list, or go back to the first
+    /// few.
+    fn toggle_diff_paths(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if !self.expanded_diffs.remove(path) {
+            self.expanded_diffs.insert(path.to_path_buf());
+        }
+        cx.notify();
     }
 
     /// The skill directory, as rows the user can click to open a file.
@@ -2308,7 +3311,10 @@ impl DetailPane {
     }
 
     /// Whether the tab now showing has edits that have not been written.
-    fn showing_dirty(&self) -> bool {
+    ///
+    /// Read from outside the pane: every way out of an edit — another skill,
+    /// another scope, Cmd-W, Cmd-Q — asks this before it takes the work away.
+    pub(crate) fn showing_dirty(&self) -> bool {
         match &self.showing {
             // The Overview edits `SKILL.md`'s frontmatter, so it saves what the
             // `SKILL.md` tab saves and is dirty when it is.
@@ -2322,9 +3328,149 @@ impl DetailPane {
         }
     }
 
+    /// The file the active tab writes, relative to the skill directory.
+    fn showing_file(&self) -> SharedString {
+        match &self.showing {
+            // The Overview edits `SKILL.md`'s frontmatter, so the file it has
+            // to write is that one.
+            Showing::Overview => SKILL_FILE_NAME.into(),
+            Showing::File(rel) => rel.clone(),
+        }
+    }
+
+    /// Ask what to do with the unsaved edits before something takes them away.
+    ///
+    /// Three answers, because all three are real: write the file, leave the
+    /// edits behind, or stay. `proceed` runs for the first two, and for a
+    /// failed write it does not: the notification says what went wrong and the
+    /// user is still on the edit that could not be saved.
+    ///
+    /// `loss` completes the sentence that names what is about to happen —
+    /// "Quitting discards them." — so the reader is told which of their
+    /// gestures is the one that costs the work.
+    pub(crate) fn confirm_discard(
+        &mut self,
+        loss: &'static str,
+        proceed: Proceed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_discard_file(self.showing_file(), loss, proceed, window, cx);
+    }
+
+    /// [`Self::confirm_discard`] for a named tab, which is not always the one
+    /// showing: a tab's own close button can be aimed at any of them.
+    fn confirm_discard_file(
+        &mut self,
+        file: SharedString,
+        loss: &'static str,
+        proceed: Proceed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending = Some(proceed);
+
+        let path = match &self.skill {
+            Some(skill) => display_path(&skill.origin.join(file.as_ref()), &self.roots),
+            None => file.clone(),
+        };
+        let this = cx.entity().downgrade();
+
+        // The builder runs on every frame the dialog is up, so nothing that can
+        // only happen once is captured here. The continuation waits on the pane
+        // instead, and each button takes it from there.
+        window.open_dialog(cx, move |dialog, _, _| {
+            let this = this.clone();
+            let body = format!("The edits in {path} have not been written to disk. {loss}");
+
+            dialog
+                .title(format!("Save changes to {file}?"))
+                .width(px(440.))
+                .content(move |content, _, _| {
+                    content.child(div().p_4().text_sm().child(body.clone()))
+                })
+                .footer(
+                    DialogFooter::new()
+                        .p_4()
+                        .child(
+                            Button::new("discard-edits")
+                                .danger()
+                                .label("Discard")
+                                .on_click({
+                                    let this = this.clone();
+                                    move |_, window, cx| {
+                                        let proceed = this
+                                            .update(cx, |this, _| this.pending.take())
+                                            .ok()
+                                            .flatten();
+                                        window.close_dialog(cx);
+                                        if let Some(proceed) = proceed {
+                                            proceed(window, cx);
+                                        }
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("keep-editing")
+                                .outline()
+                                .label("Cancel")
+                                .on_click({
+                                    let this = this.clone();
+                                    move |_, window, cx| {
+                                        this.update(cx, |this, _| this.pending = None).ok();
+                                        window.close_dialog(cx);
+                                    }
+                                }),
+                        )
+                        .child(Button::new("save-edits").primary().label("Save").on_click({
+                            let this = this.clone();
+                            let file = file.clone();
+                            move |_, window, cx| {
+                                let file = file.clone();
+                                let proceed = this
+                                    .update(cx, |this, _| this.pending.take())
+                                    .ok()
+                                    .flatten();
+                                // This dialog goes first, and the save runs
+                                // after it: `close_dialog` pops whichever
+                                // dialog is on top, so a save that opens the
+                                // rename confirmation would have that one
+                                // popped instead of this one, and nothing
+                                // would be written.
+                                window.close_dialog(cx);
+                                this.update(cx, |this, cx| {
+                                    this.save_tab_then(file, proceed, window, cx);
+                                })
+                                .ok();
+                            }
+                        })),
+                )
+        });
+    }
+
+    /// Close the bundled file the pane is showing, when it is showing one.
+    ///
+    /// True when there was a tab to close, which is what makes Cmd-W close the
+    /// file in front of the user before it closes the window. The Overview and
+    /// `SKILL.md` are permanent tabs and are never what Cmd-W closes.
+    pub(crate) fn close_showing_file(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Showing::File(rel) = self.showing.clone() else {
+            return false;
+        };
+        if !self.open.iter().any(|file| file.rel == rel) {
+            return false;
+        }
+        self.close_file(rel, window, cx);
+        true
+    }
+
     /// Save whatever the active tab holds.
     ///
-    /// The Overview and the `SKILL.md` tab both save through [`Self::save`]:
+    /// The Overview and the `SKILL.md` tab both save through [`Self::save_then`]:
     /// they are two views of one file, the Overview editing its frontmatter and
     /// the tab its text, and that one write reconciles them.
     ///
@@ -2332,10 +3478,35 @@ impl DetailPane {
     /// File > Save menu item are two entry points to this one commit, so the
     /// menu does not get a second path to disk.
     pub(crate) fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.showing.clone() {
-            Showing::Overview => self.save(window, cx),
-            Showing::File(rel) if rel == SKILL_FILE_NAME => self.save(window, cx),
-            Showing::File(rel) => self.save_file(rel, window, cx),
+        self.save_active_then(None, window, cx);
+    }
+
+    /// [`Self::save_active`], and then `then` if the write landed.
+    fn save_active_then(
+        &mut self,
+        then: Option<Proceed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_tab_then(self.showing_file(), then, window, cx);
+    }
+
+    /// Write one tab's file, whether or not it is the tab showing.
+    ///
+    /// `SKILL.md` goes through [`Self::save_then`] — the Overview and the
+    /// `SKILL.md` tab are two views of that one file — and everything else is
+    /// written as it stands.
+    fn save_tab_then(
+        &mut self,
+        file: SharedString,
+        then: Option<Proceed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if file == SKILL_FILE_NAME {
+            self.save_then(then, window, cx);
+        } else {
+            self.save_file(file, then, window, cx);
         }
     }
 
@@ -2411,11 +3582,12 @@ impl DetailPane {
         .detach();
     }
 
-    /// Close a bundled file's tab, discarding whatever it held.
+    /// Close a bundled file's tab.
     ///
     /// An unsaved edit is confirmed first, because a tab's close button is a
     /// small target next to the label and hitting it by accident should not
-    /// cost the user their work.
+    /// cost the user their work. The confirmation offers to write the file, so
+    /// the accident costs nothing at all.
     fn close_file(&mut self, rel: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let dirty = self
             .open
@@ -2427,25 +3599,19 @@ impl DetailPane {
             return;
         }
 
+        // The same three answers as every other way out of an edit, so a tab's
+        // close button costs no more than the wrong click it usually is.
         let this = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let this = this.clone();
-            let rel = rel.clone();
-            alert
-                .title(format!("Close {rel} without saving?"))
-                .description("The edits in this tab have not been written to disk.")
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Discard")
-                        .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
-                        .cancel_text("Cancel")
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.drop_file(&rel, cx)).ok();
-                    true
-                })
-        });
+        let key = rel.clone();
+        self.confirm_discard_file(
+            rel,
+            "Closing the tab discards them.",
+            Box::new(move |_, cx| {
+                this.update(cx, |this, cx| this.drop_file(&key, cx)).ok();
+            }),
+            window,
+            cx,
+        );
     }
 
     fn drop_file(&mut self, rel: &SharedString, cx: &mut Context<Self>) {
@@ -2468,7 +3634,13 @@ impl DetailPane {
     /// Nothing parses it and nothing rewrites it. A bundled file is whatever
     /// the skill's author put there, so what the editor holds is what is
     /// written.
-    fn save_file(&mut self, rel: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+    fn save_file(
+        &mut self,
+        rel: SharedString,
+        then: Option<Proceed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(file) = self.open.iter().find(|file| file.rel == rel) else {
             return;
         };
@@ -2505,6 +3677,7 @@ impl DetailPane {
                             .title("Saved"),
                             cx,
                         );
+                        run_after(then, window, cx);
                     }
                     Err(error) => window.push_notification(
                         Notification::error(error.to_string()).title("Could not save"),
@@ -2717,7 +3890,56 @@ impl DetailPane {
     }
 }
 
+/// The agents a bulk button is about to act on, named.
+fn names_of(agents: &[&'static AgentDef]) -> String {
+    let names: Vec<String> = agents
+        .iter()
+        .map(|agent| agent.display_name.to_string())
+        .collect();
+    in_a_list(&names)
+}
+
+/// Why an agent the user came looking for has no row.
+///
+/// The list is filtered to the agents on this machine, which is right — a
+/// switch for something that is not installed writes a link nothing reads —
+/// but a filter that removes six of fourteen rows without a word reads as a
+/// missing feature rather than a decision.
+fn absent_sentence(names: &[&'static str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("{one} is not installed on this machine, so it has no row here."),
+        _ => format!(
+            "{} agents are not installed on this machine, so they have no rows here: {}.",
+            names.len(),
+            names.join(", ")
+        ),
+    }
+}
+
 /// What turning an agent's Enabled switch off actually does.
+/// Join phrases the way a sentence does: "a", "a and b", "a, b, and c".
+fn in_a_list(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
+/// Run what was waiting on a save, once the pane has finished updating.
+///
+/// A save's continuation lands in the middle of the pane's own update, and
+/// everything that waits on one wants the pane back: another skill in it, a tab
+/// closed, the window gone. Deferring runs it once this update has finished,
+/// with nothing borrowed.
+fn run_after(then: Option<Proceed>, window: &mut Window, cx: &mut App) {
+    if let Some(then) = then {
+        window.defer(cx, move |window, cx| then(window, cx));
+    }
+}
+
 /// The repository and ref a provenance names, when it names one that can be
 /// read. A provenance whose `repo_url` is not a GitHub repository has nothing
 /// to ask about, which is exactly what `UpdateStatus::Unknown` reports.
@@ -2798,6 +4020,95 @@ fn row_note(text: &'static str, cx: &App) -> impl IntoElement + use<> {
         .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child(text)
+}
+
+/// One agent's share of linking or unlinking, appended to `done`.
+///
+/// Takes the outcome to append to rather than returning one of its own, so
+/// that a refusal leaves what already happened in the caller's hands. Switching
+/// an agent off unparks its link before it can unlink it: if the unlink is what
+/// fails, the link has still been moved out of the agent's disabled directory,
+/// and only the caller holds that fact to put in the message.
+///
+/// Shared by the one-switch and the whole-set paths, so the two cannot come to
+/// disagree about what switching an agent off does.
+fn set_present_step(
+    installer: &Installer,
+    done: &mut Outcome,
+    name: &str,
+    origin: &Path,
+    agent: &'static AgentDef,
+    on: bool,
+    parked: bool,
+) -> Result<(), InstallError> {
+    if on {
+        done.changes
+            .extend(installer.link(name, origin, agent)?.changes);
+        return Ok(());
+    }
+    // A link parked in the agent's disabled directory is not where `unlink`
+    // looks, so there is nothing to unlink until it is moved back.
+    if parked {
+        done.changes
+            .extend(installer.enable(name, origin, agent)?.changes);
+    }
+    done.changes.extend(installer.unlink(name, agent)?.changes);
+    Ok(())
+}
+
+/// The page on github.com the update sentence links at, and the label that
+/// says what is on it.
+///
+/// "An update is available. main holds abc1234 now" describes the whole
+/// difference in seven hex characters, and the confirmation that follows
+/// describes only what happens to the local directory. This is the other side
+/// of it, on the repository that holds it.
+///
+/// Two shapes, because only one of them is a comparison:
+///
+/// - `/compare/{installed commit}...{ref}` when the install recorded the commit
+///   its ref pointed at. GitHub resolves a branch, a tag or a commit there and
+///   nothing else — a *tree* sha answers 404, which is why the tree sha the
+///   update check compares cannot be either side of it. The head is the ref
+///   rather than a recorded commit, so the link still means "since this was
+///   installed" however stale the last check is.
+/// - `/tree/{ref}/{path}` otherwise: the directory as it stands upstream now.
+///   Every skill installed before the commit was recorded lands here, as does
+///   every skill `npx skills` installed. It is not a difference, and the label
+///   does not call it one.
+fn upstream_for(slug: &str, reference: &str, path: &str, installed_commit: &str) -> Upstream {
+    if installed_commit.is_empty() {
+        let path = path.trim_matches('/');
+        let url = if path.is_empty() {
+            format!("https://github.com/{slug}/tree/{reference}")
+        } else {
+            format!("https://github.com/{slug}/tree/{reference}/{path}")
+        };
+        return Upstream {
+            url: url.into(),
+            label: "See what is there now",
+        };
+    }
+    Upstream {
+        url: format!("https://github.com/{slug}/compare/{installed_commit}...{reference}").into(),
+        label: "See what changed",
+    }
+}
+
+/// The link out to GitHub, built once for the two places that show it — the
+/// Source section and the update confirmation — so the label and the URL
+/// cannot drift apart between them.
+///
+/// A `Link`, not a Button: it leaves the application for github.com, which is
+/// the one thing underlining is for.
+fn upstream_element(id: &'static str, upstream: Upstream) -> impl IntoElement {
+    Link::new(id).href(upstream.url).text_sm().child(
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(upstream.label)
+            .child(Icon::new(IconName::ExternalLink).xsmall()),
+    )
 }
 
 fn section_title(label: &'static str, cx: &mut Context<DetailPane>) -> impl IntoElement {
@@ -2911,14 +4222,23 @@ fn language_for(rel: &str) -> Option<&'static str> {
     })
 }
 
-/// Open a directory in the platform's file manager.
+/// Reveal a directory in the platform's file manager.
+///
+/// `open -R` selects the directory in its parent window, which is what "Reveal
+/// in Finder" means on macOS; plain `open` on a directory opens the directory
+/// itself, which is a different thing and not what the button says. Linux has
+/// no portable equivalent, so `xdg-open` opens the directory there.
 fn open_in_file_manager(dir: &Path) -> Result<(), String> {
-    let program = if cfg!(target_os = "macos") {
-        "open"
+    let (program, reveal) = if cfg!(target_os = "macos") {
+        ("open", true)
     } else {
-        "xdg-open"
+        ("xdg-open", false)
     };
-    std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    if reveal {
+        command.arg("-R");
+    }
+    command
         .arg(dir)
         .status()
         .map_err(|e| format!("{program}: {e}"))
@@ -2928,6 +4248,47 @@ fn open_in_file_manager(dir: &Path) -> Result<(), String> {
             } else {
                 Err(format!("{program} exited with {status}"))
             }
+        })
+}
+
+/// Hand a skill directory to the user's own editor.
+///
+/// `$VISUAL` first, then `$EDITOR`, both of which may carry arguments —
+/// `code -n`, `zed --wait` — so the first word is the program and the rest are
+/// passed through. With neither set there is nothing to prefer, so the
+/// directory goes to whatever the platform opens a folder with.
+///
+/// Spawned rather than waited on: an editor asked to wait does not return
+/// until the user closes the window, and a status this pane will never see is
+/// worse than none. A program that is not on `PATH` still fails here, which is
+/// the failure worth reporting.
+fn open_in_editor(dir: &Path) -> Result<(), String> {
+    let configured = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    let mut command = match &configured {
+        Some(value) => {
+            let mut words = value.split_whitespace();
+            // `filter` above rules out an all-whitespace value, so there is a
+            // first word.
+            let program = words.next().unwrap_or(value);
+            let mut command = std::process::Command::new(program);
+            command.args(words);
+            command
+        }
+        None if cfg!(target_os = "macos") => std::process::Command::new("open"),
+        None => std::process::Command::new("xdg-open"),
+    };
+
+    command
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| match &configured {
+            Some(value) => format!("{value}: {e}"),
+            None => format!("{e}. Set $EDITOR or $VISUAL to choose an editor."),
         })
 }
 
@@ -2982,6 +4343,80 @@ impl Render for DetailPane {
 }
 
 impl DetailPane {
+    /// The two frontmatter fields the Overview edits, and what saving one
+    /// costs.
+    ///
+    /// The name is here as well as in the identity row above, because the row
+    /// is the pane's title and a title is not a control. Changing it is the
+    /// thing the row cannot do, and doing it by hand in the SKILL.md tab left
+    /// the directory behind under the old name.
+    ///
+    /// Both fields go quiet for a skill whose frontmatter does not parse: there
+    /// is nothing to load into them, and a save would have nothing to put a
+    /// value into. The band above says so and points at the tab that fixes it.
+    fn fields(&self, skill: &SkillView, cx: &mut Context<Self>) -> impl IntoElement {
+        let locked = skill.parse_error.is_some() || self.busy;
+        let problem = self.name_edit(cx).and_then(|_| self.name_problem(cx));
+
+        v_flex()
+            .flex_shrink_0()
+            .gap_4()
+            .max_w(px(PROSE_MAX_WIDTH))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(Label::new("Name"))
+                    .child(Input::new(&self.name).small().disabled(locked))
+                    // One line, under the field it is about: what a name has to
+                    // look like and what changing it moves, until it is a name
+                    // that cannot be used, and then why.
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(match &problem {
+                                Some(_) => cx.theme().danger,
+                                None => cx.theme().muted_foreground,
+                            })
+                            .child(problem.clone().unwrap_or_else(|| {
+                                "kebab-case, and the directory's name as well: saving a new one \
+                                 moves the folder on disk."
+                                    .into()
+                            })),
+                    )
+                    .children(issue_lines(issues_for(&skill.issues, "name"), cx)),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(Label::new("Description"))
+                    .child(
+                        // Tall enough for the descriptions people actually
+                        // write. A skill's description is the sentence an agent
+                        // matches against, so it runs long, and at three lines
+                        // the field cut the fourth in half and looked broken
+                        // rather than scrollable.
+                        Textarea::new(&self.description)
+                            .h(rems(7.5))
+                            .disabled(locked),
+                    )
+                    .children(issue_lines(issues_for(&skill.issues, "description"), cx)),
+            )
+            // Before they type, not after they have lost a comment. A
+            // `SKILL.md` is reproduced byte for byte until a frontmatter field
+            // is edited; from then on the block is written out again from the
+            // values in it.
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Saving either field rewrites the whole frontmatter block: comments in it \
+                         are dropped and quoting is normalised. Everything below it is left as it \
+                         is.",
+                    ),
+            )
+    }
+
     /// The first tab: what the skill is, what is in its directory, and who can
     /// see it.
     ///
@@ -3030,34 +4465,13 @@ impl DetailPane {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
-                                    "The Description field stays empty until the frontmatter \
-                                     parses. Fix it in the SKILL.md tab and save.",
+                                    "The Name and Description fields stay empty until the \
+                                     frontmatter parses. Fix it in the SKILL.md tab and save.",
                                 ),
                         ),
                 )
             })
-            .child(
-                v_flex()
-                    .flex_shrink_0()
-                    .gap_2()
-                    // No name here. The identity row above already carries it,
-                    // and stays put across a tab switch; a second, larger copy
-                    // of the same word 90 pixels below out-ranked the thing it
-                    // belongs to. The description leads the body instead.
-                    .child(
-                        div()
-                            .max_w(px(PROSE_MAX_WIDTH))
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if skill.description.is_empty() {
-                                SharedString::from("No description.")
-                            } else {
-                                skill.description.clone()
-                            }),
-                    )
-                    .children(issue_lines(issues_for(&skill.issues, "name"), cx))
-                    .children(issue_lines(issues_for(&skill.issues, "description"), cx)),
-            )
+            .child(self.fields(skill, cx))
             .child(self.folder_structure(cx))
             // Location before Visibility: the switches below are read-only
             // until an unmanaged skill is adopted, and Adopt lives in
@@ -3115,4 +4529,254 @@ fn duplicates_summary(
         )
     };
     opening + &rest
+}
+
+/// Why `typed` cannot replace the skill's current name, or `None` when it can.
+///
+/// The name is the directory's name as well as the frontmatter's, so this
+/// answers for both: the rules creation applies, plus the two a rename raises
+/// on its own — a name cannot be emptied, and the directory it would move to
+/// has to be free. The scan answers the first collision and the filesystem the
+/// second, because a directory can sit beside the store without holding a skill
+/// the scan would list.
+fn rename_problem(
+    typed: &str,
+    skill: &SkillView,
+    scan: Option<&Scan>,
+    roots: &Roots,
+) -> Option<SharedString> {
+    name_rules(typed, skill, scan).or_else(|| destination_taken(typed, skill, roots))
+}
+
+/// The half of [`rename_problem`] that only reads memory: the rules creation
+/// applies, plus the one a rename raises on its own — a name cannot be emptied.
+///
+/// Split out because the pane asks this question while it renders, and the
+/// other half is a syscall.
+fn name_rules(typed: &str, skill: &SkillView, scan: Option<&Scan>) -> Option<SharedString> {
+    if typed == skill.name.as_ref() {
+        return None;
+    }
+    if typed.is_empty() {
+        return Some("A skill needs a name. It names the directory as well.".into());
+    }
+    if typed.chars().count() > MAX_NAME_LEN {
+        return Some(format!("Too long. A name is at most {MAX_NAME_LEN} characters.").into());
+    }
+    if !is_kebab_case(typed) {
+        return Some(
+            "Use lowercase letters, digits, and single hyphens between them: my-new-skill.".into(),
+        );
+    }
+    if scan.is_some_and(|scan| scan.get(typed).is_some()) {
+        return Some(format!("“{typed}” is already a skill on this machine.").into());
+    }
+    None
+}
+
+/// The half of [`rename_problem`] that reads the disk: the directory the skill
+/// would move to has to be free.
+///
+/// The scan cannot answer this, because a directory can sit beside the store
+/// without holding a skill the scan would list. Call it when the name changes,
+/// not while rendering: [`DetailPane::name_taken`] holds the answer in between.
+fn destination_taken(typed: &str, skill: &SkillView, roots: &Roots) -> Option<SharedString> {
+    if typed == skill.name.as_ref() {
+        return None;
+    }
+    let destination = skill.origin.with_file_name(typed);
+    destination.symlink_metadata().is_ok().then(|| {
+        format!(
+            "{} is already there. Rename or remove it, then try again.",
+            display_path(&destination, roots)
+        )
+        .into()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use skillbase_core::Roots;
+
+    use super::super::model::{Scan, SkillView};
+    use super::{
+        absent_sentence, destination_taken, fs, in_a_list, name_rules, rename_problem, upstream_for,
+    };
+
+    /// A directory of this test's own, named so two runs cannot collide.
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "skillbase-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    fn skill_named(name: &str, origin: PathBuf) -> SkillView {
+        SkillView {
+            name: name.to_string().into(),
+            description: "".into(),
+            origin,
+            managed: true,
+            parse_error: None,
+            issues: Vec::new(),
+            conflicts: Vec::new(),
+            locations: Vec::new(),
+            codex_disabled: false,
+            visible_to: Vec::new(),
+            in_shared: false,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn a_rename_is_refused_for_the_reasons_a_new_name_is_refused() {
+        let home = scratch("rename-rules");
+        let roots = Roots::new(home.clone());
+        let store = roots.store_dir();
+        fs::create_dir_all(&store).expect("a store directory");
+        let skill = skill_named("pdf", store.join("pdf"));
+
+        // The name it already has: nothing to say, and nothing to move.
+        assert_eq!(rename_problem("pdf", &skill, None, &roots), None);
+        // A rename to nothing would leave the directory unnameable, which the
+        // create dialog never has to answer because it disables its own button.
+        assert!(
+            rename_problem("", &skill, None, &roots)
+                .expect("an empty name is refused")
+                .contains("needs a name")
+        );
+        for bad in ["My Skill", "my_skill", "double--hyphen", "trail-"] {
+            let said = rename_problem(bad, &skill, None, &roots)
+                .unwrap_or_else(|| panic!("{bad} should be refused"));
+            assert!(said.contains("my-new-skill"), "{bad}: {said}");
+        }
+
+        let taken = Scan {
+            skills: vec![skill_named("notes", store.join("notes"))],
+            ..Scan::default()
+        };
+        assert!(
+            rename_problem("notes", &skill, Some(&taken), &roots)
+                .expect("a name the scan already holds is refused")
+                .contains("already a skill")
+        );
+        assert_eq!(rename_problem("notes", &skill, None, &roots), None);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_rename_onto_an_occupied_directory_is_refused_even_when_the_scan_lists_nothing() {
+        // A directory can sit beside the store without holding a skill the scan
+        // would list — an empty one, or one with no SKILL.md. The move would
+        // still have nowhere to land, so the filesystem gets the last word.
+        let home = scratch("rename-occupied");
+        let roots = Roots::new(home.clone());
+        let store = roots.store_dir();
+        fs::create_dir_all(store.join("notes")).expect("an occupied destination");
+        let skill = skill_named("pdf", store.join("pdf"));
+
+        assert!(
+            rename_problem("notes", &skill, None, &roots)
+                .expect("an occupied destination is refused")
+                .contains("already there")
+        );
+        assert_eq!(rename_problem("charts", &skill, None, &roots), None);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// The pane runs the rules on every frame and the disk check only when the
+    /// Name field changes, so the two have to be separable: the rules have to
+    /// pass a name the disk refuses.
+    #[test]
+    fn the_rules_pass_a_name_only_the_disk_refuses() {
+        let home = scratch("rename-split");
+        let roots = Roots::new(home.clone());
+        let store = roots.store_dir();
+        fs::create_dir_all(store.join("notes")).expect("an occupied destination");
+        let skill = skill_named("pdf", store.join("pdf"));
+
+        assert_eq!(name_rules("notes", &skill, None), None);
+        assert!(
+            destination_taken("notes", &skill, &roots)
+                .expect("an occupied destination is refused")
+                .contains("already there")
+        );
+        // The name it already has moves nothing, so neither half has anything
+        // to say and the disk is never asked.
+        assert_eq!(name_rules("pdf", &skill, None), None);
+        assert_eq!(destination_taken("pdf", &skill, &roots), None);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// The shapes are checked against github.com, not inferred: `/compare`
+    /// resolves a branch, a tag or a commit and answers 404 for a tree sha,
+    /// which is what the link used to hand it.
+    #[test]
+    fn an_install_commit_gets_a_comparison_and_nothing_else_gets_one() {
+        let with_commit = upstream_for("o/r", "main", "skills/pdf", "c0ffee");
+        assert_eq!(
+            with_commit.url,
+            "https://github.com/o/r/compare/c0ffee...main"
+        );
+        assert_eq!(with_commit.label, "See what changed");
+
+        // Installed before the commit was recorded, or installed by something
+        // that records none. The directory upstream is all there is to show,
+        // and the label says so rather than promising a difference.
+        let without = upstream_for("o/r", "main", "skills/pdf", "");
+        assert_eq!(without.url, "https://github.com/o/r/tree/main/skills/pdf");
+        assert_eq!(without.label, "See what is there now");
+
+        // A skill that is the whole repository has no path segment to append,
+        // and a trailing slash would be one.
+        assert_eq!(
+            upstream_for("o/r", "v2", "", "").url,
+            "https://github.com/o/r/tree/v2"
+        );
+        assert_eq!(
+            upstream_for("o/r", "main", "/skills/pdf/", "").url,
+            "https://github.com/o/r/tree/main/skills/pdf"
+        );
+    }
+
+    #[test]
+    fn absent_agents_are_named_not_counted_away() {
+        assert_eq!(absent_sentence(&[]), "");
+        assert_eq!(
+            absent_sentence(&["Cursor"]),
+            "Cursor is not installed on this machine, so it has no row here."
+        );
+        assert_eq!(
+            absent_sentence(&["Cursor", "Gemini CLI", "Amp"]),
+            "3 agents are not installed on this machine, so they have no rows here: Cursor, \
+             Gemini CLI, Amp."
+        );
+    }
+
+    #[test]
+    fn a_list_of_phrases_reads_as_a_sentence() {
+        let one = ["1 link".to_string()];
+        let two = ["1 link".to_string(), "2 duplicate directories".to_string()];
+        let three = [
+            "the directory it lives in".to_string(),
+            "3 links".to_string(),
+            "1 duplicate directory".to_string(),
+        ];
+
+        assert_eq!(in_a_list(&[]), "");
+        assert_eq!(in_a_list(&one), "1 link");
+        assert_eq!(in_a_list(&two), "1 link and 2 duplicate directories");
+        assert_eq!(
+            in_a_list(&three),
+            "the directory it lives in, 3 links, and 1 duplicate directory"
+        );
+    }
 }

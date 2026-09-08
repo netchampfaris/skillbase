@@ -12,7 +12,7 @@
 //! Nothing here reads the filesystem. Whether a directory exists comes from
 //! the scan, which runs on a background thread.
 
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
@@ -348,17 +348,23 @@ impl Skillbase {
     fn updates_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let checking = matches!(self.updates, UpdateState::Checking);
         let caption = match self.token_source {
-            TokenSource::Environment => format!(
+            // The lookup runs `gh auth token`, which can wait on the keychain,
+            // so it is a background task and this section can be read before it
+            // lands. Saying so beats naming a limit that may be wrong.
+            None => "Looking for a GitHub token. A check asks once per repository and only walks \
+                     a repository that has moved."
+                .to_string(),
+            Some(TokenSource::Environment) => format!(
                 "{GITHUB_TOKEN_ENV} is set, so GitHub allows 5000 requests an hour. A check asks \
                  once per repository and only walks a repository that has moved."
             ),
-            TokenSource::GitHubCli => {
+            Some(TokenSource::GitHubCli) => {
                 "Using the token from GitHub CLI, so GitHub allows 5000 requests an hour. The \
                  token stays in memory and is not written to disk. A check asks once per \
                  repository and only walks a repository that has moved."
                     .to_string()
             }
-            TokenSource::None => format!(
+            Some(TokenSource::None) => format!(
                 "No token, so GitHub allows 60 requests an hour. A check asks once per \
                  repository and only walks a repository that has moved. Set {GITHUB_TOKEN_ENV}, \
                  or log in with gh, to raise the limit to 5000."
@@ -398,6 +404,19 @@ impl Skillbase {
             }
         };
 
+        let updatable = self.updatable_count();
+        let downloading = self.downloading();
+        // The lookup is the one thing on this row the user can start again,
+        // and it sits on the row it changes rather than beside the update
+        // commands, which mean something else entirely.
+        let look_again = Button::new("look-for-token")
+            .ghost()
+            .xsmall()
+            .label("Look again")
+            .disabled(self.token_source.is_none())
+            .on_click(cx.listener(|this, _, window, cx| this.refresh_token_source(window, cx)))
+            .into_any_element();
+
         section(
             "Updates",
             caption,
@@ -411,27 +430,57 @@ impl Skillbase {
                             "token",
                             "GitHub token",
                             match self.token_source {
-                                TokenSource::Environment => "found in the environment",
-                                TokenSource::GitHubCli => "using GitHub CLI",
-                                TokenSource::None => "not set",
+                                None => "still looking",
+                                Some(TokenSource::Environment) => "found in the environment",
+                                Some(TokenSource::GitHubCli) => "using GitHub CLI",
+                                Some(TokenSource::None) => "not set",
                             },
+                            Some(look_again),
                             cx,
                         ))
-                        .child(fact_row("budget", "Rate limit", budget, cx))
-                        .child(fact_row("last-check", "Last check", found, cx)),
+                        .child(fact_row("budget", "Rate limit", budget, None, cx))
+                        .child(fact_row("last-check", "Last check", found, None, cx)),
                 )
                 .child(
-                    h_flex().child(
-                        Button::new("check-updates")
-                            .outline()
-                            .small()
-                            .label("Check for updates now")
-                            .disabled(checking)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.check_for_updates(window, cx)
-                            })),
-                    ),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("check-updates")
+                                .outline()
+                                .small()
+                                .label("Check for updates now")
+                                .disabled(checking)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.check_for_updates(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("update-all")
+                                .outline()
+                                .small()
+                                .label("Update all")
+                                .disabled(updatable == 0 || checking || downloading)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.update_all(window, cx)),
+                                ),
+                        ),
                 )
+                // Only when there is something to take. Update all deletes
+                // directories, so what it will and will not touch has to be
+                // readable before the click rather than reported after it.
+                .when(updatable > 0, |this| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                "Update all downloads each of them again and writes it over its \
+                                 own directory. A copy that has been edited since it was \
+                                 installed, or that has no install record, is left for its own \
+                                 page, where the change is spelled out first.",
+                            ),
+                    )
+                })
                 .into_any_element(),
             cx,
         )
@@ -563,18 +612,23 @@ impl Skillbase {
 }
 
 /// One labelled fact, on the same two lanes the directory rows use so the two
-/// lists read as one column.
+/// lists read as one column, with an optional control on the trailing edge for
+/// the fact the user can change.
 fn fact_row(
     id: &'static str,
     label: &'static str,
     value: impl Into<SharedString>,
+    action: Option<AnyElement>,
     cx: &mut Context<Skillbase>,
 ) -> AnyElement {
     h_flex()
         .id(ElementId::from((ElementId::from("settings-fact"), id)))
         .w_full()
         .px_3()
-        .py_2()
+        // Shorter than the other rows so that a row carrying a button is the
+        // same height as one that does not, and the column keeps its rhythm.
+        .py_1()
+        .min_h(px(36.))
         .gap_3()
         .items_center()
         .child(
@@ -593,6 +647,7 @@ fn fact_row(
                 .text_color(cx.theme().muted_foreground)
                 .child(value.into()),
         )
+        .children(action.map(|action| div().flex_shrink_0().child(action)))
         .into_any_element()
 }
 

@@ -18,18 +18,28 @@ actions!(
     [
         About,
         BringAllToFront,
+        CheckForUpdates,
+        ClearMarks,
         CloseWindow,
+        DeleteSkill,
         Hide,
         HideOthers,
+        InstallFromGitHub,
+        LinkMarked,
+        MarkAll,
         Minimize,
         FindSkill,
         NewSkill,
         Quit,
         ReloadSkills,
+        RevealInFinder,
         Save,
         ShowAll,
+        ShowDiscover,
         ShowSettings,
         ToggleSidebar,
+        UnlinkMarked,
+        UpdateSkill,
         Zoom,
     ]
 );
@@ -59,6 +69,26 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-r", ReloadSkills, None),
         KeyBinding::new("cmd-f", FindSkill, None),
         KeyBinding::new("cmd-m", Minimize, None),
+        // What the Finder binds for the same two gestures: Cmd-Delete removes
+        // the selected thing, Cmd-Shift-R opens a folder. The skill list is
+        // keyboard-navigable, so the row the arrows land on is the row these
+        // act on.
+        //
+        // Delete is bound outside text controls only. Inside one, Cmd-Delete
+        // deletes to the start of the line, and a keystroke that means "trim
+        // this line" in every other application must not mean "delete this
+        // skill" here. `!Input` is false at every depth once an `Input` is
+        // anywhere on the focus path, so the editor keeps the key.
+        KeyBinding::new("cmd-backspace", DeleteSkill, Some("!Input")),
+        KeyBinding::new("cmd-shift-r", RevealInFinder, None),
+        // Marking a set of rows is what Cmd-A means inside a list, and Escape
+        // is what takes the set back to one. Both are scoped to the list's own
+        // context, so Cmd-A still selects text in every field and Escape still
+        // dismisses whatever overlay is on top. Registered here, before
+        // `set_menus`, because the menu bar is built from a snapshot of the
+        // keymap and an item whose binding lands later shows no shortcut.
+        KeyBinding::new("cmd-a", MarkAll, Some(crate::ui::list::CONTEXT)),
+        KeyBinding::new("escape", ClearMarks, Some(crate::ui::list::CONTEXT)),
     ]);
 
     // These act on the application or on the front window rather than on
@@ -131,12 +161,34 @@ fn menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Quit Skillbase", Quit),
         ]),
+        // Everything that puts a skill on this machine, changes it, or takes it
+        // off again. The detail pane offers the same commands as buttons; these
+        // are what makes them findable by reading the menu bar, and what gives
+        // the keyboard a way to act on the row the arrow keys landed on.
         Menu::new("File").items([
             MenuItem::action("New Skill", NewSkill),
+            MenuItem::action("Install from GitHub…", InstallFromGitHub),
             MenuItem::separator(),
-            MenuItem::action("Close Window", CloseWindow),
+            // "Close", not "Close Window": with a bundled file open in a tab,
+            // this closes that tab first.
+            MenuItem::action("Close", CloseWindow),
             // Below Close, where every document application on macOS puts it.
             MenuItem::action("Save", Save),
+            MenuItem::separator(),
+            MenuItem::action("Reveal in Finder", RevealInFinder),
+            MenuItem::action("Update Skill", UpdateSkill),
+            MenuItem::separator(),
+            // The commands that act on every marked row rather than on the
+            // selected one. Both linking items open a dialog naming the agent,
+            // so both take the ellipsis. Delete Skill below acts on the marked
+            // set too when there is one, which is why it keeps its place at the
+            // foot of the menu rather than gaining a second item.
+            MenuItem::action("Mark All", MarkAll),
+            MenuItem::action("Clear Marks", ClearMarks),
+            MenuItem::action("Link Marked Skills…", LinkMarked),
+            MenuItem::action("Unlink Marked Skills…", UnlinkMarked),
+            MenuItem::separator(),
+            MenuItem::action("Delete Skill", DeleteSkill),
         ]),
         // Every item here belongs to the framework's text controls. The
         // search field and the detail pane's editor both answer them, and
@@ -157,9 +209,11 @@ fn menus() -> Vec<Menu> {
             // control already has focus, which is no use as the way in to the
             // search field.
             MenuItem::action("Find Skill", FindSkill),
+            MenuItem::action("Discover", ShowDiscover),
             MenuItem::separator(),
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Reload Skills", ReloadSkills),
+            MenuItem::action("Check for Updates", CheckForUpdates),
         ]),
         // Named "Window" so AppKit adopts it: it appends the window list and
         // keeps the checkmark on the front window without being asked.

@@ -42,6 +42,19 @@ pub enum SkillError {
     #[error("malformed YAML frontmatter: {0}")]
     MalformedYaml(#[source] serde_yaml_ng::Error),
 
+    /// A frontmatter value has no YAML spelling, so the document cannot be
+    /// written back out.
+    ///
+    /// The reverse direction of [`MalformedYaml`](Self::MalformedYaml), and
+    /// not a parse failure at all: the text on disk is valid YAML, and it is
+    /// the mapping now held in memory that cannot be serialized. Reported by
+    /// [`SkillDoc::try_to_markdown`](crate::SkillDoc::try_to_markdown).
+    #[error(
+        "frontmatter cannot be written as YAML: {0}. Undo the last change to the field it names, \
+         then save again"
+    )]
+    FrontmatterNotSerializable(#[source] serde_yaml_ng::Error),
+
     /// The frontmatter parsed, but as something other than a mapping.
     #[error("YAML frontmatter must be a mapping, found {found}")]
     FrontmatterNotMapping {

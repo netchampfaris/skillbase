@@ -52,10 +52,16 @@ impl Skill {
     ///
     /// Bundled files are only ever listed, never written or deleted, so saving
     /// cannot lose them.
+    ///
+    /// The document is rendered with [`SkillDoc::try_to_markdown`], so a
+    /// frontmatter YAML cannot spell is an error and nothing is written. The
+    /// alternative — the lossy render — would leave a file on disk with one
+    /// key fewer than the one that was read, and report it as saved.
     pub fn save(&self) -> Result<(), SkillError> {
+        let text = self.doc.try_to_markdown()?;
         fs::create_dir_all(&self.path).map_err(|e| SkillError::io(&self.path, e))?;
         let file = self.skill_md_path();
-        fs::write(&file, self.doc.to_markdown()).map_err(|e| SkillError::io(&file, e))
+        fs::write(&file, text).map_err(|e| SkillError::io(&file, e))
     }
 
     /// Path of the `SKILL.md` itself.
@@ -261,6 +267,42 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.join(SKILL_FILE_NAME)).unwrap(),
             SOURCE
+        );
+    }
+
+    /// A frontmatter that cannot be serialized must not be half-written and
+    /// called a save. Only a caller that went through `as_mapping_mut` can put
+    /// the mapping in this state; the interface cannot.
+    #[test]
+    fn save_refuses_a_frontmatter_that_cannot_be_serialized() {
+        use serde_yaml_ng::Value;
+        use serde_yaml_ng::value::{Tag, TaggedValue};
+
+        let temp = skill_dir();
+        let dir = temp.path().join("pdf-tools");
+        let mut skill = Skill::load(&dir).unwrap();
+        // A value inside two tags, which YAML has no spelling for.
+        let inner = Value::Tagged(Box::new(TaggedValue {
+            tag: Tag::new("Inner"),
+            value: Value::String("x".into()),
+        }));
+        skill.doc.frontmatter.as_mapping_mut().insert(
+            Value::String("metadata".into()),
+            Value::Tagged(Box::new(TaggedValue {
+                tag: Tag::new("Outer"),
+                value: inner,
+            })),
+        );
+
+        let error = skill.save().unwrap_err();
+        assert!(
+            matches!(error, SkillError::FrontmatterNotSerializable(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(SKILL_FILE_NAME)).unwrap(),
+            SOURCE,
+            "the file on disk must be exactly what it was"
         );
     }
 

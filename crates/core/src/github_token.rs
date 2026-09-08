@@ -9,10 +9,14 @@
 //! CLI fallback is what makes the 5000-request budget reachable from the
 //! installed `.app`. Extra well-known paths are searched because that launch
 //! also has a thin `PATH`.
+//!
+//! The answer is held rather than looked up per request, but it is not frozen:
+//! a user who runs `gh auth login` after the application started can ask for it
+//! to be read again with [`refresh_github_token`].
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{PoisonError, RwLock};
 
 use crate::github::GITHUB_TOKEN_ENV;
 
@@ -34,12 +38,19 @@ impl TokenSource {
     }
 }
 
+/// What the last lookup found, or `None` before the first one.
+///
+/// A lock rather than a `OnceLock` because the answer can change under a
+/// running process: `gh auth login` in another window is exactly the case
+/// [`refresh_github_token`] exists for.
+static CREDENTIAL: RwLock<Option<(Option<String>, TokenSource)>> = RwLock::new(None);
+
 /// The token [`crate::GitHub::from_env`] will use, and where it came from.
 ///
-/// Looked up once: an environment variable does not change under a running
-/// process, and spawning `gh` on every request would be wasted work.
+/// Looked up on the first call and then held, because spawning `gh` on every
+/// request would be wasted work. [`refresh_github_token`] is what replaces it.
 pub(crate) fn github_credential() -> (Option<String>, TokenSource) {
-    github_credential_cached().clone()
+    github_credential_cached()
 }
 
 /// Where the token came from, without handing the secret to the interface.
@@ -47,9 +58,50 @@ pub fn github_token_source() -> TokenSource {
     github_credential_cached().1
 }
 
-fn github_credential_cached() -> &'static (Option<String>, TokenSource) {
-    static CREDENTIAL: OnceLock<(Option<String>, TokenSource)> = OnceLock::new();
-    CREDENTIAL.get_or_init(lookup_github_token)
+/// Read the environment and `gh` again, and adopt what they say now.
+///
+/// For the user who hits a private-repository 404, runs `gh auth login`, and
+/// comes back: without this the process would go on sending whatever it found
+/// at startup until it was relaunched.
+///
+/// Blocking. It stats every entry on `PATH` and waits on a `gh` subprocess that
+/// may in turn wait on the keychain, so callers run it on a background thread.
+pub fn refresh_github_token() -> TokenSource {
+    refresh_with(lookup_github_token)
+}
+
+/// [`refresh_github_token`] with the lookup passed in, so a test can drive the
+/// replacement without running `gh`.
+fn refresh_with(lookup: impl FnOnce() -> (Option<String>, TokenSource)) -> TokenSource {
+    let found = lookup();
+    let source = found.1;
+    *CREDENTIAL.write().unwrap_or_else(PoisonError::into_inner) = Some(found);
+    source
+}
+
+fn github_credential_cached() -> (Option<String>, TokenSource) {
+    credential_cached_with(lookup_github_token)
+}
+
+/// [`github_credential_cached`] with the lookup passed in. Same reason as
+/// [`refresh_with`]: the holding is what is worth testing, and the lookup is
+/// the part that spawns a subprocess.
+fn credential_cached_with(
+    lookup: impl FnOnce() -> (Option<String>, TokenSource),
+) -> (Option<String>, TokenSource) {
+    if let Some(found) = CREDENTIAL
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+    {
+        return found;
+    }
+    // Looked up outside the write lock, so a second caller arriving during a
+    // slow `gh` is not blocked behind it. Both then store, and both store the
+    // same answer.
+    let found = lookup();
+    let mut slot = CREDENTIAL.write().unwrap_or_else(PoisonError::into_inner);
+    slot.get_or_insert(found).clone()
 }
 
 fn lookup_github_token() -> (Option<String>, TokenSource) {
@@ -178,5 +230,40 @@ mod tests {
     #[test]
     fn gh_stdout_that_is_a_sentence_is_not_a_token() {
         assert_eq!(parse_gh_stdout("no oauth token found for github.com"), None);
+    }
+
+    /// The point of the lock: the first call looks up and holds the answer, and
+    /// [`refresh_github_token`] replaces what is held, so a `gh auth login` that
+    /// happens while the process runs is reachable without a relaunch.
+    ///
+    /// Drives the two functions the interface calls, with only the `gh`
+    /// subprocess substituted.
+    #[test]
+    fn a_refresh_replaces_the_answer_the_first_call_held() {
+        let saved = CREDENTIAL
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+
+        // Nothing held yet, so the first call looks up.
+        let (token, source) = credential_cached_with(|| (None, TokenSource::None));
+        assert_eq!(token, None);
+        assert_eq!(source, TokenSource::None);
+        // And the second does not: this is what stops `gh` being spawned on
+        // every request.
+        assert_eq!(
+            credential_cached_with(|| panic!("the held answer was looked up again")).1,
+            TokenSource::None
+        );
+
+        // The login happens now.
+        assert_eq!(
+            refresh_with(|| (Some("gho_exampleToken".into()), TokenSource::GitHubCli)),
+            TokenSource::GitHubCli
+        );
+        assert_eq!(github_token_source(), TokenSource::GitHubCli);
+        assert_eq!(github_credential().0.as_deref(), Some("gho_exampleToken"));
+
+        *CREDENTIAL.write().unwrap_or_else(PoisonError::into_inner) = saved;
     }
 }

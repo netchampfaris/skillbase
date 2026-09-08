@@ -45,6 +45,8 @@ impl LineEnding {
 /// style the author used. That holds because the document keeps the delimiter
 /// lines, the frontmatter source and the body as verbatim strings, and only
 /// re-emits YAML once the frontmatter is actually mutated.
+/// [`SkillDoc::try_to_markdown`] returns the same bytes, and cannot fail while
+/// the frontmatter is untouched.
 ///
 /// After a mutation the frontmatter is serialized again. Key order still
 /// survives, but formatting is normalized; [`SkillDoc::to_markdown`] documents
@@ -155,7 +157,37 @@ impl SkillDoc {
     ///
     /// The body is never touched, in either case.
     pub fn to_markdown(&self) -> String {
-        let mut yaml = self.frontmatter.to_yaml();
+        self.assemble(self.frontmatter.to_yaml())
+    }
+
+    /// Renders the document back to `SKILL.md` text, or reports the frontmatter
+    /// the YAML serializer refused.
+    ///
+    /// The same as [`SkillDoc::to_markdown`] in every respect but one: when the
+    /// mapping holds a value YAML cannot spell, this returns the error, where
+    /// `to_markdown` drops that one key and returns the rest.
+    ///
+    /// **Anything about to overwrite a file must call this one.** A save that
+    /// quietly drops a key and then reports success loses work the user cannot
+    /// get back and never told them it happened.
+    ///
+    /// The byte-for-byte round trip is unchanged: an untouched frontmatter is
+    /// replayed verbatim and cannot fail here.
+    pub fn try_to_markdown(&self) -> Result<String, SkillError> {
+        // Not `MalformedYaml`: the text on disk parsed fine, and pointing the
+        // user at the file would send them looking for a fault that is not
+        // there. This is the other direction — a mapping in memory with no
+        // YAML spelling.
+        let yaml = self
+            .frontmatter
+            .try_to_yaml()
+            .map_err(SkillError::FrontmatterNotSerializable)?;
+        Ok(self.assemble(yaml))
+    }
+
+    /// Puts the delimiters, the YAML block and the body back together, with the
+    /// newline the document was read with.
+    fn assemble(&self, mut yaml: String) -> String {
         if self.frontmatter.is_dirty() && self.line_ending == LineEnding::Crlf {
             // A freshly serialized block is always LF; match the document.
             yaml = yaml.replace('\n', "\r\n");
@@ -306,6 +338,7 @@ fn is_delimiter(line: &str, closing: bool) -> bool {
 mod tests {
     use super::*;
     use serde_yaml_ng::Value;
+    use serde_yaml_ng::value::{Tag, TaggedValue};
 
     const EXAMPLE: &str = concat!(
         "---\n",
@@ -389,7 +422,45 @@ mod tests {
         for (label, text) in cases {
             let doc = SkillDoc::parse(text).unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(&doc.to_markdown(), text, "{label} did not round-trip");
+            // `try_to_markdown` is what `Skill::save` writes, so the guarantee
+            // has to hold for it too, not only for the infallible renderer.
+            assert_eq!(
+                &doc.try_to_markdown().unwrap(),
+                text,
+                "{label} did not round-trip through try_to_markdown"
+            );
         }
+    }
+
+    /// The save path refuses rather than writing a shorter frontmatter than the
+    /// one it was given. `to_markdown` keeps its lossy fallback, for callers
+    /// with nowhere to put an error.
+    #[test]
+    fn try_to_markdown_reports_what_to_markdown_would_drop() {
+        let mut doc = SkillDoc::parse("---\nname: pdf\ndescription: Reads PDFs.\n---\nbody\n")
+            .expect("the source parses");
+        // A value inside two tags: YAML has no spelling for it, and the
+        // serializer refuses the whole mapping.
+        let inner = Value::Tagged(Box::new(TaggedValue {
+            tag: Tag::new("Inner"),
+            value: Value::String("x".into()),
+        }));
+        doc.frontmatter.as_mapping_mut().insert(
+            Value::String("metadata".into()),
+            Value::Tagged(Box::new(TaggedValue {
+                tag: Tag::new("Outer"),
+                value: inner,
+            })),
+        );
+
+        assert!(matches!(
+            doc.try_to_markdown(),
+            Err(SkillError::FrontmatterNotSerializable(_))
+        ));
+
+        let lossy = doc.to_markdown();
+        assert!(lossy.contains("name: pdf"), "{lossy:?}");
+        assert!(!lossy.contains("metadata"), "{lossy:?}");
     }
 
     #[test]
