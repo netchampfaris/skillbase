@@ -18,7 +18,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, FocusHandle,
+    AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, ElementId, FocusHandle,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, ScrollHandle,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, actions, div, px, rems,
 };
@@ -41,6 +41,14 @@ use super::{
 pub const LIST_WIDTH: f32 = 320.;
 pub const LIST_MIN_WIDTH: f32 = 240.;
 pub const LIST_MAX_WIDTH: f32 = 460.;
+
+/// How wide a tooltip carrying a sentence is allowed to get.
+///
+/// A tooltip is read in one glance, so the line has to be short enough that the
+/// eye finds the start of the next one — around fifty characters here. It is
+/// also the width of the column it sits beside, which keeps a tooltip from
+/// covering the list it explains.
+const TOOLTIP_WIDTH: f32 = 320.;
 
 /// The keymap context the list's own bindings live in.
 ///
@@ -508,7 +516,7 @@ impl Skillbase {
                     .id("scope-title")
                     .text_base()
                     .font_medium()
-                    .tooltip(move |window, cx| Tooltip::new(explanation.clone()).build(window, cx))
+                    .tooltip(text_tooltip(explanation))
                     .child(self.scope.title())
             })
             .child(match total {
@@ -748,9 +756,7 @@ impl Skillbase {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(detail.clone()).build(window, cx)
-                                })
+                                .tooltip(text_tooltip(detail))
                                 .child(format!(
                                     "{} problem{} during the scan",
                                     warnings.len(),
@@ -1916,9 +1922,7 @@ impl Skillbase {
                                     skill.name.clone(),
                                 )))
                                 .flex_shrink_0()
-                                .tooltip(|window, cx| {
-                                    Tooltip::new("An update is available").build(window, cx)
-                                })
+                                .tooltip(text_tooltip("An update is available"))
                                 .child(
                                     Icon::new(IconName::ArrowDown)
                                         .xsmall()
@@ -1938,14 +1942,10 @@ impl Skillbase {
                                     skill.name.clone(),
                                 )))
                                 .flex_shrink_0()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(format!(
-                                        "This name is a real directory in {others} other \
-                                         place{}",
-                                        if others == 1 { "" } else { "s" }
-                                    ))
-                                    .build(window, cx)
-                                })
+                                .tooltip(text_tooltip(format!(
+                                    "This name is a real directory in {others} other place{}",
+                                    if others == 1 { "" } else { "s" }
+                                )))
                                 .child(
                                     Icon::new(IconName::Copy)
                                         .xsmall()
@@ -1977,14 +1977,10 @@ impl Skillbase {
                                     .flex_shrink_0()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .tooltip(|window, cx| {
-                                        Tooltip::new(
-                                            "No invocation was recorded. Not every agent keeps \
-                                             session records, so this is not the same as never \
-                                             used.",
-                                        )
-                                        .build(window, cx)
-                                    })
+                                    .tooltip(text_tooltip(
+                                        "No invocation was recorded. Not every agent keeps \
+                                         session records, so this is not the same as never used.",
+                                    ))
                                     .child("—"),
                             )
                         } else {
@@ -2030,9 +2026,7 @@ impl Skillbase {
                             // rest — a tooltip repeating a line that already
                             // fits is noise.
                             .when_some(long_enough_to_truncate(&subtitle), |this, full| {
-                                this.tooltip(move |window, cx| {
-                                    Tooltip::new(full.clone()).build(window, cx)
-                                })
+                                this.tooltip(text_tooltip(full))
                             })
                             .child(subtitle),
                     )
@@ -2087,7 +2081,7 @@ impl Skillbase {
             .flex_shrink_0()
             .gap_1()
             .items_center()
-            .tooltip(move |window, cx| Tooltip::new(spoken.clone()).build(window, cx))
+            .tooltip(text_tooltip(spoken))
             .children(agents.into_iter().take(SHOWN).map(|agent| {
                 agent_icon(agent)
                     .xsmall()
@@ -2370,6 +2364,27 @@ fn count_label(shown: usize, total: usize) -> SharedString {
         total.to_string().into()
     } else {
         format!("{shown} of {total}").into()
+    }
+}
+
+/// A tooltip carrying a sentence, capped at a width it can be read at.
+///
+/// Every text tooltip in this column is built here. `Tooltip::new` lays its
+/// text out on a single line however long the text is, so a description of
+/// several sentences drew a box wider than the window — worse than the
+/// truncated row it was there to explain.
+///
+/// The cap has to sit on an element of our own rather than on the tooltip: the
+/// tooltip's box is a row that takes whatever width its content asks for, and
+/// it is the block the text is laid out in that decides where the lines break.
+/// A block with a width also breaks a run that has no spaces in it, so a
+/// description written as one long word wraps rather than spilling out.
+fn text_tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
+    let text = text.into();
+    move |window, cx| {
+        let text = text.clone();
+        Tooltip::element(move |_, _| div().max_w(px(TOOLTIP_WIDTH)).child(text.clone()))
+            .build(window, cx)
     }
 }
 
@@ -2804,10 +2819,22 @@ mod dialog_tests {
 /// search that matches none of them, and a marked set.
 #[cfg(test)]
 mod render_tests {
-    use gpui_kit::TestAppContext;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui_kit::base::ElementExt as _;
+    use gpui_kit::{
+        AvailableSpace, ParentElement as _, Pixels, Size, TestAppContext, VisualTestContext, div,
+        point, px,
+    };
 
     use super::dialog_probe::{list_drawn, window};
+    use super::{TOOLTIP_WIDTH, text_tooltip};
     use crate::ui::model::{Library, Scope};
+
+    /// The margin, padding and border the tooltip draws around its text. The
+    /// cap is on the text, so the box is that much wider than the cap.
+    const CHROME: Pixels = px(48.);
 
     #[gpui_kit::test]
     fn the_list_draws_its_rows(cx: &mut TestAppContext) {
@@ -2856,5 +2883,86 @@ mod render_tests {
             });
         });
         list_drawn(&mut cx);
+    }
+
+    /// How large a tooltip built by [`text_tooltip`] draws.
+    ///
+    /// The window lays a tooltip out against its minimum size, which is what
+    /// leaves the box free to be as wide as its one line of text — so the
+    /// measurement has to be taken the same way for it to say anything.
+    fn tooltip_size(cx: &mut VisualTestContext, text: &str) -> Size<Pixels> {
+        let measured = Rc::new(Cell::new(Size::default()));
+        let build = text_tooltip(text.to_string());
+        let out = measured.clone();
+        cx.draw(
+            point(px(0.), px(0.)),
+            AvailableSpace::min_size(),
+            move |window, cx| {
+                let tooltip = build(window, cx);
+                div()
+                    .on_prepaint(move |bounds, _, _| out.set(bounds.size))
+                    .child(tooltip)
+            },
+        );
+        measured.get()
+    }
+
+    /// A tooltip used to be laid out on one line however long its text was, so
+    /// the full description offered on a truncated row arrived as a line wider
+    /// than the window — worse than the row it was explaining.
+    #[gpui_kit::test]
+    fn a_tooltip_holding_a_sentence_wraps_inside_a_reading_width(cx: &mut TestAppContext) {
+        let (mut cx, _) = window(cx);
+
+        let label = tooltip_size(&mut cx, "Short.");
+        // A short label still hugs its text: the cap is a maximum, not a width.
+        assert!(
+            label.width < px(TOOLTIP_WIDTH),
+            "a one-word tooltip drew {:?} wide",
+            label.width
+        );
+
+        let sentence = tooltip_size(
+            &mut cx,
+            "Use this skill whenever the user works with PDF files.",
+        );
+        let paragraph = tooltip_size(
+            &mut cx,
+            "Use this skill whenever the user works with PDF files: reading one, filling in a \
+             form, splitting one apart, or putting several together. It reads the pages and \
+             does not change them.",
+        );
+        // Nothing in this one is a place to break a line, so the break has to
+        // fall mid-word. Unwrapped, it was the description that ran off the
+        // screen.
+        let unbroken = tooltip_size(&mut cx, &"unbrokenrun".repeat(20));
+
+        for (what, size) in [
+            ("a sentence", sentence),
+            ("a paragraph", paragraph),
+            ("one long word", unbroken),
+        ] {
+            assert!(
+                size.width <= px(TOOLTIP_WIDTH) + CHROME,
+                "{what} drew {:?} wide, past the {TOOLTIP_WIDTH}pt cap",
+                size.width
+            );
+            assert!(
+                size.height > label.height,
+                "{what} is wider than the cap, so it has to take more than the one line \
+                 a label takes: {:?} against {:?}",
+                size.height,
+                label.height
+            );
+        }
+
+        // The lines pile up rather than the box being cut off at some height:
+        // three sentences take more of them than one.
+        assert!(
+            paragraph.height > sentence.height,
+            "a paragraph drew {:?} against a sentence's {:?}",
+            paragraph.height,
+            sentence.height
+        );
     }
 }
