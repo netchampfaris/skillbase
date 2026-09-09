@@ -2206,9 +2206,11 @@ impl DetailPane {
         let open = self.visibility_open;
         let shared = Registry::shared();
 
-        // Agents that exist on this machine, plus any that already hold a link
-        // to this skill. Zed is never here: its directory is the shared
-        // directory, so linking "into Zed" is the Shared switch.
+        // Agents on this machine, plus any that already hold a link to this
+        // skill. The scan decides what "on this machine" means, once, for the
+        // sidebar and this pane alike. Zed gets no row of its own: its
+        // directory is the shared directory, so linking "into Zed" is the
+        // Shared switch.
         let installed = self
             .scan
             .as_ref()
@@ -3905,13 +3907,17 @@ fn names_of(agents: &[&'static AgentDef]) -> String {
 /// switch for something that is not installed writes a link nothing reads —
 /// but a filter that removes six of fourteen rows without a word reads as a
 /// missing feature rather than a decision.
+///
+/// The names, not a count of them. The sidebar counts agents and this section
+/// lists only the ones that can hold a link of their own, so two numbers on
+/// one screen would differ by the agents covered by Shared and look like a
+/// contradiction. The names answer the question either way.
 fn absent_sentence(names: &[&'static str]) -> String {
     match names {
         [] => String::new(),
         [one] => format!("{one} is not installed on this machine, so it has no row here."),
         _ => format!(
-            "{} agents are not installed on this machine, so they have no rows here: {}.",
-            names.len(),
+            "These agents are not installed on this machine, so they have no rows here: {}.",
             names.join(", ")
         ),
     }
@@ -4756,7 +4762,7 @@ mod tests {
         );
         assert_eq!(
             absent_sentence(&["Cursor", "Gemini CLI", "Amp"]),
-            "3 agents are not installed on this machine, so they have no rows here: Cursor, \
+            "These agents are not installed on this machine, so they have no rows here: Cursor, \
              Gemini CLI, Amp."
         );
     }

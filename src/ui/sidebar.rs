@@ -179,10 +179,14 @@ impl Skillbase {
                                 // The group starts closed and lists only the
                                 // agents that are here, so without this the
                                 // reader cannot tell whether Skillbase knows
-                                // about the agent they are missing.
+                                // about the agent they are missing. It says
+                                // "installed" because that is what the two
+                                // numbers are about: with "Show all agents"
+                                // on, every agent has a row and the count
+                                // still reports how many are on the machine.
                                 .count(scan.map(|scan| {
                                     SharedString::from(format!(
-                                        "{} of {}",
+                                        "{} of {} installed",
                                         scan.installed.len(),
                                         Registry::all().iter().filter(|a| !a.is_shared()).count()
                                     ))

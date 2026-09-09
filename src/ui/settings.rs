@@ -112,9 +112,15 @@ impl Skillbase {
 
         section(
             "Directories",
+            // Directories, not agents, and it has to say so: the sidebar
+            // counts agents over a different total, and two bare fractions on
+            // two screens read as a contradiction. An agent that is installed
+            // can still have no skills directory, which is the second
+            // sentence.
             format!(
-                "{present} of {} exist on this machine. Skillbase reads all of them and writes \
-                 only where you ask it to.",
+                "{present} of these {} directories exist on this machine. Skillbase reads all of \
+                 them and writes only where you ask it to. An agent that is installed can still \
+                 have no directory here: it is created the first time the agent is given a skill.",
                 dirs.len()
             ),
             v_flex()
