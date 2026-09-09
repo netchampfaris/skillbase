@@ -35,13 +35,13 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
-    WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
+    StyledExt as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathPromptOptions, RenderOnce, SharedString,
+    ParentElement as _, PathPromptOptions, RenderOnce, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, div, px, rems,
 };
 use skillbase_core::{
@@ -66,6 +66,13 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// How many failed skills a batch summary names before it counts the rest.
 const NAMED_FAILURES: usize = 3;
+
+/// How tall the list of skills in the chooser is allowed to get.
+///
+/// About eight rows. A repository with three skills shows three rows and no
+/// more; a repository with forty scrolls, and the dialog stays short enough to
+/// keep Select all above the list and Install below it on screen.
+const CHOICES_MAX_HEIGHT: f32 = 260.;
 
 /// How long a job runs before the strip starts counting the seconds.
 const PROGRESS_AFTER_SECS: u64 = 2;
@@ -1045,6 +1052,11 @@ impl Skillbase {
         cx.notify();
 
         let this = cx.entity().downgrade();
+        // One scroll position for the life of the dialog. It is made here and
+        // captured, rather than kept in window state, because the builder runs
+        // again on every frame and the rows have to come back where the user
+        // left them.
+        let scroll = ScrollHandle::default();
         // Nothing in this builder may read this view. `open_dialog` keeps the
         // builder and calls it from `Root::render_dialog_layer`, which is part
         // of `Skillbase::render`, so the view is borrowed for the whole of it
@@ -1054,6 +1066,7 @@ impl Skillbase {
         // rather than as they were when the dialog opened.
         window.open_dialog(cx, move |dialog, _, _| {
             let this = this.clone();
+            let scroll = scroll.clone();
 
             dialog
                 .title(title.clone())
@@ -1063,6 +1076,7 @@ impl Skillbase {
                     let this = this.clone();
                     move |content, _, cx| {
                         let this = this.clone();
+                        let scroll = scroll.clone();
                         let choices: Vec<(SharedString, bool)> = this
                             .read_with(cx, |this, _| {
                                 this.install_choices
@@ -1114,50 +1128,7 @@ impl Skillbase {
                                                 }),
                                         ),
                                 )
-                                .child(
-                                    v_flex()
-                                        .id("install-choices")
-                                        .max_h(px(260.))
-                                        .overflow_y_scrollbar()
-                                        .rounded(cx.theme().radius)
-                                        .bg(cx.theme().group_box)
-                                        .children(choices.into_iter().map(|(path, on)| {
-                                            let this = this.clone();
-                                            let key = path.clone();
-                                            h_flex()
-                                                .id(ElementId::from((
-                                                    ElementId::from("install-choice"),
-                                                    path.clone(),
-                                                )))
-                                                .w_full()
-                                                .px_3()
-                                                .py_2()
-                                                .child(
-                                                    Checkbox::new(ElementId::from((
-                                                        ElementId::from("install-choice-box"),
-                                                        path.clone(),
-                                                    )))
-                                                    .checked(on)
-                                                    .label(path)
-                                                    .on_click(move |checked, _, cx| {
-                                                        let checked = *checked;
-                                                        let key = key.clone();
-                                                        this.update(cx, |this, cx| {
-                                                            for choice in &mut this.install_choices
-                                                            {
-                                                                if choice_label(&choice.location)
-                                                                    == key
-                                                                {
-                                                                    choice.selected = checked;
-                                                                }
-                                                            }
-                                                            cx.notify();
-                                                        })
-                                                        .ok();
-                                                    }),
-                                                )
-                                        })),
-                                ),
+                                .child(choice_list(choices, &this, &scroll, cx)),
                         )
                     }
                 })
@@ -2224,6 +2195,83 @@ fn choice_label(location: &SkillLocation) -> SharedString {
     }
 }
 
+/// The tickable list of a repository's skills, under a cap and scrolling.
+///
+/// The scroll area is built by hand rather than with `overflow_y_scrollbar`,
+/// which caps the element it wraps at the same height as the area that scrolls
+/// it: the rows past the cap are then clipped with nothing left to scroll to.
+/// Capping the element that holds the rows as its own children scrolls them
+/// instead. Only the rows move — the lead and Select all above the list and the
+/// buttons below it stay where they are.
+///
+/// `choices` is each row's path in the repository and whether it is ticked,
+/// read from the view one frame at a time; ticking one writes back through
+/// `this`.
+fn choice_list(
+    choices: Vec<(SharedString, bool)>,
+    this: &WeakEntity<Skillbase>,
+    scroll: &ScrollHandle,
+    cx: &App,
+) -> impl IntoElement {
+    let this = this.clone();
+    div()
+        .id("install-choices")
+        .debug_selector(|| "install-choices".into())
+        .relative()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().group_box)
+        .child(
+            v_flex()
+                .id("install-choice-rows")
+                .track_scroll(scroll)
+                .max_h(px(CHOICES_MAX_HEIGHT))
+                .overflow_y_scroll()
+                // Otherwise gpui folds a horizontal swipe onto the one axis
+                // this area scrolls.
+                .lock_scroll_axis()
+                .children(choices.into_iter().map(|(path, on)| {
+                    let this = this.clone();
+                    let key = path.clone();
+                    let selector = path.clone();
+                    h_flex()
+                        .id(ElementId::from((
+                            ElementId::from("install-choice"),
+                            path.clone(),
+                        )))
+                        .debug_selector(move || format!("install-choice:{selector}"))
+                        // Rows keep their height when the list is taller than
+                        // the cap; without this the flex column would squeeze
+                        // forty rows into the space of six.
+                        .flex_shrink_0()
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .child(
+                            Checkbox::new(ElementId::from((
+                                ElementId::from("install-choice-box"),
+                                path.clone(),
+                            )))
+                            .checked(on)
+                            .label(path)
+                            .on_click(move |checked, _, cx| {
+                                let checked = *checked;
+                                let key = key.clone();
+                                this.update(cx, |this, cx| {
+                                    for choice in &mut this.install_choices {
+                                        if choice_label(&choice.location) == key {
+                                            choice.selected = checked;
+                                        }
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                            }),
+                        )
+                })),
+        )
+        .vertical_scrollbar(scroll)
+}
+
 /// What to name in the progress strip before the first download starts.
 fn install_label(locations: &[SkillLocation]) -> SharedString {
     match locations.first() {
@@ -2534,10 +2582,12 @@ mod tests {
 #[cfg(test)]
 mod dialog_tests {
     use gpui_kit::component::{Root, WindowExt as _};
-    use gpui_kit::{Focusable as _, TestAppContext};
+    use gpui_kit::{
+        Focusable as _, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext, point, px,
+    };
     use skillbase_core::{RepoRef, SkillLocation};
 
-    use super::{Occupied, OccupiedSource, StartedFrom};
+    use super::{CHOICES_MAX_HEIGHT, Occupied, OccupiedSource, StartedFrom};
     use crate::ui::list::dialog_probe::{drawn, window};
 
     fn locations() -> Vec<SkillLocation> {
@@ -2549,6 +2599,36 @@ mod dialog_tests {
                 path: path.to_string(),
             })
             .collect()
+    }
+
+    /// A repository holding as many skills as asked for, named in order.
+    fn many_locations(count: usize) -> Vec<SkillLocation> {
+        let repo = RepoRef::new("anthropics", "skills", "main");
+        (0..count)
+            .map(|index| SkillLocation {
+                repo: repo.clone(),
+                path: format!("skills/skill-{index:02}"),
+            })
+            .collect()
+    }
+
+    /// Open the chooser on a repository holding `count` skills and draw it.
+    fn chooser(cx: &mut TestAppContext, count: usize) -> VisualTestContext {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| {
+                this.open_location_dialog(
+                    "anthropics/skills".into(),
+                    format!("It holds {count} skills.").into(),
+                    many_locations(count),
+                    StartedFrom::Discover,
+                    window,
+                    cx,
+                );
+            });
+        });
+        drawn(&mut cx);
+        cx
     }
 
     #[gpui_kit::test]
@@ -2676,6 +2756,98 @@ mod dialog_tests {
             });
             assert_eq!(counted, ticked);
         }
+    }
+
+    /// Forty skills used to leave everything past the sixth row unreachable:
+    /// the list was capped, and the rows under the cap were clipped away with
+    /// nothing to scroll.
+    #[gpui_kit::test]
+    fn the_chooser_scrolls_a_long_list(cx: &mut TestAppContext) {
+        let mut cx = chooser(cx, 40);
+
+        // Read afresh on every frame: the dialog is still sliding into place
+        // while this runs, so bounds taken from an earlier frame sit a few
+        // pixels above where the list now is.
+        let list = |cx: &mut VisualTestContext| {
+            cx.debug_bounds("install-choices")
+                .expect("the list of skills drew")
+        };
+        let last_row = |cx: &mut VisualTestContext| {
+            cx.debug_bounds("install-choice:skills/skill-39")
+                .expect("the last row drew")
+        };
+
+        let area = list(&mut cx);
+        assert!(
+            area.size.height <= px(CHOICES_MAX_HEIGHT + 1.),
+            "forty skills should not make the list {} tall",
+            area.size.height
+        );
+        assert!(
+            last_row(&mut cx).top() > area.bottom(),
+            "the last row should start out below the fold"
+        );
+
+        // A wheel turn at a time, each one drawn: the scroll is clamped
+        // against the frame it last drew. Stops as soon as the whole of the
+        // last row is in view, which is the thing under test.
+        let mut reached = false;
+        for _ in 0..12 {
+            let area = list(&mut cx);
+            let row = last_row(&mut cx);
+            if row.top() >= area.top() && row.bottom() <= area.bottom() {
+                reached = true;
+                break;
+            }
+            cx.simulate_event(ScrollWheelEvent {
+                position: area.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-200.))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        }
+
+        let area = list(&mut cx);
+        let row = last_row(&mut cx);
+        assert!(
+            reached,
+            "the wheel should have brought the whole of the last row into the \
+             list, which ends at {}, and left it at {row:?}",
+            area.bottom()
+        );
+
+        // Only the rows moved. The list is still its own height, in one piece,
+        // with the lead and Select all above it and the buttons below.
+        assert!(
+            area.size.height <= px(CHOICES_MAX_HEIGHT + 1.),
+            "the list should not have grown while it scrolled"
+        );
+        assert!(
+            cx.debug_bounds("dialog-layer").is_some(),
+            "the dialog should still be standing"
+        );
+    }
+
+    /// The cap is a ceiling, not a height: two skills make a dialog two rows
+    /// tall, with no empty space under them.
+    #[gpui_kit::test]
+    fn the_chooser_stays_short_for_two_skills(cx: &mut TestAppContext) {
+        let mut cx = chooser(cx, 2);
+
+        let area = cx
+            .debug_bounds("install-choices")
+            .expect("the list of skills drew");
+        let row = cx
+            .debug_bounds("install-choice:skills/skill-00")
+            .expect("the first row drew");
+        assert!(
+            area.size.height < px(CHOICES_MAX_HEIGHT),
+            "two skills should not fill the cap"
+        );
+        assert!(
+            area.size.height <= row.size.height * 2. + px(1.),
+            "the list should be as tall as its two rows and no taller"
+        );
     }
 
     #[gpui_kit::test]
