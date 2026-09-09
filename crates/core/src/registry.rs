@@ -5,11 +5,15 @@
 //! agents that read `~/.agents/skills/` changed substantially during 2026 and
 //! will change again.
 //!
-//! Nothing here touches the filesystem. Paths are resolved against a home
-//! directory handed in by the caller ([`Roots::new`]), which is what makes
-//! discovery and installation testable against a fake home instead of the
-//! user's real one. [`home_dir`] is the only function that asks the operating
-//! system, and it is the application's job to call it.
+//! Paths are resolved against a home directory handed in by the caller
+//! ([`Roots::new`]), which is what makes discovery and installation testable
+//! against a fake home instead of the user's real one. [`home_dir`] is the
+//! only function that asks the operating system, and it is the application's
+//! job to call it.
+//!
+//! The filesystem is read in two places only: [`Roots::new`] canonicalizes the
+//! home it is given, and [`Roots::agent_present`] asks whether an agent's own
+//! directory is there. Everything else is arithmetic on paths.
 
 use std::path::{Path, PathBuf};
 
@@ -81,6 +85,26 @@ impl GlobalDir {
     }
 }
 
+/// How Skillbase decides whether an agent is on this machine.
+///
+/// A different question from whether the agent has any skills, and the reason
+/// this is not the skills directory: `~/.claude/skills` does not exist until
+/// somebody puts a skill in it, so testing for it reports Claude Code as
+/// absent on a machine that plainly has it. The directory named here is the
+/// agent's own, which exists as soon as the agent has been run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Presence {
+    /// The agent is on the machine when this directory, relative to the home
+    /// directory, exists.
+    HomeDir(&'static str),
+    /// Nothing on disk says whether this row is here.
+    ///
+    /// The shared scope is the case: its directory is `~/.agents/skills`,
+    /// which Skillbase creates itself, so its existence says nothing about
+    /// what else is on the machine.
+    Unknown,
+}
+
 /// Whether a skill reaches an agent's directory as a symlink or as a copy.
 ///
 /// Symlinks are the default and the point of the application: one edit lands
@@ -120,6 +144,11 @@ pub struct AgentDef {
     pub display_name: &'static str,
     /// How to resolve the global skills directory.
     pub global_dir: GlobalDir,
+    /// What says this agent is on the machine.
+    ///
+    /// Never the skills directory, and never the shared directory: see
+    /// [`Presence`].
+    pub presence: Presence,
     /// The project-scoped directory, relative to a project root. `None` when
     /// the agent has no project scope. Recorded for completeness; project
     /// scopes are out of scope for v1.
@@ -137,6 +166,19 @@ impl AgentDef {
     /// The absolute global skills directory for this agent under `home`.
     pub fn resolve(&self, home: &Path) -> PathBuf {
         home.join(self.global_dir.relative())
+    }
+
+    /// The directory whose existence means this agent is on the machine,
+    /// resolved under `home`.
+    ///
+    /// `None` when nothing on disk answers the question. Ask
+    /// [`Roots::agent_present`] rather than this, unless the path itself is
+    /// what is wanted.
+    pub fn presence_dir(&self, home: &Path) -> Option<PathBuf> {
+        match self.presence {
+            Presence::HomeDir(dir) => Some(home.join(dir)),
+            Presence::Unknown => None,
+        }
     }
 
     /// True for the shared scope itself.
@@ -178,6 +220,7 @@ static AGENTS: &[AgentDef] = &[
         id: SHARED_ID,
         display_name: "All agents (shared)",
         global_dir: GlobalDir::Shared,
+        presence: Presence::Unknown,
         project_dir: Some(".agents/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -187,6 +230,7 @@ static AGENTS: &[AgentDef] = &[
         id: "claude-code",
         display_name: "Claude Code",
         global_dir: GlobalDir::UnderHome(".claude/skills"),
+        presence: Presence::HomeDir(".claude"),
         project_dir: Some(".claude/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: false,
@@ -196,6 +240,7 @@ static AGENTS: &[AgentDef] = &[
         id: "codex",
         display_name: "Codex",
         global_dir: GlobalDir::UnderHome(".codex/skills"),
+        presence: Presence::HomeDir(".codex"),
         project_dir: Some(".agents/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -205,6 +250,7 @@ static AGENTS: &[AgentDef] = &[
         id: "cursor",
         display_name: "Cursor",
         global_dir: GlobalDir::UnderHome(".cursor/skills"),
+        presence: Presence::HomeDir(".cursor"),
         project_dir: Some(".cursor/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -214,6 +260,7 @@ static AGENTS: &[AgentDef] = &[
         id: "gemini-cli",
         display_name: "Gemini CLI",
         global_dir: GlobalDir::UnderHome(".gemini/skills"),
+        presence: Presence::HomeDir(".gemini"),
         project_dir: Some(".gemini/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -223,6 +270,7 @@ static AGENTS: &[AgentDef] = &[
         id: "opencode",
         display_name: "opencode",
         global_dir: GlobalDir::UnderHome(".config/opencode/skills"),
+        presence: Presence::HomeDir(".config/opencode"),
         project_dir: Some(".opencode/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -232,6 +280,7 @@ static AGENTS: &[AgentDef] = &[
         id: "goose",
         display_name: "Goose",
         global_dir: GlobalDir::UnderHome(".config/goose/skills"),
+        presence: Presence::HomeDir(".config/goose"),
         project_dir: Some(".goose/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -241,6 +290,10 @@ static AGENTS: &[AgentDef] = &[
         id: "amp",
         display_name: "Amp",
         global_dir: GlobalDir::UnderHome(".config/agents/skills"),
+        // Amp's own directory, not the parent of its skills directory:
+        // `~/.config/agents` is a vendor-neutral name that another tool can
+        // create, so it says nothing about Amp.
+        presence: Presence::HomeDir(".config/amp"),
         project_dir: Some(".agents/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -250,6 +303,7 @@ static AGENTS: &[AgentDef] = &[
         id: "copilot",
         display_name: "GitHub Copilot",
         global_dir: GlobalDir::UnderHome(".copilot/skills"),
+        presence: Presence::HomeDir(".copilot"),
         project_dir: Some(".github/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -259,6 +313,10 @@ static AGENTS: &[AgentDef] = &[
         id: "zed",
         display_name: "Zed",
         global_dir: GlobalDir::Shared,
+        // Zed's settings directory. Its skills directory is the shared one,
+        // which Skillbase creates itself, so that directory would report Zed
+        // as installed on a machine that has never had it.
+        presence: Presence::HomeDir(".config/zed"),
         project_dir: Some(".agents/skills"),
         link_mode: LinkMode::Symlink,
         // Zed reads the shared directory, and its global directory *is* the
@@ -270,6 +328,7 @@ static AGENTS: &[AgentDef] = &[
         id: "cline",
         display_name: "Cline",
         global_dir: GlobalDir::UnderHome(".cline/skills"),
+        presence: Presence::HomeDir(".cline"),
         project_dir: Some(".cline/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: false,
@@ -279,6 +338,7 @@ static AGENTS: &[AgentDef] = &[
         id: "junie",
         display_name: "JetBrains Junie",
         global_dir: GlobalDir::UnderHome(".junie/skills"),
+        presence: Presence::HomeDir(".junie"),
         project_dir: Some(".junie/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -288,6 +348,7 @@ static AGENTS: &[AgentDef] = &[
         id: "warp",
         display_name: "Warp",
         global_dir: GlobalDir::UnderHome(".warp/skills"),
+        presence: Presence::HomeDir(".warp"),
         project_dir: Some(".warp/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -297,6 +358,7 @@ static AGENTS: &[AgentDef] = &[
         id: "kiro",
         display_name: "Kiro",
         global_dir: GlobalDir::UnderHome(".kiro/skills"),
+        presence: Presence::HomeDir(".kiro"),
         project_dir: Some(".kiro/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -306,6 +368,7 @@ static AGENTS: &[AgentDef] = &[
         id: "devin",
         display_name: "Devin Desktop",
         global_dir: GlobalDir::UnderHome(".devin/skills"),
+        presence: Presence::HomeDir(".devin"),
         project_dir: Some(".devin/skills"),
         link_mode: LinkMode::Symlink,
         reads_shared: true,
@@ -474,6 +537,29 @@ impl Roots {
         agent.resolve(&self.home)
     }
 
+    /// True when this agent is on this machine.
+    ///
+    /// The one answer to that question: every count and every list that draws
+    /// the distinction asks this, so they cannot come to disagree. It reads
+    /// the agent's own directory, not its skills directory — see
+    /// [`Presence`] for why the two are not the same question.
+    pub fn agent_present(&self, agent: &AgentDef) -> bool {
+        agent
+            .presence_dir(&self.home)
+            .is_some_and(|dir| dir.is_dir())
+    }
+
+    /// Every agent on this machine, in registry order.
+    ///
+    /// Without the shared scope, which is a directory rather than an agent.
+    pub fn present_agents(&self) -> Vec<&'static AgentDef> {
+        Registry::all()
+            .iter()
+            .filter(|agent| !agent.is_shared())
+            .filter(|agent| self.agent_present(agent))
+            .collect()
+    }
+
     /// The directory this agent's disabled links are parked in, when it has
     /// one.
     pub fn disabled_dir(&self, agent: &AgentDef) -> Option<PathBuf> {
@@ -529,6 +615,7 @@ impl Roots {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixture::Fixture;
 
     #[test]
     fn the_table_holds_every_agent_exactly_once() {
@@ -675,6 +762,108 @@ mod tests {
             roots.scope_roots().len() - 1,
             "the trash is the only difference"
         );
+    }
+
+    #[test]
+    fn every_agent_answers_presence_from_a_directory_of_its_own() {
+        let home = Path::new("/fake/home");
+        let shared = Path::new("/fake/home/.agents/skills");
+        for agent in Registry::all() {
+            if agent.is_shared() {
+                assert_eq!(
+                    agent.presence,
+                    Presence::Unknown,
+                    "the shared scope is a directory, not an agent"
+                );
+                continue;
+            }
+            let dir = agent
+                .presence_dir(home)
+                .unwrap_or_else(|| panic!("{} needs a presence directory", agent.id));
+            assert_ne!(
+                dir,
+                agent.resolve(home),
+                "{}: the skills directory does not exist until a skill does",
+                agent.id
+            );
+            assert_ne!(
+                dir, shared,
+                "{}: the shared directory is Skillbase's own",
+                agent.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_shared_store_on_its_own_makes_no_agent_present() {
+        // What a machine looks like after Skillbase has installed one skill
+        // and nothing else has ever run: the store exists, no agent does.
+        let fx = Fixture::empty();
+        fx.skill(".agents/skills/react-pdf", "react-pdf");
+        let roots = fx.roots();
+
+        let zed = Registry::get("zed").unwrap();
+        assert_eq!(roots.agent_dir(zed), roots.shared_dir());
+        assert!(
+            !roots.agent_present(zed),
+            "Zed's skills directory is the store, so the store says nothing about Zed"
+        );
+        assert!(
+            roots.present_agents().is_empty(),
+            "no agent is on this machine: {:?}",
+            roots
+                .present_agents()
+                .iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_agent_is_present_before_it_has_a_skills_directory() {
+        // Claude Code is installed and has never been given a skill, so
+        // `~/.claude/skills` does not exist yet. Creating it is Skillbase's
+        // job, which it cannot offer if it says the agent is not here.
+        let fx = Fixture::empty();
+        fx.dir(".claude");
+        let roots = fx.roots();
+        let claude = Registry::get("claude-code").unwrap();
+
+        assert!(!roots.agent_dir(claude).is_dir());
+        assert!(roots.agent_present(claude));
+        let ids: Vec<_> = roots.present_agents().iter().map(|a| a.id).collect();
+        assert_eq!(ids, ["claude-code"]);
+    }
+
+    #[test]
+    fn an_agent_with_nothing_on_disk_is_absent() {
+        let fx = Fixture::empty();
+        fx.dir(".claude");
+        let roots = fx.roots();
+        let cursor = Registry::get("cursor").unwrap();
+
+        assert!(!roots.agent_present(cursor));
+        assert!(!roots.present_agents().contains(&cursor));
+    }
+
+    #[test]
+    fn a_shared_directory_agent_is_present_through_its_own_directory() {
+        // The other half of the Zed rule: Zed is reported when Zed is here,
+        // and what reports it is Zed's own configuration directory.
+        let fx = Fixture::empty();
+        fx.dir(".config/zed");
+        let roots = fx.roots();
+        let zed = Registry::get("zed").unwrap();
+
+        assert!(roots.agent_present(zed));
+        assert!(roots.present_agents().contains(&zed));
+    }
+
+    #[test]
+    fn present_agents_come_back_in_registry_order_without_the_shared_scope() {
+        let fx = Fixture::realistic();
+        let ids: Vec<_> = fx.roots().present_agents().iter().map(|a| a.id).collect();
+        assert_eq!(ids, ["claude-code", "codex", "cursor", "gemini-cli"]);
     }
 
     #[test]

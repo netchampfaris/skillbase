@@ -118,7 +118,7 @@ pub use provenance::{
     LockEntry, PROVENANCE_KEYS, Provenance, SKILL_LOCK_FILE, SkillLock, split_owner_repo,
 };
 pub use registry::{
-    AgentDef, DisableMode, GlobalDir, LinkMode, PRIVATE_DIR, PRIVATE_ID, Registry, Roots,
+    AgentDef, DisableMode, GlobalDir, LinkMode, PRIVATE_DIR, PRIVATE_ID, Presence, Registry, Roots,
     SHARED_ID, SHARED_SKILLS_DIR, STORE_DIR, UNSUPPORTED, home_dir,
 };
 pub use remote::{

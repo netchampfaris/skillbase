@@ -959,8 +959,10 @@ pub struct Scan {
     pub skills: Vec<SkillView>,
     /// Everything discovery could not read, in the order it was noticed.
     pub warnings: Vec<SharedString>,
-    /// Agents whose global directory exists on this machine, in registry
-    /// order, without the shared scope.
+    /// Agents on this machine, in registry order, without the shared scope.
+    ///
+    /// [`Roots::present_agents`] decides, so the sidebar, the detail pane and
+    /// the bulk-link menu all draw the line in the same place.
     pub installed: Vec<&'static AgentDef>,
     /// Every directory the scan looked in, and whether it is there: the store
     /// first, then the shared directory, then one row per agent.
@@ -985,11 +987,10 @@ impl Scan {
 
         let agent_counts: HashMap<&'static str, usize> =
             result.counts_by_agent().into_iter().collect();
-        let installed = Registry::all()
-            .iter()
-            .filter(|agent| !agent.is_shared())
-            .filter(|agent| roots.agent_dir(agent).is_dir())
-            .collect::<Vec<_>>();
+        // One rule, asked in one place: an agent is here when its own
+        // directory is, not when its skills directory is. See
+        // `Presence` in the registry.
+        let installed = roots.present_agents();
 
         // The store is `~/.agents/skills`, which the shared row below already
         // lists. What is worth a row of its own is the private directory,
@@ -1728,5 +1729,40 @@ mod tests {
         assert_eq!(Scope::from_key("all"), None);
         assert_eq!(Scope::from_key("agent:library:all"), None);
         assert_eq!(Scope::from_key(""), None);
+    }
+
+    /// The two ways this used to go wrong, through the scan the sidebar, the
+    /// detail pane and the bulk-link menu all read.
+    #[test]
+    fn the_scan_takes_an_agent_from_the_agent_and_not_from_the_store() {
+        let home = TempHome::new();
+        let roots = home.roots();
+
+        // A machine with one installed skill and no agents on it. The store is
+        // there because Skillbase made it, and it is also Zed's skills
+        // directory, which is not Zed being here.
+        let skill = roots.store_dir().join("react-pdf");
+        fs::create_dir_all(&skill).expect("a store");
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: react-pdf\ndescription: A skill.\n---\n",
+        )
+        .expect("a skill");
+
+        let scan = Scan::load(&roots);
+        assert_eq!(scan.skills.len(), 1);
+        let ids: Vec<_> = scan.installed.iter().map(|agent| agent.id).collect();
+        assert!(ids.is_empty(), "no agent is on this machine: {ids:?}");
+
+        // Claude Code, installed and never given a skill, so it has no skills
+        // directory yet. Creating that directory is Skillbase's job, which it
+        // cannot offer while it says the agent is not here.
+        fs::create_dir_all(roots.home().join(".claude")).expect("a Claude Code directory");
+        let claude = Registry::get("claude-code").expect("Claude Code is in the table");
+        assert!(!roots.agent_dir(claude).is_dir());
+
+        let scan = Scan::load(&roots);
+        let ids: Vec<_> = scan.installed.iter().map(|agent| agent.id).collect();
+        assert_eq!(ids, ["claude-code"]);
     }
 }
