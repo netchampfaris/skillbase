@@ -22,6 +22,13 @@
 //! that holds a `SKILL.md`, which is also how it copes with a skill sitting at
 //! the repository root and with a repository holding the same skill id twice.
 //!
+//! A hit carries no description either, so two results called `pdf` say
+//! nothing that tells them apart beyond the repository they come from.
+//! [`describe`] is the answer to that: it settles where the skill is and reads
+//! the `description` out of its own `SKILL.md`. It costs three requests against
+//! GitHub's hourly budget, so it is called for one hit at a time, when
+//! something asks about that hit, and never for a whole page of results.
+//!
 //! The query must be at least [`MIN_QUERY_LEN`] characters and `limit` is
 //! capped at [`MAX_LIMIT`]. `owner` narrows a search; category and tag
 //! parameters are accepted by the server and silently ignored, so this module
@@ -32,6 +39,7 @@
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::doc::SkillDoc;
 use crate::github::{GitHub, GitHubError, RepoRef, SkillLocation};
 use crate::http::{Http, HttpError};
 use crate::provenance::split_owner_repo;
@@ -220,6 +228,86 @@ pub fn resolve<H: Http>(
     hit: &SearchHit,
     reference: Option<&str>,
 ) -> Result<Vec<SkillLocation>, GitHubError> {
+    let (repo, _, paths) = locate(gh, hit, reference)?;
+    Ok(paths
+        .into_iter()
+        .map(|path| SkillLocation::new(repo.clone(), path))
+        .collect())
+}
+
+/// What a search result actually is, read from the repository it names.
+///
+/// The registry answers with a name, an owner and an install count, none of
+/// which says what the skill does. This is the rest of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitDetail {
+    /// The skill's directory within the repository. Empty at the root.
+    pub path: String,
+    /// The branch or tag it was read from.
+    pub reference: String,
+    /// The `description` from its `SKILL.md`, when the file has one.
+    pub description: Option<String>,
+}
+
+/// Reads what a search result says about itself.
+///
+/// Settles where the skill is the same way [`resolve`] does, then reads the
+/// first directory's `SKILL.md` from `raw.githubusercontent.com`. `Ok(None)`
+/// means the repository holds no such directory, which is the same disagreement
+/// between registry and repository that an empty [`resolve`] reports.
+///
+/// A hit that resolves to more than one directory is described by the first of
+/// them, in tree order. Two directories of the same name in one repository is
+/// rare, and one description is closer to an answer than none.
+///
+/// Three requests against GitHub's hourly budget: the default branch, the ref,
+/// and the tree. Reading the file itself costs nothing, because
+/// `raw.githubusercontent.com` is not on that budget.
+///
+/// Blocking, and it makes network requests. Run it on a background task.
+pub fn describe<H: Http>(
+    gh: &GitHub<H>,
+    hit: &SearchHit,
+) -> Result<Option<HitDetail>, GitHubError> {
+    let (repo, commit, paths) = locate(gh, hit, None)?;
+    let Some(path) = paths.into_iter().next() else {
+        return Ok(None);
+    };
+    let file = if path.is_empty() {
+        "SKILL.md".to_string()
+    } else {
+        format!("{path}/SKILL.md")
+    };
+    // Anything the file turns out not to be is the same answer as no
+    // description: bytes that are not UTF-8, a document with no frontmatter, a
+    // frontmatter with no `description`. The path and the branch are worth
+    // handing back either way, because they are what tells two rows apart when
+    // neither has a description.
+    let description = gh
+        .fetch_file(&repo, &commit, &file)?
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| SkillDoc::parse(&text).ok())
+        .and_then(|doc| doc.frontmatter.description().map(str::to_string))
+        .map(|description| description.trim().to_string())
+        .filter(|description| !description.is_empty());
+
+    Ok(Some(HitDetail {
+        path,
+        reference: repo.reference,
+        description,
+    }))
+}
+
+/// The repository, the commit its ref points at, and every directory in it that
+/// answers to the hit's skill id.
+///
+/// Shared by [`resolve`] and [`describe`] so the two cannot come to disagree
+/// about where a search result points.
+fn locate<H: Http>(
+    gh: &GitHub<H>,
+    hit: &SearchHit,
+    reference: Option<&str>,
+) -> Result<(RepoRef, String, Vec<String>), GitHubError> {
     let (owner, repo_name) = hit.owner_repo().ok_or_else(|| GitHubError::NotFound {
         what: format!("a repository named `{}`", hit.source),
     })?;
@@ -234,11 +322,8 @@ pub fn resolve<H: Http>(
     } else {
         hit.skill_id.as_str()
     };
-    Ok(gh
-        .find_skill_dirs(&repo, &commit, skill_id)?
-        .into_iter()
-        .map(|path| SkillLocation::new(repo.clone(), path))
-        .collect())
+    let paths = gh.find_skill_dirs(&repo, &commit, skill_id)?;
+    Ok((repo, commit, paths))
 }
 
 /// Percent-encodes a query parameter value.
@@ -435,6 +520,101 @@ mod tests {
                 .urls()
                 .contains(&"https://api.test/repos/o/pdf".to_string())
         );
+    }
+
+    /// A repository holding one `pdf`, wired for both lookups.
+    fn described_repo() -> FakeHttp {
+        let http = FakeHttp::new();
+        http.json(
+            "https://api.test/repos/o/r",
+            r#"{"default_branch":"trunk"}"#,
+        );
+        http.json(
+            "https://api.test/repos/o/r/git/ref/heads/trunk",
+            r#"{"object":{"sha":"c1","type":"commit"}}"#,
+        );
+        http.json(
+            "https://api.test/repos/o/r/git/trees/c1?recursive=1",
+            r#"{"sha":"root","truncated":false,"tree":[
+                {"path":"skills/pdf/SKILL.md","type":"blob","sha":"b1"}]}"#,
+        );
+        http
+    }
+
+    fn described_hit() -> SearchHit {
+        SearchHit {
+            id: "cm7".into(),
+            skill_id: "pdf".into(),
+            name: "pdf".into(),
+            installs: 12,
+            source: "o/r".into(),
+        }
+    }
+
+    #[test]
+    fn a_hit_is_described_by_its_own_skill_file() {
+        let http = described_repo();
+        http.reply(
+            "https://raw.test/o/r/c1/skills/pdf/SKILL.md",
+            HttpResponse::new(
+                200,
+                b"---\nname: pdf\ndescription:  Fill in PDF forms.  \n---\n\nBody.\n".to_vec(),
+            ),
+        );
+        let gh = GitHub::new(http).with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        );
+
+        let detail = describe(&gh, &described_hit()).unwrap().unwrap();
+        assert_eq!(detail.path, "skills/pdf");
+        assert_eq!(detail.reference, "trunk");
+        assert_eq!(detail.description.as_deref(), Some("Fill in PDF forms."));
+    }
+
+    #[test]
+    fn a_skill_file_with_nothing_to_say_still_names_where_it_is() {
+        // No frontmatter at all, which is not a reason to withhold the path:
+        // the path is what tells two rows of the same name apart.
+        let http = described_repo();
+        http.reply(
+            "https://raw.test/o/r/c1/skills/pdf/SKILL.md",
+            HttpResponse::new(200, b"Just a heading.\n".to_vec()),
+        );
+        let gh = GitHub::new(http).with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        );
+
+        let detail = describe(&gh, &described_hit()).unwrap().unwrap();
+        assert_eq!(detail.path, "skills/pdf");
+        assert_eq!(detail.description, None);
+    }
+
+    #[test]
+    fn a_hit_the_repository_does_not_hold_describes_nothing() {
+        let http = FakeHttp::new();
+        http.json(
+            "https://api.test/repos/o/r",
+            r#"{"default_branch":"trunk"}"#,
+        );
+        http.json(
+            "https://api.test/repos/o/r/git/ref/heads/trunk",
+            r#"{"object":{"sha":"c1","type":"commit"}}"#,
+        );
+        http.json(
+            "https://api.test/repos/o/r/git/trees/c1?recursive=1",
+            r#"{"sha":"root","truncated":false,"tree":[
+                {"path":"skills/docx/SKILL.md","type":"blob","sha":"b1"}]}"#,
+        );
+        let gh = GitHub::new(http).with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        );
+        assert_eq!(describe(&gh, &described_hit()).unwrap(), None);
     }
 
     #[test]

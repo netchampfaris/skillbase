@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -41,19 +41,22 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathPromptOptions, RenderOnce, SharedString, Styled as _, WeakEntity,
-    Window, div, px, rems,
+    ParentElement as _, PathPromptOptions, RenderOnce, SharedString,
+    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, div, px, rems,
 };
 use skillbase_core::{
-    DEFAULT_LIMIT, FetchError, GitHub, ImportOptions, InstallError, InstallOptions, Installed,
-    Installer, MIN_QUERY_LEN, ParsedLocation, Roots, SearchHit, SearchResults, SkillLocation,
-    SkillsSh, UreqHttp, resolve,
+    AgentDef, DEFAULT_LIMIT, FetchError, GitHub, HitDetail, ImportOptions, InstallError,
+    InstallOptions, Installed, Installer, MIN_QUERY_LEN, ParsedLocation, Roots, SearchHit,
+    SearchResults, SkillLocation, SkillsSh, UreqHttp, describe, resolve,
 };
 
 use crate::app::{Skillbase, WorkArea};
 
-use super::model::display_path;
-use super::{PAGE_MAX_WIDTH, capitalized, install_skill, report, report_install};
+use super::model::{Scan, display_path};
+use super::{
+    Notice, PAGE_MAX_WIDTH, cannot_see, capitalized, install_outcome, install_skill, push_notice,
+    reach_sentence, report, report_install,
+};
 
 /// How long typing has to stop before a search is sent.
 ///
@@ -63,6 +66,13 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// How many failed skills a batch summary names before it counts the rest.
 const NAMED_FAILURES: usize = 3;
+
+/// How long a job runs before the strip starts counting the seconds.
+const PROGRESS_AFTER_SECS: u64 = 2;
+
+/// How often the strip is repainted while a job runs, so the count of seconds
+/// moves. Twice a second, so the number never looks stuck between ticks.
+const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
 /// Where the registry search has got to.
 pub(crate) enum SearchState {
@@ -95,6 +105,13 @@ pub(crate) struct JobId(u64);
 pub(crate) struct Installing {
     /// Tells this job apart from the next one to hold the same slot.
     id: JobId,
+    /// When the job started, so the strip can say how long it has been going.
+    ///
+    /// The bytes cannot be counted — the HTTP layer reads a response whole, so
+    /// there is no progress to report and a percentage would be invented — but
+    /// how long it has been waiting is a fact, and it is the difference between
+    /// a window that is working and one that has stopped.
+    started: Instant,
     /// What the job's sentence leads with, lower-case so it can sit inside a
     /// longer one: "downloading", "updating", "copying". The strip capitalizes
     /// it.
@@ -139,6 +156,7 @@ impl Installing {
     pub(crate) fn new(verb: &'static str, waiting: impl Into<SharedString>) -> Self {
         Self {
             id: JobId(NEXT_JOB.fetch_add(1, Ordering::Relaxed)),
+            started: Instant::now(),
             verb,
             name: None,
             waiting: waiting.into(),
@@ -256,6 +274,17 @@ impl Installing {
     fn count(&self) -> Option<SharedString> {
         (self.total > 1).then(|| format!("{} of {}", self.index + 1, self.total).into())
     }
+
+    /// How long the job has been running, once that is worth saying.
+    ///
+    /// Nothing for the first couple of seconds: a download that is over before
+    /// it can be read does not need a clock, and one that appears and vanishes
+    /// is noise. Past that the number is what says the wait is a wait rather
+    /// than a window that has stopped.
+    fn elapsed(&self) -> Option<SharedString> {
+        let seconds = self.started.elapsed().as_secs();
+        (seconds >= PROGRESS_AFTER_SECS).then(|| format!("{seconds}s").into())
+    }
 }
 
 /// One skill a repository offers, and whether it is ticked for install.
@@ -309,11 +338,13 @@ impl RenderOnce for InstallChoiceButton {
                         return;
                     }
                     let label = install_label(&chosen);
+                    let from = this.install_choices_from;
                     this.run_install(
                         InstallPlan::Ready(chosen),
                         InstallOptions::new(),
                         label,
                         None,
+                        from,
                         window,
                         cx,
                     );
@@ -322,6 +353,87 @@ impl RenderOnce for InstallChoiceButton {
                 window.close_dialog(cx);
             })
     }
+}
+
+/// What a result row already is on this machine.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum RowState {
+    /// Nothing in the store answers to it.
+    New,
+    /// It is already installed, under this name.
+    Installed(SharedString),
+    /// A skill of that name is in the store, but it came from somewhere else.
+    /// Installing this one is a real request, and it will have to be answered.
+    NameTaken,
+}
+
+/// What is known about one result beyond the four fields the registry sends.
+pub(crate) enum Described {
+    /// The repository is being asked.
+    Reading,
+    Ready(Rc<HitDetail>),
+    /// Nothing came back, and this says why.
+    Failed(SharedString),
+}
+
+/// Whether this result is already in the store.
+///
+/// Decided on where a skill came from rather than on its name alone. A skill's
+/// name in the store is read from its own frontmatter and need not match the
+/// directory the registry lists, and `pdf` is a name three separate
+/// repositories use: matching on the name alone would report the wrong one of
+/// them as installed. A name that is taken by a skill from elsewhere is its own
+/// answer, because installing this one has to settle that clash.
+fn row_state(scan: Option<&Scan>, hit: &SearchHit) -> RowState {
+    let Some(scan) = scan else {
+        return RowState::New;
+    };
+    let wanted = if hit.skill_id.is_empty() {
+        hit.name.as_str()
+    } else {
+        hit.skill_id.as_str()
+    };
+    let source = hit.owner_repo();
+
+    for skill in &scan.skills {
+        let same_repo = skill
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.owner_repo())
+            .is_some_and(|installed| Some(installed) == source);
+        // The directory it was installed from, which is what the registry's
+        // skill id names. A skill at the repository root is named by the
+        // repository.
+        let same_dir = skill.provenance.as_ref().is_some_and(|provenance| {
+            provenance
+                .path
+                .rsplit('/')
+                .next()
+                .is_some_and(|dir| dir == wanted)
+        });
+        if same_repo && (same_dir || skill.name == wanted) {
+            return RowState::Installed(skill.name.clone());
+        }
+    }
+    if scan.skills.iter().any(|skill| skill.name == wanted) {
+        return RowState::NameTaken;
+    }
+    RowState::New
+}
+
+/// Where an install was started from, which decides where the window is when
+/// it lands.
+///
+/// Discover is a place to install several things from: a work area that jumps
+/// to the library after each one breaks that, and it is what the user asked to
+/// have stopped. Everywhere else names one skill and expects to be taken to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StartedFrom {
+    /// A Discover result row. The view stays where it is.
+    Discover,
+    /// The Install from GitHub dialog, the menu bar, or a folder on this
+    /// machine. The list opens on what landed.
+    Elsewhere,
 }
 
 /// What an install task was asked to do.
@@ -360,6 +472,9 @@ enum Settled {
 struct Occupied {
     /// Where the skill that could not be written was coming from.
     source: OccupiedSource,
+    /// Which view asked for it, so that answering the dialog lands where the
+    /// install that raised it would have landed.
+    from: StartedFrom,
     /// The name that is taken.
     name: SharedString,
     /// The directory in the way.
@@ -486,6 +601,16 @@ impl Skillbase {
                     .text_color(cx.theme().muted_foreground)
                     .child(count)
             }))
+            // The one thing this side actually knows about how far a download
+            // has got. Nothing counts the bytes, so a percentage would be
+            // invented; the seconds are true, and they are what says the wait
+            // is a wait.
+            .children(progress.elapsed().map(|elapsed| {
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(elapsed)
+            }))
             .child(div().flex_1())
             .when(progress.stoppable(), |this| {
                 this.child(
@@ -570,10 +695,14 @@ impl Skillbase {
 
     /// One search result.
     ///
-    /// skills.sh returns no description, so there is nothing to put under the
-    /// name. What the row can answer instead is which repository it comes from
-    /// and how many people have installed it, which is the whole basis for
-    /// choosing between two rows with similar names.
+    /// skills.sh answers with a name, a repository and an install count and
+    /// nothing else — no description — so three rows called `pdf` say nothing
+    /// that tells them apart. Opening a row is what asks the repository: see
+    /// [`Skillbase::toggle_hit`].
+    ///
+    /// The row also says whether the skill is already in the store, because the
+    /// alternative is a second download of something the user already has,
+    /// answered only once it has been fetched.
     fn result_row(&self, hit: &SearchHit, cx: &mut Context<Self>) -> AnyElement {
         let hit = hit.clone();
         let id = hit_id(&hit);
@@ -584,8 +713,10 @@ impl Skillbase {
             .installing
             .as_ref()
             .is_some_and(|progress| progress.started_from(&id));
+        let state = row_state(self.scan().map(|scan| &**scan), &hit);
+        let open = self.discover_open.as_ref() == Some(&id);
 
-        h_flex()
+        v_flex()
             // Identity comes from the registry's own row id, so a row keeps its
             // state as results are replaced.
             .id(ElementId::from((
@@ -595,50 +726,226 @@ impl Skillbase {
             .w_full()
             .px_3()
             .py_2()
-            .gap_3()
-            .items_center()
+            .gap_1()
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
+                h_flex()
+                    .w_full()
+                    .gap_3()
+                    .items_center()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .truncate()
-                            .child(SharedString::from(hit.name.clone())),
+                        v_flex()
+                            .id(ElementId::from((
+                                ElementId::from("discover-open"),
+                                id.clone(),
+                            )))
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .cursor_pointer()
+                            .on_click(cx.listener({
+                                let hit = hit.clone();
+                                move |this, _, window, cx| this.toggle_hit(&hit, window, cx)
+                            }))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        Icon::new(if open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .xsmall()
+                                        .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .font_medium()
+                                            .truncate()
+                                            .child(SharedString::from(hit.name.clone())),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .pl_4()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(SharedString::from(hit.source.clone())),
+                            ),
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .truncate()
-                            .child(SharedString::from(hit.source.clone())),
-                    ),
+                            .child(installs(hit.installs)),
+                    )
+                    .child(self.row_action(&hit, &id, &state, downloading, cx)),
             )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(installs(hit.installs)),
-            )
-            .child(
-                Button::new(ElementId::from((ElementId::from("discover-install"), id)))
-                    .outline()
-                    .small()
-                    .label(if downloading {
-                        "Downloading"
-                    } else {
-                        "Install"
-                    })
-                    .disabled(downloading)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.install_hit(hit.clone(), window, cx)
-                    })),
-            )
+            .when(state == RowState::NameTaken, |this| {
+                this.child(
+                    div()
+                        .pl_4()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "A skill called {} is already in the store, from somewhere else. \
+                             Installing this one asks which to keep.",
+                            hit.name
+                        )),
+                )
+            })
+            .when(open, |this| this.child(self.hit_detail(&id, cx)))
             .into_any_element()
+    }
+
+    /// The button at the end of a result row.
+    ///
+    /// A skill already in the store is not offered again: the click that used to
+    /// be there downloaded the whole thing a second time and only then asked
+    /// whether to replace it. What it offers instead is the copy already on this
+    /// machine.
+    fn row_action(
+        &self,
+        hit: &SearchHit,
+        id: &SharedString,
+        state: &RowState,
+        downloading: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let RowState::Installed(name) = state {
+            let name = name.clone();
+            return h_flex()
+                .flex_shrink_0()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Installed"),
+                )
+                .child(
+                    Button::new(ElementId::from((
+                        ElementId::from("discover-open-installed"),
+                        id.clone(),
+                    )))
+                    .ghost()
+                    .small()
+                    .label("Open")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show(WorkArea::Skills, cx);
+                        this.select_skill(name.clone(), window, cx);
+                    })),
+                )
+                .into_any_element();
+        }
+
+        let hit = hit.clone();
+        Button::new(ElementId::from((
+            ElementId::from("discover-install"),
+            id.clone(),
+        )))
+        .outline()
+        .small()
+        .label(if downloading {
+            "Downloading"
+        } else {
+            "Install"
+        })
+        .disabled(downloading)
+        .on_click(cx.listener(move |this, _, window, cx| this.install_hit(hit.clone(), window, cx)))
+        .into_any_element()
+    }
+
+    /// What an opened row shows: where the skill is in its repository, and what
+    /// its own `SKILL.md` says it does.
+    fn hit_detail(&self, id: &SharedString, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let line = |text: SharedString| {
+            div()
+                .pl_4()
+                .max_w(rems(38.))
+                .text_xs()
+                .text_color(muted)
+                .child(text)
+        };
+        match self.discover_details.get(id) {
+            None | Some(Described::Reading) => {
+                line("Reading its SKILL.md from GitHub…".into()).into_any_element()
+            }
+            Some(Described::Failed(reason)) => line(reason.clone()).into_any_element(),
+            Some(Described::Ready(detail)) => v_flex()
+                .gap_0p5()
+                .child(line(match detail.description.clone() {
+                    Some(description) => description.into(),
+                    None => "Its SKILL.md gives no description.".into(),
+                }))
+                .child(line(
+                    format!(
+                        "{} on {}",
+                        if detail.path.is_empty() {
+                            "The repository root".to_string()
+                        } else {
+                            detail.path.clone()
+                        },
+                        detail.reference
+                    )
+                    .into(),
+                ))
+                .into_any_element(),
+        }
+    }
+
+    /// Open a result row, and read the repository the first time it is opened.
+    ///
+    /// One row at a time, and one read per row for as long as the results
+    /// stand: settling where a skill is costs three requests against GitHub's
+    /// hourly budget, and a page of fifty results would spend an unauthenticated
+    /// hour's worth on rows nobody asked about.
+    fn toggle_hit(&mut self, hit: &SearchHit, window: &mut Window, cx: &mut Context<Self>) {
+        let id = hit_id(hit);
+        if self.discover_open.as_ref() == Some(&id) {
+            self.discover_open = None;
+            cx.notify();
+            return;
+        }
+        self.discover_open = Some(id.clone());
+        cx.notify();
+        if self.discover_details.contains_key(&id) {
+            return;
+        }
+
+        self.discover_details.insert(id.clone(), Described::Reading);
+        let hit = hit.clone();
+        self._describe_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let detail = cx
+                .background_spawn(async move { describe(&GitHub::from_env(UreqHttp::new()), &hit) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.discover_details.insert(
+                    id,
+                    match detail {
+                        Ok(Some(detail)) => Described::Ready(Rc::new(detail)),
+                        // The registry and the repository disagree, which is
+                        // the same thing installing it would report.
+                        Ok(None) => Described::Failed(
+                            "The repository no longer holds a directory of that name with a \
+                             SKILL.md in it."
+                                .into(),
+                        ),
+                        Err(error) => Described::Failed(error.to_string().into()),
+                    },
+                );
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Ask skills.sh what matches what has been typed, once the typing stops.
@@ -705,6 +1012,7 @@ impl Skillbase {
             InstallOptions::new(),
             name,
             Some(row),
+            StartedFrom::Discover,
             window,
             cx,
         );
@@ -722,9 +1030,11 @@ impl Skillbase {
         title: SharedString,
         lead: SharedString,
         locations: Vec<SkillLocation>,
+        from: StartedFrom,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.install_choices_from = from;
         self.install_choices = locations
             .into_iter()
             .map(|location| InstallChoice {
@@ -942,8 +1252,14 @@ impl Skillbase {
                         .child({
                             let occupied = occupied.clone();
                             let this = this.clone();
+                            // The primary of the three, because it is the one
+                            // that takes nothing away. Replace was, and for the
+                            // commonest reason to be here — the same skill
+                            // asked for twice — the default was the answer that
+                            // moved a directory to the trash to write the same
+                            // bytes back.
                             Button::new("keep-both")
-                                .outline()
+                                .primary()
                                 .label("Keep both")
                                 .on_click(move |_, window, cx| {
                                     let occupied = occupied.clone();
@@ -958,7 +1274,7 @@ impl Skillbase {
                             let occupied = occupied.clone();
                             let this = this.clone();
                             Button::new("replace-installed")
-                                .primary()
+                                .danger()
                                 .label("Replace")
                                 .on_click(move |_, window, cx| {
                                     let occupied = occupied.clone();
@@ -1028,6 +1344,7 @@ impl Skillbase {
                     options,
                     label,
                     None,
+                    occupied.from,
                     window,
                     cx,
                 );
@@ -1060,9 +1377,19 @@ impl Skillbase {
             let field = field.clone();
             let store = store.clone();
             let this = this.clone();
+            let confirm = this.clone();
             dialog
                 .title("Install from GitHub")
                 .width(px(460.))
+                // Return in the field is the dialog's own confirm, so it runs
+                // exactly what the Install button runs. Returning false keeps
+                // the dialog, and the text in it, when the spelling was
+                // refused.
+                .on_ok(move |_, window, cx| {
+                    confirm
+                        .update(cx, |this, cx| this.install_from_spec(window, cx))
+                        .unwrap_or(false)
+                })
                 .content(move |content, _, cx| {
                     let store = store.clone();
                     content.child(
@@ -1108,34 +1435,58 @@ impl Skillbase {
                                 .primary()
                                 .label("Install")
                                 .on_click(move |_, window, cx| {
-                                    this.update(cx, |this, cx| this.install_from_spec(window, cx))
-                                        .ok();
-                                    window.close_dialog(cx);
+                                    let started = this
+                                        .update(cx, |this, cx| this.install_from_spec(window, cx))
+                                        .unwrap_or(false);
+                                    // A spelling that was not accepted keeps
+                                    // the dialog, and the text in it, so the
+                                    // refusal has something to point at.
+                                    if started {
+                                        window.close_dialog(cx);
+                                    }
                                 }),
                         ),
                 )
         });
+
+        // After `open_dialog`, which focuses a handle of its own. The dialog
+        // has one field and nothing else to type into, so a user who opens it
+        // and starts typing should be typing into it.
+        self.install_spec
+            .update(cx, |state, cx| state.focus(window, cx));
     }
 
-    fn install_from_spec(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Install whatever the Install from GitHub field names.
+    ///
+    /// Returns whether an install started, which is what tells the dialog
+    /// whether to close: a spelling the parser does not accept leaves the
+    /// dialog standing with the text still in it, and the refusal below tells
+    /// the user to look at it.
+    pub(crate) fn install_from_spec(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let spec = self.install_spec.read(cx).value().trim().to_string();
         let Some(parsed) = SkillLocation::parse_spec(&spec) else {
-            window.push_notification(
-                Notification::error(if spec.is_empty() {
-                    "Name a repository first, as owner/repo or as a github.com URL.".to_string()
-                } else {
-                    format!(
-                        "`{spec}` does not name a GitHub repository. Try owner/repo, or paste \
-                         the repository's URL."
-                    )
-                })
-                .title("Could not install")
-                // What the user typed is still in the field, and this says
-                // what is wrong with it. It stays until it is dismissed.
-                .autohide(false),
+            // What the user typed is still in the field, and this says what is
+            // wrong with it. It stays until it is cleared.
+            push_notice(
+                Notice::error(
+                    "Could not install",
+                    if spec.is_empty() {
+                        "Name a repository first, as owner/repo or as a github.com URL.".to_string()
+                    } else {
+                        format!(
+                            "`{spec}` does not name a GitHub repository. Try owner/repo, or \
+                             paste the repository's URL."
+                        )
+                    },
+                ),
+                window,
                 cx,
             );
-            return;
+            return false;
         };
         let label = SharedString::from(parsed.location.dir_name().to_string());
         self.run_install(
@@ -1143,9 +1494,13 @@ impl Skillbase {
             InstallOptions::new(),
             label,
             None,
+            // Not a browsing flow: one repository was named, and the list
+            // opening on what came out of it is the answer to having named it.
+            StartedFrom::Elsewhere,
             window,
             cx,
         );
+        true
     }
 
     /// Ask for a folder on this machine, and copy the skill in it into the
@@ -1216,6 +1571,7 @@ impl Skillbase {
         progress.working_on(label.clone());
         let job = progress.id();
         self.installing = Some(progress);
+        self.tick_progress(window, cx);
         cx.notify();
 
         let roots = self.roots.clone();
@@ -1270,6 +1626,9 @@ impl Skillbase {
                     this.open_occupied_dialog(
                         Occupied {
                             source: OccupiedSource::Folder(source),
+                            // A folder was picked one at a time, so the list
+                            // opening on what came out of it is the answer.
+                            from: StartedFrom::Elsewhere,
                             name,
                             path,
                             free_name,
@@ -1300,6 +1659,36 @@ impl Skillbase {
             .ok();
         })
         .detach();
+    }
+
+    /// Repaint the progress strip while a job runs.
+    ///
+    /// Nothing else asks for a frame between the steps of a download: the task
+    /// notifies when it moves from one skill to the next, and a single skill
+    /// that takes a minute notifies twice in that minute. Without this the
+    /// count of seconds would be drawn once and then stand still, which is
+    /// worse than not drawing it.
+    ///
+    /// The loop ends with the job, and holding the task in one slot means the
+    /// next job to start replaces it rather than adding a second timer.
+    pub(crate) fn tick_progress(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._progress_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PROGRESS_TICK).await;
+                let running = this
+                    .update(cx, |this, cx| {
+                        let running = this.installing.is_some() || this.updating.is_some();
+                        if running {
+                            cx.notify();
+                        }
+                        running
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    return;
+                }
+            }
+        }));
     }
 
     /// Why the store cannot be written to right now, or `None` when it can.
@@ -1344,6 +1733,7 @@ impl Skillbase {
         options: InstallOptions,
         label: SharedString,
         row: Option<SharedString>,
+        from: StartedFrom,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1369,6 +1759,7 @@ impl Skillbase {
             .cancelled_by(cancel.clone());
         progress.working_on(label);
         self.installing = Some(progress);
+        self.tick_progress(window, cx);
         cx.notify();
 
         let roots = self.roots.clone();
@@ -1396,20 +1787,18 @@ impl Skillbase {
                             }) => {
                                 this.installing = None;
                                 cx.notify();
-                                this.open_location_dialog(title, lead, locations, window, cx);
+                                this.open_location_dialog(title, lead, locations, from, window, cx);
                                 None
                             }
                             Ok(Settled::Nothing(reason)) => {
                                 this.installing = None;
                                 cx.notify();
-                                window.push_notification(
-                                    Notification::error(reason)
-                                        .title("Nothing to install")
-                                        // Nothing was installed, so the list
-                                        // looks exactly as it did before the
-                                        // click. This sentence is the only
-                                        // thing that says why.
-                                        .autohide(false),
+                                // Nothing was installed, so the list looks
+                                // exactly as it did before the click. This
+                                // sentence is the only thing that says why.
+                                push_notice(
+                                    Notice::error("Nothing to install", reason),
+                                    window,
                                     cx,
                                 );
                                 None
@@ -1482,6 +1871,7 @@ impl Skillbase {
                         let free_name = free_name(&roots, &name);
                         occupied = Some(Occupied {
                             source: OccupiedSource::Download(location),
+                            from,
                             name,
                             path,
                             free_name,
@@ -1504,20 +1894,21 @@ impl Skillbase {
                     let Some((_, installed)) = results.pop() else {
                         return;
                     };
-                    if let Some(name) = report_install(
-                        "Installed",
-                        "Could not install",
-                        installed,
-                        &this.roots,
-                        window,
-                        cx,
-                    ) {
-                        this.installed(name, window, cx);
+                    if let Some(installed) =
+                        install_outcome("Could not install", installed, &this.roots, window, cx)
+                    {
+                        // In this order: the notification is drawn from the
+                        // disk as it stands now, and the scan the line below
+                        // starts is what the rest of the interface catches up
+                        // from.
+                        let name = SharedString::from(installed.name.clone());
+                        this.report_installed("Installed", &installed, window, cx);
+                        this.adopt_installed(from, name, window, cx);
                     }
                     return;
                 }
-                if let Some(first) = report_batch(&results, total, &this.roots, window, cx) {
-                    this.installed(first, window, cx);
+                if let Some(first) = this.report_batch(&results, total, window, cx) {
+                    this.adopt_installed(from, first, window, cx);
                 }
             })
             .ok();
@@ -1654,79 +2045,116 @@ impl Settle {
     }
 }
 
-/// One notification for a batch, rather than one per skill.
-///
-/// Returns the first skill that landed, for the list to select. A batch that
-/// installed nothing selects nothing.
-fn report_batch(
-    results: &[(SharedString, Result<Installed, FetchError>)],
-    total: usize,
-    roots: &Roots,
-    window: &mut Window,
-    cx: &mut gpui_kit::App,
-) -> Option<SharedString> {
-    let installed: Vec<&SharedString> = results
-        .iter()
-        .filter(|(_, result)| result.is_ok())
-        .map(|(name, _)| name)
-        .collect();
-    let failures: Vec<String> = results
-        .iter()
-        .filter_map(|(name, result)| {
-            result
-                .as_ref()
-                .err()
-                .map(|error| format!("{name}: {error}"))
-        })
-        .collect();
-
-    let store = display_path(&roots.store_dir(), roots);
-    let mut message = if installed.is_empty() {
-        format!("None of the {total} skills were installed.")
-    } else {
-        format!("{} of {total} skills are now in {store}.", installed.len())
-    };
-    for failure in failures.iter().take(NAMED_FAILURES) {
-        message.push('\n');
-        message.push_str(failure);
-    }
-    if failures.len() > NAMED_FAILURES {
-        message.push_str(&format!(
-            "\nand {} more that did not install.",
-            failures.len() - NAMED_FAILURES
-        ));
+impl Skillbase {
+    /// Adopt what an install wrote, in the way its entry point calls for.
+    fn adopt_installed(
+        &mut self,
+        from: StartedFrom,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match from {
+            StartedFrom::Discover => self.installed_in_place(name, window, cx),
+            StartedFrom::Elsewhere => self.installed(name, window, cx),
+        }
     }
 
-    let first = installed.first().map(|name| (*name).clone());
-    let notification = if failures.is_empty() {
-        Notification::success(message).title("Installed")
-    } else if installed.is_empty() {
-        Notification::error(message)
-            .title("Could not install")
-            .autohide(false)
-    } else {
-        Notification::warning(message)
-            .title(format!("Installed {} of {total}", installed.len()))
-            .autohide(false)
-    };
-    window.push_notification(notification, cx);
-    // Every skill in the batch swept the same staging directory, so the first
-    // sweep that could not clear it says what all of them would say. Without
-    // this line a part-downloaded skill sits in `~/.skillbase/staging` with
-    // nothing in the interface naming it.
-    if let Some(warning) = results
-        .iter()
-        .filter_map(|(_, result)| result.as_ref().ok())
-        .find_map(|installed| installed.staging.warning())
-    {
-        window.push_notification(
-            Notification::warning(warning)
-                .title("Staging directory not cleared")
-                .autohide(false),
-            cx,
-        );
+    /// One notification for a batch, rather than one per skill.
+    ///
+    /// Returns the first skill that landed, for the list to select. A batch
+    /// that installed nothing selects nothing.
+    fn report_batch(
+        &mut self,
+        results: &[(SharedString, Result<Installed, FetchError>)],
+        total: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<SharedString> {
+        let installed: Vec<&Installed> = results
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().ok())
+            .collect();
+        let failures: Vec<String> = results
+            .iter()
+            .filter_map(|(name, result)| {
+                result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("{name}: {error}"))
+            })
+            .collect();
+
+        let store = display_path(&self.roots.store_dir(), &self.roots);
+        let mut message = if installed.is_empty() {
+            format!("None of the {total} skills were installed.")
+        } else {
+            format!("{} of {total} skills are now in {store}.", installed.len())
+        };
+        for failure in failures.iter().take(NAMED_FAILURES) {
+            message.push('\n');
+            message.push_str(failure);
+        }
+        if failures.len() > NAMED_FAILURES {
+            message.push_str(&format!(
+                "\nand {} more that did not install.",
+                failures.len() - NAMED_FAILURES
+            ));
+        }
+
+        let first = installed
+            .first()
+            .map(|installed| SharedString::from(installed.name.clone()));
+        // The same question a single install answers, asked once for the whole
+        // batch: an agent that cannot read the store cannot read any of them.
+        let blind: Vec<&'static AgentDef> = match installed.first() {
+            Some(first) if failures.is_empty() => cannot_see(&self.roots, &first.name),
+            _ => Vec::new(),
+        };
+        let targets: Vec<(SharedString, PathBuf)> = installed
+            .iter()
+            .map(|installed| {
+                (
+                    SharedString::from(installed.name.clone()),
+                    installed.dir.clone(),
+                )
+            })
+            .collect();
+
+        if failures.is_empty() {
+            if let Some(reach) = reach_sentence(&self.roots, &blind, "these skills", true) {
+                message.push(' ');
+                message.push_str(&reach);
+            }
+            self.push_install_notification("Installed", message, blind, targets, window, cx);
+        } else {
+            // A batch that failed part-way has the failures to report, and
+            // stacking a second question about visibility on top of them buries
+            // what went wrong. The detail pane still answers it per skill.
+            let notice = if installed.is_empty() {
+                Notice::error("Could not install", message)
+            } else {
+                Notice::warning(format!("Installed {} of {total}", installed.len()), message)
+            };
+            push_notice(notice, window, cx);
+        }
+
+        // Every skill in the batch swept the same staging directory, so the
+        // first sweep that could not clear it says what all of them would say.
+        // Without this line a part-downloaded skill sits in
+        // `~/.skillbase/staging` with nothing in the interface naming it.
+        if let Some(warning) = installed
+            .iter()
+            .find_map(|installed| installed.staging.warning())
+        {
+            push_notice(
+                Notice::warning("Staging directory not cleared", warning),
+                window,
+                cx,
+            );
+        }
+        first
     }
-    first
 }
 
 /// A directory's own name: the name in the way when a destination is occupied,
@@ -1866,6 +2294,7 @@ impl Skillbase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::model::SkillView;
 
     /// A directory of this test's own, named after it, so two tests running at
     /// once cannot write over one another.
@@ -1972,6 +2401,119 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// One scanned skill, with the provenance an install writes.
+    fn installed_skill(name: &str, repo: Option<(&str, &str)>) -> SkillView {
+        SkillView {
+            name: name.into(),
+            description: "A skill.".into(),
+            origin: PathBuf::from("/store").join(name),
+            managed: true,
+            parse_error: None,
+            issues: Vec::new(),
+            conflicts: Vec::new(),
+            locations: Vec::new(),
+            codex_disabled: false,
+            visible_to: Vec::new(),
+            in_shared: true,
+            provenance: repo.map(|(slug, path)| {
+                skillbase_core::Provenance::new(
+                    format!("https://github.com/{slug}"),
+                    "main",
+                    "tree-sha",
+                    path,
+                )
+            }),
+        }
+    }
+
+    fn hit(source: &str, skill_id: &str) -> SearchHit {
+        SearchHit {
+            id: format!("{source}/{skill_id}"),
+            skill_id: skill_id.to_string(),
+            name: skill_id.to_string(),
+            installs: 1,
+            source: source.to_string(),
+        }
+    }
+
+    fn scan_of(skills: Vec<SkillView>) -> Scan {
+        Scan {
+            skills,
+            ..Scan::default()
+        }
+    }
+
+    #[test]
+    fn a_result_already_in_the_store_says_so_before_it_is_clicked() {
+        let scan = scan_of(vec![installed_skill(
+            "pdf",
+            Some(("anthropics/skills", "document-skills/pdf")),
+        )]);
+        assert_eq!(
+            row_state(Some(&scan), &hit("anthropics/skills", "pdf")),
+            RowState::Installed("pdf".into())
+        );
+    }
+
+    #[test]
+    fn a_skill_at_a_repository_root_is_recognised_by_its_name() {
+        // Nothing but the empty path to match on, so the name in the store is
+        // what answers.
+        let scan = scan_of(vec![installed_skill("pdf", Some(("o/pdf", "")))]);
+        assert_eq!(
+            row_state(Some(&scan), &hit("o/pdf", "pdf")),
+            RowState::Installed("pdf".into())
+        );
+    }
+
+    #[test]
+    fn the_same_name_from_another_repository_is_not_the_same_skill() {
+        // Three repositories publish a `pdf`. Installing one of them must not
+        // make the other two claim to be installed, or the row that says so is
+        // the row that stops the user getting the one they wanted.
+        let scan = scan_of(vec![installed_skill(
+            "pdf",
+            Some(("anthropics/skills", "document-skills/pdf")),
+        )]);
+        assert_eq!(
+            row_state(Some(&scan), &hit("openai/skills", "pdf")),
+            RowState::NameTaken
+        );
+        assert_eq!(
+            row_state(Some(&scan), &hit("anthropics/skills", "docx")),
+            RowState::New
+        );
+    }
+
+    #[test]
+    fn a_skill_that_records_no_provenance_only_ever_takes_the_name() {
+        // Written by hand, or installed by something that recorded nothing.
+        // There is no way to tell whether it is this result, so the row says
+        // the name is taken rather than claiming the skill is installed.
+        let scan = scan_of(vec![installed_skill("pdf", None)]);
+        assert_eq!(
+            row_state(Some(&scan), &hit("anthropics/skills", "pdf")),
+            RowState::NameTaken
+        );
+    }
+
+    #[test]
+    fn nothing_is_installed_before_the_first_scan_lands() {
+        assert_eq!(
+            row_state(None, &hit("anthropics/skills", "pdf")),
+            RowState::New
+        );
+    }
+
+    #[test]
+    fn a_job_counts_the_seconds_once_it_has_been_running_for_a_couple() {
+        let mut job = Installing::new("downloading", "working out what to install");
+        // Just started, so there is nothing worth saying.
+        assert_eq!(job.elapsed(), None);
+        job.started = Instant::now() - Duration::from_secs(14);
+        assert_eq!(job.elapsed().as_deref(), Some("14s"));
+    }
+
     #[test]
     fn a_second_copy_takes_the_first_free_numbered_name() {
         let dir = scratch("free-name");
@@ -1991,10 +2533,11 @@ mod tests {
 /// [`crate::ui::list::dialog_probe`] for why that matters.
 #[cfg(test)]
 mod dialog_tests {
-    use gpui_kit::TestAppContext;
+    use gpui_kit::component::{Root, WindowExt as _};
+    use gpui_kit::{Focusable as _, TestAppContext};
     use skillbase_core::{RepoRef, SkillLocation};
 
-    use super::{Occupied, OccupiedSource};
+    use super::{Occupied, OccupiedSource, StartedFrom};
     use crate::ui::list::dialog_probe::{drawn, window};
 
     fn locations() -> Vec<SkillLocation> {
@@ -2017,6 +2560,65 @@ mod dialog_tests {
         drawn(&mut cx);
     }
 
+    /// The dialog has one field and nothing else to type into.
+    #[gpui_kit::test]
+    fn the_install_from_github_dialog_focuses_its_only_field(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| this.open_install_dialog(window, cx));
+        });
+        drawn(&mut cx);
+
+        let focused = cx.update(|window, cx| {
+            skillbase
+                .read(cx)
+                .install_spec
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(focused, "the repository field should have focus");
+    }
+
+    /// Return has to run what the Install button runs. It used to close the
+    /// dialog, install nothing, say nothing, and throw the text away.
+    #[gpui_kit::test]
+    fn return_in_the_repository_field_submits_the_dialog(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| this.open_install_dialog(window, cx));
+        });
+        drawn(&mut cx);
+
+        // A spelling that names no repository, so nothing reaches the network:
+        // what is under test is that Return reached submit at all.
+        cx.update(|window, cx| {
+            let field = skillbase.read(cx).install_spec.clone();
+            field.update(cx, |state, cx| {
+                state.set_value("not a repository", window, cx)
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        drawn(&mut cx);
+
+        let (notifications, kept, open) = cx.update(|window, cx| {
+            let notifications = Root::read(window, cx)
+                .notification
+                .read(cx)
+                .notifications()
+                .len();
+            let field = skillbase.read(cx).install_spec.clone();
+            let kept = field.read(cx).value().to_string();
+            (notifications, kept, window.has_active_dialog(cx))
+        });
+        assert_eq!(notifications, 1, "Return should have said why it refused");
+        assert_eq!(
+            kept, "not a repository",
+            "the text should still be in the field"
+        );
+        assert!(open, "the dialog should still be standing over it");
+    }
+
     #[gpui_kit::test]
     fn the_multi_skill_chooser_opens(cx: &mut TestAppContext) {
         let (mut cx, skillbase) = window(cx);
@@ -2026,6 +2628,7 @@ mod dialog_tests {
                     "anthropics/skills".into(),
                     "It holds 3 skills.".into(),
                     locations(),
+                    StartedFrom::Discover,
                     window,
                     cx,
                 );
@@ -2045,6 +2648,7 @@ mod dialog_tests {
                     "anthropics/skills".into(),
                     "It holds 3 skills.".into(),
                     locations(),
+                    StartedFrom::Discover,
                     window,
                     cx,
                 );
@@ -2081,6 +2685,7 @@ mod dialog_tests {
             skillbase.update(cx, |this, cx| {
                 let occupied = Occupied {
                     source: OccupiedSource::Download(locations().remove(0)),
+                    from: StartedFrom::Discover,
                     name: "docx".into(),
                     path: this.roots.store_dir().join("docx"),
                     free_name: "docx-2".to_string(),
