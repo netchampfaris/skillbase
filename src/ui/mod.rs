@@ -20,8 +20,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, Context, Div, Global, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, Pixels, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div, px,
+    IntoElement, MouseButton, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
+    Stateful, StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div, px,
 };
 use skillbase_core::{
     AgentDef, CacheWriteError, Change, FetchError, GitHub, GitHubError, InstallError,
@@ -270,6 +270,9 @@ struct Notices {
     items: Vec<(u64, Notice)>,
     /// The last key handed out.
     last_key: u64,
+    /// Where the card is scrolled to, kept across frames so a redraw does not
+    /// throw the reader back to the top.
+    scroll: ScrollHandle,
 }
 
 impl Global for Notices {}
@@ -297,6 +300,9 @@ pub fn push_notice(notice: Notice, window: &mut Window, cx: &mut App) {
     notices.items.push((key, notice));
     let overflow = notices.items.len().saturating_sub(MAX_NOTICES);
     notices.items.drain(..overflow);
+    // The newest row is the one the reader is waiting on, and it is the last
+    // one. Past the height cap it would otherwise arrive below the fold.
+    notices.scroll.scroll_to_bottom();
 
     window.push_notification(
         // No title, no message and no type of its own: everything the card
@@ -320,26 +326,34 @@ pub fn push_notice(notice: Notice, window: &mut Window, cx: &mut App) {
 
 /// Every outstanding notice as a row, newest last.
 fn render_notices(cx: &mut Context<Notification>) -> AnyElement {
-    let items = cx.default_global::<Notices>().items.clone();
+    let notices = cx.default_global::<Notices>();
+    let items = notices.items.clone();
+    let scroll = notices.scroll.clone();
     let last = items.len().saturating_sub(1);
 
-    div()
+    // A column, and one that takes the whole width the card gives it: a plain
+    // `div` is a flex row, which would size the rows to their own content
+    // rather than to the card. The card is 382px wide and says so itself, so
+    // nothing here sets a width of its own.
+    v_flex()
         .id("notices")
         .debug_selector(|| "notices".to_string())
+        .w_full()
+        .gap_3()
+        .track_scroll(&scroll)
         .max_h(px(NOTICES_MAX_HEIGHT))
         .overflow_y_scroll()
-        .child(v_flex().gap_3().children(items.into_iter().enumerate().map(
-            |(index, (key, notice))| {
-                v_flex()
-                    .gap_3()
-                    .child(render_notice(key, &notice, cx))
-                    // A rule between rows, so two failures do not read as
-                    // one paragraph.
-                    .when(index < last, |this| {
-                        this.child(div().h(px(1.)).w_full().bg(cx.theme().border))
-                    })
-            },
-        )))
+        .children(items.into_iter().enumerate().map(|(index, (key, notice))| {
+            v_flex()
+                .w_full()
+                .gap_3()
+                .child(render_notice(key, &notice, cx))
+                // A rule between rows, so two failures do not read as
+                // one paragraph.
+                .when(index < last, |this| {
+                    this.child(div().h(px(1.)).w_full().bg(cx.theme().border))
+                })
+        }))
         .into_any_element()
 }
 
@@ -348,20 +362,36 @@ fn render_notice(key: u64, notice: &Notice, cx: &mut Context<Notification>) -> A
     let action = notice.action.clone();
 
     h_flex()
+        .w_full()
         .items_start()
         .gap_2()
-        .child(div().pt(px(2.)).child(notice.icon(cx)))
+        // The icon and the dismiss button keep their size and their place at
+        // the top of the row: the message between them is what grows.
+        .child(div().flex_shrink_0().pt(px(2.)).child(notice.icon(cx)))
         .child(
             v_flex()
                 .flex_1()
+                // Allowed to be narrower than the sentence it holds. Without
+                // this the column cannot shrink below the width of the whole
+                // unwrapped message — a flex item is at least its own
+                // minimum content width, and an unwrapped line's is the line —
+                // so the message was laid out at its natural width and cut
+                // off wherever the card ended.
+                .min_w_0()
                 .gap_1()
                 .child(div().text_sm().font_semibold().child(notice.title.clone()))
-                .child(div().text_sm().child(notice.message.clone()))
+                .child(
+                    div()
+                        .debug_selector(|| "notice-message".to_string())
+                        .text_sm()
+                        .child(notice.message.clone()),
+                )
                 .when_some(action, |this, action| {
                     let run = action.run.clone();
                     this.child(
                         h_flex().pt_1().justify_end().child(
                             Button::new(("notice-action", key as usize))
+                                .debug_selector(|| "notice-action".to_string())
                                 .primary()
                                 .small()
                                 .label(action.label.clone())
@@ -380,6 +410,7 @@ fn render_notice(key: u64, notice: &Notice, cx: &mut Context<Notification>) -> A
         // clearable without hunting for the control that clears it.
         .child(
             Button::new(("dismiss-notice", key as usize))
+                .debug_selector(|| "dismiss-notice".to_string())
                 .icon(IconName::Close)
                 .ghost()
                 .xsmall()
@@ -1045,6 +1076,142 @@ mod notice_tests {
             cx.debug_bounds("notices").is_some(),
             "the notice never drew"
         );
+    }
+
+    /// The two shapes a long notice comes in: an install that failed, which is
+    /// two sentences and a URL, and one that worked, which names a path and
+    /// the agents that can see it.
+    const TWO_SENTENCES: &str = "GitHub has nothing at \
+        https://api.github.com/repos/anthropics/skills. If the repository is \
+        private, check that your token can read it.";
+    const AFTER_AN_INSTALL: &str = "Wrote 3 files to ~/.agents/skills/ask-matt. \
+        Claude Code and Codex can see it.";
+
+    /// A message used to be laid out at its natural width and cut off at the
+    /// edge of the card, mid-word. It wraps now, onto as many lines as it
+    /// needs, and the card is no wider for it.
+    #[gpui_kit::test]
+    fn a_long_message_wraps_inside_the_card(cx: &mut TestAppContext) {
+        let (mut cx, _) = window(cx);
+        cx.update(|window, cx| {
+            push_notice(Notice::error("Could not install", "Short."), window, cx);
+        });
+        cx.run_until_parked();
+        let narrow = cx.debug_bounds("notices").expect("the card never drew");
+        let one_line = cx
+            .debug_bounds("notice-message")
+            .expect("the message never drew")
+            .size
+            .height;
+        let dismiss = cx
+            .debug_bounds("dismiss-notice")
+            .expect("the dismiss button never drew");
+
+        cx.update(|window, cx| {
+            cx.default_global::<Notices>().items.clear();
+            push_notice(
+                Notice::error("Could not install", TWO_SENTENCES),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let card = cx.debug_bounds("notices").expect("the card never drew");
+        let message = cx
+            .debug_bounds("notice-message")
+            .expect("the message never drew");
+        assert_eq!(
+            card.size.width, narrow.size.width,
+            "a long message widened the card"
+        );
+        assert!(
+            message.right() <= card.right(),
+            "the message ran past the right edge of the card: {message:?} in {card:?}"
+        );
+        assert!(
+            message.size.height > one_line * 2.,
+            "the message never wrapped: {} tall, one line is {one_line}",
+            message.size.height
+        );
+        assert_eq!(
+            cx.debug_bounds("dismiss-notice")
+                .expect("the dismiss button never drew"),
+            dismiss,
+            "the dismiss button moved as the message grew"
+        );
+    }
+
+    /// The message a successful install leaves is long too, and it carries a
+    /// button. The button stays under the wrapped sentence rather than being
+    /// pushed off the side of the card.
+    #[gpui_kit::test]
+    fn a_long_message_wraps_above_its_button(cx: &mut TestAppContext) {
+        let (mut cx, _) = window(cx);
+        cx.update(|window, cx| {
+            push_notice(
+                Notice::info("Installed", AFTER_AN_INSTALL)
+                    .action("Link to Claude Code", |_, _| {}),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let card = cx.debug_bounds("notices").expect("the card never drew");
+        let message = cx
+            .debug_bounds("notice-message")
+            .expect("the message never drew");
+        let action = cx
+            .debug_bounds("notice-action")
+            .expect("the action button never drew");
+        assert!(
+            message.size.height > px(30.),
+            "the message never wrapped: {} tall",
+            message.size.height
+        );
+        assert!(
+            message.right() <= card.right() && action.right() <= card.right(),
+            "the row ran past the right edge of the card: {message:?}, {action:?} in {card:?}"
+        );
+        assert!(
+            action.top() >= message.bottom(),
+            "the button landed beside the message rather than under it"
+        );
+    }
+
+    /// Past the height cap the rows scroll inside the card, and the row the
+    /// reader is waiting on is the newest one, at the bottom.
+    #[gpui_kit::test]
+    fn a_full_card_scrolls_and_shows_the_newest_row(cx: &mut TestAppContext) {
+        let (mut cx, _) = window(cx);
+        cx.update(|window, cx| {
+            for index in 0..6 {
+                push_notice(
+                    Notice::error(format!("Could not install {index}"), TWO_SENTENCES),
+                    window,
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        let card = cx.debug_bounds("notices").expect("the card never drew");
+        assert_eq!(
+            card.size.height,
+            px(NOTICES_MAX_HEIGHT),
+            "six wrapped notices grew the card past its cap"
+        );
+        cx.update(|_, cx| {
+            let scroll = cx.default_global::<Notices>().scroll.clone();
+            let max = scroll.max_offset().y;
+            assert!(max > px(0.), "the rows did not overflow the card");
+            assert_eq!(
+                scroll.offset().y,
+                -max,
+                "the newest row was left below the fold"
+            );
+        });
     }
 
     /// Clearing the card has to forget the rows with it, or they would come
