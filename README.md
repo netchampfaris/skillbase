@@ -203,9 +203,10 @@ to 0.2.0 in the pull request that earns it, and the manifest wins. The major
 number is never raised by the workflow; 1.0.0 is a decision, and it is made the
 same way, by editing the manifest.
 
-To see what a release would produce without publishing one, run the workflow by
-hand from the Actions tab with **Dry run** left ticked. It builds all four
-artifacts and attaches them to the run.
+Only a push to `main` publishes. A pull request that touches the release
+machinery builds all four artifacts and attaches them to the run without
+tagging anything, and so does a run started by hand from the Actions tab. That
+is how a change to any of this gets tested before it is trusted.
 
 Signing is ad-hoc until five repository secrets exist — `MACOS_CERTIFICATE`,
 `MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_PASSWORD` and
