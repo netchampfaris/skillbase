@@ -1134,11 +1134,23 @@ mod notice_tests {
             "the message never wrapped: {} tall, one line is {one_line}",
             message.size.height
         );
-        assert_eq!(
-            cx.debug_bounds("dismiss-notice")
-                .expect("the dismiss button never drew"),
-            dismiss,
-            "the dismiss button moved as the message grew"
+        // Against the card's own corner, and to within a pixel. The card is
+        // still animating in while this runs, so the two measurements are
+        // taken a fraction of a frame apart and the absolute figures differ
+        // by half a pixel about once in twenty runs. What the assertion is
+        // for — the button being pushed around by the text it sits beside —
+        // moves it much further than that.
+        let moved = cx
+            .debug_bounds("dismiss-notice")
+            .expect("the dismiss button never drew");
+        let before = (
+            narrow.right() - dismiss.right(),
+            dismiss.origin.y - narrow.origin.y,
+        );
+        let after = (card.right() - moved.right(), moved.origin.y - card.origin.y);
+        assert!(
+            (before.0 - after.0).abs() < px(1.) && (before.1 - after.1).abs() < px(1.),
+            "the dismiss button moved as the message grew: {before:?} then {after:?}"
         );
     }
 

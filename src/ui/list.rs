@@ -2647,8 +2647,16 @@ pub(crate) mod dialog_probe {
     /// `SKILLBASE_HOME` points the whole application at it, so nothing in
     /// these tests can reach the real store.
     fn fixture_home() {
-        let home = std::env::temp_dir().join("skillbase-dialog-probe");
+        // Per-process, because two test binaries run at once often enough to
+        // matter: `cargo test --workspace` starts one while another is still
+        // going, and a shared path let one write the fixture while the other
+        // scanned it. That raced, and the tests that read the scan failed
+        // about once in twenty runs.
+        let home =
+            std::env::temp_dir().join(format!("skillbase-dialog-probe-{}", std::process::id()));
         FIXTURE_HOME.call_once(|| {
+            // A recycled pid must not inherit the last run's store.
+            let _ = fs::remove_dir_all(&home);
             for name in FIXTURE {
                 let dir = home.join(".agents/skills").join(name);
                 fs::create_dir_all(&dir).expect("a fixture directory");
