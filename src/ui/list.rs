@@ -8,7 +8,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::{DialogButtonProps, DialogClose, DialogFooter};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::label::Label;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tooltip::Tooltip;
@@ -323,6 +323,11 @@ impl Skillbase {
         // the sort cannot mean one thing to the eye and another to the
         // keyboard.
         let mut ordered: Rc<Vec<SharedString>> = Rc::new(Vec::new());
+        // How many rows the list is actually showing, which is what the count
+        // in the band has to report. Taken from the same pass that builds the
+        // rows rather than derived a second time, so the search cannot hide a
+        // row the number still counts. `None` until a scan has landed.
+        let mut shown: Option<usize> = None;
 
         let body: Vec<AnyElement> = match &self.scan {
             ScanState::Loading => vec![
@@ -362,12 +367,15 @@ impl Skillbase {
                     &|name| self.has_update(name),
                     &|name| self.usage_count(name),
                 );
+                shown = Some(matches.len());
                 if matches.is_empty() {
-                    // Both states name a way forward rather than only reporting
-                    // the absence: one points at the three commands that put a
-                    // skill here, the other offers the registry search, because
-                    // "nothing matched" here often means "it is not installed
-                    // yet" rather than "the search is hiding it".
+                    // Every state names a way forward rather than only
+                    // reporting the absence: a machine with no skills on it
+                    // gets the one command that puts one there, a group that
+                    // is empty gets the rule for landing in it, and a search
+                    // that matched nothing gets the registry, because "nothing
+                    // matched" here often means "it is not installed yet"
+                    // rather than "the search is hiding it".
                     vec![if self.scope == Scope::Library(Library::Updates)
                         && !self.checked_for_updates()
                     {
@@ -400,16 +408,33 @@ impl Skillbase {
                                 cx,
                             )
                         }
-                    } else if query.is_empty() {
+                    } else if query.is_empty() && scan.skills.is_empty() {
+                        // First launch. One thing to do, and enough about a
+                        // skill and about skills.sh to make doing it a
+                        // decision rather than a guess. The sidebar is beside
+                        // this text and does not need reading out.
                         empty_state(
-                            "No skills here",
-                            "Four commands in the sidebar add one: Discover searches skills.sh, \
-                             Install from GitHub downloads one, Install from folder copies one \
-                             already on this machine, and New skill starts an empty one."
+                            "No skills yet",
+                            "A skill is a folder with a SKILL.md file in it that tells an agent \
+                             how to do one thing. Discover searches skills.sh, a public index \
+                             of skills you can install."
                                 .into(),
-                            None,
+                            Some(
+                                Button::new("discover-skills")
+                                    .primary()
+                                    .small()
+                                    .label("Discover skills")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_discover(window, cx)
+                                    })),
+                            ),
                             cx,
                         )
+                    } else if query.is_empty() {
+                        // The machine has skills; this group has none of them.
+                        // What the reader needs is the rule for landing in it,
+                        // which is the same sentence the band's title carries.
+                        empty_state("No skills here", scope_explanation(self.scope), None, cx)
                     } else {
                         empty_state(
                             "Nothing matched",
@@ -472,12 +497,28 @@ impl Skillbase {
             // The size every column's band title uses. The list is a peer of
             // the detail, settings and Discover bands, not a subordinate of
             // them.
-            .child(div().text_base().font_medium().child(self.scope.title()))
+            //
+            // The title is also the one place the word is written large, so it
+            // carries its own definition: hovering "Managed" says what makes a
+            // skill managed, rather than leaving the whole vocabulary behind a
+            // help button at the other end of the band.
+            .child({
+                let explanation = scope_explanation(self.scope);
+                div()
+                    .id("scope-title")
+                    .text_base()
+                    .font_medium()
+                    .tooltip(move |window, cx| Tooltip::new(explanation.clone()).build(window, cx))
+                    .child(self.scope.title())
+            })
             .child(match total {
                 Some(total) => div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(total.to_string())
+                    // "1 of 2" while a search is hiding a row: a bare total
+                    // over a shorter list is a number that contradicts what is
+                    // on screen.
+                    .child(count_label(shown.unwrap_or(total), total))
                     .into_any_element(),
                 // The same placeholder the rows below are wearing while the
                 // scan runs, rather than a third idiom for the one moment. A
@@ -493,17 +534,21 @@ impl Skillbase {
             .child(div().flex_1().min_w_0())
             .child(self.sort_menu(cx))
             .child(
-                Button::new("library-help")
+                // The commands that act on more than one row, written out.
+                // Marking used to be reachable only by shift-clicking a second
+                // row, which nothing on screen suggested; a menu everyone opens
+                // is where a reader finds out that it exists at all. The
+                // library help moved in here too, as a sentence rather than as
+                // an (i) with nothing beside it.
+                Button::new("list-more")
                     .ghost()
                     .small()
-                    .icon(IconName::Info)
-                    .tooltip("What Shared, Managed and the other groups mean")
+                    .icon(IconName::Ellipsis)
+                    .tooltip("Mark several skills, and what the groups mean")
                     // A tooltip is not an accessible name, so an icon-only
                     // button has to be given one as well.
-                    .accessibility_label("What the library groups mean")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_library_help(window, cx)),
-                    ),
+                    .accessibility_label("More list commands")
+                    .dropdown_menu(self.marking_menu(None, &focus, cx)),
             );
 
         v_flex()
@@ -555,6 +600,9 @@ impl Skillbase {
                 // to be able to bring one into view.
                 div()
                     .id("skill-list")
+                    // How the render tests find out whether this column reached
+                    // the screen. A no-op in release builds.
+                    .debug_selector(|| "skill-list".into())
                     .relative()
                     .flex_1()
                     .min_h_0()
@@ -868,6 +916,140 @@ impl Skillbase {
             .iter()
             .filter(|skill| self.marks.contains(&skill.name))
             .collect()
+    }
+
+    /// The commands that act on a set of rows rather than on the selection.
+    ///
+    /// Built once and used twice: from the button in the band, where somebody
+    /// who has never marked anything can read that marking exists, and from a
+    /// right-click on a row, which is where a desktop reader looks for it. Both
+    /// routes end in the same four methods the menu bar calls, so there is one
+    /// command with one shape however it was reached.
+    ///
+    /// `row` is the skill the menu was opened on, when it was opened on one.
+    /// `None` is the band's copy, which has no row to act on and carries the
+    /// library help instead.
+    ///
+    /// `focus` is the list's own focus handle, given to the menu so it can find
+    /// the keys these commands are bound to — they are scoped to [`CONTEXT`],
+    /// and a menu with no context to search would show no shortcut at all.
+    fn marking_menu(
+        &self,
+        row: Option<SharedString>,
+        focus: &FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let this = cx.entity().downgrade();
+        let focus = focus.clone();
+        let marked = self.marks.len();
+        // Every bulk command opens a dialog or writes, and both are refused
+        // while one is already running.
+        let busy = self.bulk_busy;
+        // A set is two rows or more: one marked row is the selection, which the
+        // detail pane is already showing.
+        let has_set = marked > 1;
+        let row_marked = row.as_deref().is_some_and(|name| self.marks.contains(name));
+        // True for the band's copy, which acts on the column rather than on a
+        // row and is the one that carries the library help.
+        let in_band = row.is_none();
+        // The selection is the marked set of one, so until a real set exists
+        // its own row has nothing to mark or unmark and the item is left out
+        // rather than offered as a command that changes nothing. Every other
+        // row keeps it, and another row is what somebody meeting this feature
+        // for the first time right-clicks.
+        let row = row.filter(|name| has_set || self.selected.as_ref() != Some(name));
+
+        move |menu, _, _| {
+            let mut menu = menu
+                .action_context(focus.clone())
+                // Wide enough for "Unlink marked skills…" and its shortcut on
+                // one line.
+                .min_w(px(240.));
+
+            if let Some(name) = row.clone() {
+                let this = this.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(if row_marked {
+                        "Unmark this skill"
+                    } else {
+                        "Mark this skill"
+                    })
+                    .on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| this.toggle_mark(name.clone(), cx))
+                            .ok();
+                    }),
+                );
+            }
+
+            let mark_all = this.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Mark all")
+                    // The action is here for its key: the handler above it is
+                    // what runs, so nothing depends on the dispatch reaching
+                    // the list.
+                    .action(Box::new(MarkAll))
+                    .on_click(move |_, _, cx| {
+                        mark_all.update(cx, |this, cx| this.mark_all(cx)).ok();
+                    }),
+            );
+
+            let clear = this.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Clear marks")
+                    .action(Box::new(ClearMarks))
+                    .disabled(!has_set)
+                    .on_click(move |_, _, cx| {
+                        clear.update(cx, |this, cx| this.clear_marks(cx)).ok();
+                    }),
+            );
+
+            menu = menu.separator();
+
+            for (label, on) in [
+                ("Link marked skills…", true),
+                ("Unlink marked skills…", false),
+            ] {
+                let this = this.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label)
+                        .disabled(!has_set || busy)
+                        .on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.open_link_marked_dialog(on, window, cx)
+                            })
+                            .ok();
+                        }),
+                );
+            }
+
+            let delete = this.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Delete marked skills…")
+                    .disabled(!has_set || busy)
+                    .on_click(move |_, window, cx| {
+                        delete
+                            .update(cx, |this, cx| this.confirm_delete_marked(window, cx))
+                            .ok();
+                    }),
+            );
+
+            // Only the band's copy. A right-click on a row is about that row,
+            // and a glossary at the foot of it would be an answer to a question
+            // nobody asked there.
+            if in_band {
+                let help = this.clone();
+                menu = menu.separator().item(
+                    PopupMenuItem::new("What the library groups mean").on_click(
+                        move |_, window, cx| {
+                            help.update(cx, |this, cx| this.open_library_help(window, cx))
+                                .ok();
+                        },
+                    ),
+                );
+            }
+
+            menu
+        }
     }
 
     /// The ordering control.
@@ -1781,6 +1963,10 @@ impl Skillbase {
                     .when(marking, |this| this.child(div().flex_shrink_0().size_3()))
                     .child(
                         div()
+                            .id(ElementId::from((
+                                ElementId::from("skill-description"),
+                                skill.name.clone(),
+                            )))
                             .flex_1()
                             .min_w_0()
                             .text_sm()
@@ -1790,10 +1976,22 @@ impl Skillbase {
                             } else {
                                 cx.theme().muted_foreground
                             })
+                            // Two skills whose descriptions open with the same
+                            // words truncate to the same line and stop telling
+                            // each other apart. The tooltip is the rest of the
+                            // sentence, and it is offered only when there is a
+                            // rest — a tooltip repeating a line that already
+                            // fits is noise.
+                            .when_some(long_enough_to_truncate(&subtitle), |this, full| {
+                                this.tooltip(move |window, cx| {
+                                    Tooltip::new(full.clone()).build(window, cx)
+                                })
+                            })
                             .child(subtitle),
                     )
                     .child(self.reach_lane(skill, cx)),
             )
+            .context_menu(self.marking_menu(Some(skill.name.clone()), focus, cx))
             .into_any_element()
     }
 
@@ -1920,8 +2118,9 @@ impl Skillbase {
                                                 None => cx.theme().muted_foreground,
                                             })
                                             .child(problem.clone().unwrap_or_else(|| {
-                                                "kebab-case. It becomes the directory name in \
-                                                 ~/.skillbase/store."
+                                                "Lowercase letters, digits and single hyphens. \
+                                                 It becomes the directory name in \
+                                                 ~/.agents/skills."
                                                     .into()
                                             })),
                                     ),
@@ -2089,6 +2288,53 @@ fn empty_state(
         .into_any_element()
 }
 
+/// What the band's title means, in the words the filter behind it actually
+/// tests.
+///
+/// Used twice: as a tooltip on the title, so the vocabulary is explained where
+/// the word is written rather than behind a button at the far end of the band,
+/// and as the body of the empty state, where the rule for landing in a group is
+/// the one thing a reader of an empty group wants.
+fn scope_explanation(scope: Scope) -> SharedString {
+    match scope {
+        Scope::Library(library) => library.explanation().into(),
+        Scope::Agent(_) => format!(
+            "{} sees a skill when it has a link of its own, or when it reads ~/.agents/skills \
+             and the skill is there.",
+            scope.title()
+        )
+        .into(),
+    }
+}
+
+/// The number beside the band's title: the rows on screen, and out of how many
+/// when a search is hiding some.
+///
+/// One number when nothing is hidden, because "2 of 2" is a comparison with
+/// nothing on the other side of it.
+fn count_label(shown: usize, total: usize) -> SharedString {
+    if shown == total {
+        total.to_string().into()
+    } else {
+        format!("{shown} of {total}").into()
+    }
+}
+
+/// The whole of a row's description, when the row is too narrow to have shown
+/// it.
+///
+/// The column cannot be measured from here, so this is a length: at the 320pt
+/// default the description shares its line with the agent marks and truncates
+/// somewhere around here. It is deliberately generous — a tooltip that repeats
+/// a line the reader can already see is worse than one that is occasionally
+/// missing.
+fn long_enough_to_truncate(description: &SharedString) -> Option<SharedString> {
+    /// Characters that fit on the description line before it truncates.
+    const FITS: usize = 34;
+
+    (description.chars().count() > FITS).then(|| description.clone())
+}
+
 /// Why this name cannot be used, or `None` when it can.
 ///
 /// An empty field is not a mistake yet, so it has no message: the line under
@@ -2123,24 +2369,40 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn scan_holding(name: &str) -> Scan {
+    fn skill_named(name: &str, description: &str) -> SkillView {
+        SkillView {
+            name: name.to_string().into(),
+            description: description.to_string().into(),
+            origin: PathBuf::from("/store").join(name),
+            managed: true,
+            parse_error: None,
+            issues: Vec::new(),
+            conflicts: Vec::new(),
+            locations: Vec::new(),
+            codex_disabled: false,
+            visible_to: Vec::new(),
+            in_shared: false,
+            provenance: None,
+        }
+    }
+
+    /// A scan holding these skills and nothing else.
+    ///
+    /// `Scan::load` counts each Library row as it maps the disk; a scan built
+    /// by hand has to fill the one row these tests ask for. `All` is the first
+    /// of [`Library::ALL`].
+    fn scan_of(skills: Vec<SkillView>) -> Scan {
+        let mut library_counts = [0usize; Library::ALL.len()];
+        library_counts[0] = skills.len();
         Scan {
-            skills: vec![SkillView {
-                name: name.to_string().into(),
-                description: "".into(),
-                origin: PathBuf::from("/store").join(name),
-                managed: true,
-                parse_error: None,
-                issues: Vec::new(),
-                conflicts: Vec::new(),
-                locations: Vec::new(),
-                codex_disabled: false,
-                visible_to: Vec::new(),
-                in_shared: false,
-                provenance: None,
-            }],
+            skills,
+            library_counts,
             ..Scan::default()
         }
+    }
+
+    fn scan_holding(name: &str) -> Scan {
+        scan_of(vec![skill_named(name, "")])
     }
 
     #[test]
@@ -2183,6 +2445,59 @@ mod tests {
         let said = name_problem("pdf", Some(&scan)).expect("already exists");
         assert!(said.contains("already a skill"), "{said}");
         assert_eq!(name_problem("pdf-two", Some(&scan)), None);
+    }
+
+    /// The band used to report the scope's whole count while the search below
+    /// it had cut the list to one row, so the number on screen disagreed with
+    /// the rows under it.
+    #[test]
+    fn the_count_in_the_band_is_the_number_of_rows_on_screen() {
+        let scan = scan_of(vec![
+            skill_named(
+                "docx",
+                "Use this skill whenever the user works with Word documents.",
+            ),
+            skill_named(
+                "pdf",
+                "Use this skill whenever the user works with PDF files.",
+            ),
+        ]);
+        let scope = Scope::Library(Library::All);
+        let total = scan.count(scope, |_| false);
+        assert_eq!(total, 2);
+
+        let rows =
+            |query: &str| listed(&scan, scope, query, SkillSort::Name, &|_| false, &|_| 0).len();
+
+        // Nothing hidden: one number, because "2 of 2" compares a thing with
+        // itself.
+        assert_eq!(count_label(rows(""), total), "2");
+        // A search that hides one row says which of the two are showing.
+        assert_eq!(rows("pdf"), 1);
+        assert_eq!(count_label(rows("pdf"), total), "1 of 2");
+        // A search matching a description, not a name, counts the same way.
+        assert_eq!(count_label(rows("Word"), total), "1 of 2");
+        assert_eq!(count_label(rows("no-such-thing"), total), "0 of 2");
+    }
+
+    /// `pdf` and `docx` both open "Use this skill whenever the…", so the line
+    /// on screen is the same for both and the rest of the sentence is the only
+    /// thing that tells them apart.
+    #[test]
+    fn a_description_too_long_for_the_row_is_offered_in_full() {
+        let long: SharedString = "Use this skill whenever the user works with PDF files.".into();
+        assert_eq!(long_enough_to_truncate(&long), Some(long.clone()));
+        assert_eq!(long_enough_to_truncate(&"Short enough.".into()), None);
+    }
+
+    #[test]
+    fn every_scope_can_say_what_it_holds() {
+        for library in Library::ALL {
+            let said = scope_explanation(Scope::Library(library));
+            assert!(!said.is_empty(), "{library:?} has nothing to say");
+        }
+        let said = scope_explanation(Scope::Agent("claude-code"));
+        assert!(said.contains("Claude Code"), "{said}");
     }
 }
 
@@ -2281,6 +2596,19 @@ pub(crate) mod dialog_probe {
             "the dialog was opened but never drew"
         );
     }
+
+    /// Draw the window, and fail if the skill list did not reach the screen.
+    ///
+    /// The list's own states — the rows, the band's menu, the marked band and
+    /// each empty state — are built during the draw and nowhere else, so this
+    /// is the only thing that runs them.
+    pub(crate) fn list_drawn(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("skill-list").is_some(),
+            "the skill list never drew"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2368,5 +2696,68 @@ mod dialog_tests {
             });
         });
         drawn(&mut cx);
+    }
+}
+
+/// The list's own render paths, each of which is built during a draw and
+/// nowhere else.
+///
+/// They share the dialog probe's window, because a real `Skillbase` over a
+/// throwaway home is what the states are made of: a scan with rows in it, a
+/// search that matches none of them, and a marked set.
+#[cfg(test)]
+mod render_tests {
+    use gpui_kit::TestAppContext;
+
+    use super::dialog_probe::{list_drawn, window};
+    use crate::ui::model::{Library, Scope};
+
+    #[gpui_kit::test]
+    fn the_list_draws_its_rows(cx: &mut TestAppContext) {
+        let (mut cx, _) = window(cx);
+        list_drawn(&mut cx);
+    }
+
+    /// The band's menu and every row's context menu are built here. A builder
+    /// that read the view while it was being updated would abort on this draw,
+    /// which is the failure the dialog probe exists to catch.
+    #[gpui_kit::test]
+    fn a_marked_set_draws_its_band_and_its_menus(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|_, cx| {
+            skillbase.update(cx, |this, cx| this.mark_all(cx));
+        });
+        list_drawn(&mut cx);
+    }
+
+    /// Two of the three empty states: a search that matched nothing, which
+    /// carries the registry button, and a group with nothing in it, which
+    /// carries the rule for landing in it. The third is first launch, which
+    /// needs a home with no skills at all.
+    #[gpui_kit::test]
+    fn the_empty_states_draw(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+
+        let search = cx.update(|_, cx| skillbase.read(cx).search.clone());
+        cx.update(|window, cx| {
+            search.update(cx, |state, cx| {
+                state.set_value("no-skill-is-called-this", window, cx)
+            });
+        });
+        list_drawn(&mut cx);
+
+        cx.update(|window, cx| {
+            search.update(cx, |state, cx| state.set_value("", window, cx));
+            skillbase.update(cx, |this, cx| {
+                // Nothing in the fixture home is a duplicate, so this group is
+                // empty on a machine that does hold skills. Set rather than
+                // selected: `select_scope` saves the settings file, and every
+                // test in this binary shares one home, so the next one to start
+                // would open on a scope it did not ask for.
+                this.scope = Scope::Library(Library::Conflicts);
+                cx.notify();
+            });
+        });
+        list_drawn(&mut cx);
     }
 }
