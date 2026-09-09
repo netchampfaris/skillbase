@@ -1865,19 +1865,29 @@ impl Skillbase {
         let description_state = self.new_description.clone();
         let this = cx.entity().downgrade();
 
+        // The names already on this machine, read here rather than from the
+        // builder below. The builder runs from inside `Skillbase::render` —
+        // that is where `Root::render_dialog_layer` is called from — so this
+        // view is already borrowed by the time it runs, and reading it there
+        // aborts the process.
+        //
+        // So the list is the one that stood when the dialog opened. A skill
+        // that arrives behind an open dialog is not in it, and `Create` is the
+        // backstop for that: `Installer::create` refuses a directory that is
+        // already there rather than writing over it.
+        let scan = self.scan().cloned();
+
         window.open_dialog(cx, move |dialog, _, cx| {
             let fields = (name_state.clone(), description_state.clone());
             let this = this.clone();
 
             // Checked on the frame the character was typed. The dialog's
-            // builder runs on every frame it is on screen, so the line under
-            // the field and the state of Create always describe what is in the
-            // field now rather than what it held when the dialog opened.
+            // builder runs on every frame it is on screen, and the field's own
+            // state is a separate entity, so the line under the field and the
+            // state of Create always describe what is in the field now rather
+            // than what it held when the dialog opened.
             let typed = name_state.read(cx).value();
             let typed = typed.trim();
-            let scan = this
-                .upgrade()
-                .and_then(|entity| entity.read(cx).scan().cloned());
             let problem = name_problem(typed, scan.as_deref());
             let can_create = !typed.is_empty() && problem.is_none();
             let footer_problem = problem.clone();
@@ -2173,5 +2183,190 @@ mod tests {
         let said = name_problem("pdf", Some(&scan)).expect("already exists");
         assert!(said.contains("already a skill"), "{said}");
         assert_eq!(name_problem("pdf-two", Some(&scan)), None);
+    }
+}
+
+/// The window a dialog test opens, and the throwaway home it runs against.
+///
+/// `window.open_dialog` only stores the builder it is given. The builder runs
+/// later, from `Root::render_dialog_layer`, which `Skillbase::render` calls —
+/// so the view is borrowed while the builder runs, and a builder that reads
+/// the view aborts the process on the frame after the click rather than at the
+/// click. Opening a dialog therefore proves nothing on its own: a test has to
+/// draw as well, which is what [`drawn`] does.
+///
+/// This lives here rather than beside either set of tests because the dialogs
+/// it is used on are spread across `list` and `discover`, and neither module
+/// can see the other's private methods.
+#[cfg(test)]
+pub(crate) mod dialog_probe {
+    use std::fs;
+    use std::sync::Once;
+
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+
+    use crate::app::Skillbase;
+    use crate::ui::model::HOME_OVERRIDE_ENV;
+
+    /// Two skills, because the dialogs that act on a marked set need at least
+    /// two rows to mark.
+    pub(crate) const FIXTURE: [&str; 2] = ["alpha", "beta"];
+
+    static FIXTURE_HOME: Once = Once::new();
+
+    /// A home under the temporary directory, with two skills written into it.
+    ///
+    /// `SKILLBASE_HOME` points the whole application at it, so nothing in
+    /// these tests can reach the real store.
+    fn fixture_home() {
+        let home = std::env::temp_dir().join("skillbase-dialog-probe");
+        FIXTURE_HOME.call_once(|| {
+            for name in FIXTURE {
+                let dir = home.join(".agents/skills").join(name);
+                fs::create_dir_all(&dir).expect("a fixture directory");
+                fs::write(
+                    dir.join("SKILL.md"),
+                    format!(
+                        "---\nname: {name}\ndescription: A skill for the dialog tests to \
+                         act on.\n---\n\nNothing here is run.\n"
+                    ),
+                )
+                .expect("a fixture SKILL.md");
+            }
+            // Sound because every test that reads this variable goes through
+            // this `Once` first, and nothing in the binary writes it again.
+            unsafe { std::env::set_var(HOME_OVERRIDE_ENV, &home) };
+        });
+    }
+
+    /// A drawn window holding a real `Skillbase` that has scanned the fixture.
+    pub(crate) fn window(cx: &mut TestAppContext) -> (VisualTestContext, Entity<Skillbase>) {
+        fixture_home();
+        cx.update(gpui_kit::init);
+
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| Skillbase::new(window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+
+        let mut cx = VisualTestContext::from_window(handle.into(), cx);
+        let skillbase = cx.update(|window, cx| {
+            window
+                .root::<Root>()
+                .flatten()
+                .expect("the window has a Root")
+                .read(cx)
+                .view()
+                .clone()
+                .downcast::<Skillbase>()
+                .expect("the Root holds the Skillbase view")
+        });
+
+        let scanned = cx.update(|_, cx| skillbase.read(cx).scan().is_some());
+        assert!(scanned, "the fixture home was never scanned");
+
+        (cx, skillbase)
+    }
+
+    /// Draw the window, and fail if no dialog reached the screen.
+    ///
+    /// The draw is the assertion: it is the only thing that runs a dialog
+    /// builder.
+    pub(crate) fn drawn(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("dialog-layer").is_some(),
+            "the dialog was opened but never drew"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use gpui_kit::TestAppContext;
+
+    use super::dialog_probe::{FIXTURE, drawn, window};
+    use super::name_problem;
+
+    #[gpui_kit::test]
+    fn the_new_skill_dialog_opens(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| this.open_new_skill_dialog(window, cx));
+        });
+        drawn(&mut cx);
+    }
+
+    /// The line under the Name field is written from the scan the dialog took
+    /// when it opened, so the scan has to be the one that found the fixture.
+    #[gpui_kit::test]
+    fn the_new_skill_dialog_still_knows_which_names_are_taken(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| this.open_new_skill_dialog(window, cx));
+        });
+        drawn(&mut cx);
+
+        let scan = cx.update(|_, cx| skillbase.read(cx).scan().cloned());
+        let taken = name_problem(FIXTURE[0], scan.as_deref()).expect("the fixture name is taken");
+        assert!(taken.contains("already a skill"), "{taken}");
+        assert_eq!(name_problem("not-installed-yet", scan.as_deref()), None);
+    }
+
+    /// Typing redraws the dialog, which runs its builder again. The rule under
+    /// the field is written on that pass, so this is the path that has to hold
+    /// up frame after frame.
+    #[gpui_kit::test]
+    fn the_new_skill_dialog_survives_typing_into_it(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| this.open_new_skill_dialog(window, cx));
+        });
+        drawn(&mut cx);
+
+        let name = cx.update(|_, cx| skillbase.read(cx).new_name.clone());
+        for typed in ["My Skill", FIXTURE[0], "my-new-skill"] {
+            cx.update(|window, cx| {
+                name.update(cx, |state, cx| state.set_value(typed, window, cx));
+            });
+            drawn(&mut cx);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_library_help_dialog_opens(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| this.open_library_help(window, cx));
+        });
+        drawn(&mut cx);
+    }
+
+    #[gpui_kit::test]
+    fn the_link_and_unlink_dialogs_open_for_a_marked_set(cx: &mut TestAppContext) {
+        for on in [true, false] {
+            let (mut cx, skillbase) = window(cx);
+            cx.update(|window, cx| {
+                skillbase.update(cx, |this, cx| {
+                    this.mark_all(cx);
+                    this.open_link_marked_dialog(on, window, cx);
+                });
+            });
+            drawn(&mut cx);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_bulk_delete_dialog_opens_for_a_marked_set(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| {
+                this.mark_all(cx);
+                this.confirm_delete_marked(window, cx);
+            });
+        });
+        drawn(&mut cx);
     }
 }

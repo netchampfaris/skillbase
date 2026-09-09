@@ -54,6 +54,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSString",
 ] }
 
+# The dialog tests open a real window and draw it, which is the only way to
+# reach the code that builds a dialog.
+[dev-dependencies]
+gpui-kit = { version = "0.6", features = ["test-support"] }
+
 [profile.dev]
 opt-level = 0
 
