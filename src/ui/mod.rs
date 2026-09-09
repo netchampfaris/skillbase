@@ -19,14 +19,14 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, App, Context, Div, Global, InteractiveElement as _, IntoElement,
-    MouseButton, ParentElement as _, Pixels, Render, SharedString, Stateful,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Global, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, Pixels, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div, px,
 };
 use skillbase_core::{
-    AgentDef, CacheWriteError, FetchError, GitHub, GitHubError, InstallError, InstallOptions,
-    Installed, Installer, Outcome, RemoteCache, Roots, SkillLocation, UreqHttp,
-    github_token_source, install_from_github,
+    AgentDef, CacheWriteError, Change, FetchError, GitHub, GitHubError, InstallError,
+    InstallOptions, Installed, Installer, Outcome, RemoteCache, Restored, Roots, SkillLocation,
+    UreqHttp, github_token_source, install_from_github,
 };
 
 use crate::ui::model::{display_path, in_words, join_and};
@@ -450,19 +450,153 @@ pub fn report(
             // why it stopped. Deleting a skill from nine places and failing on
             // the seventh has to read as six links gone, not as a refusal.
             let changed = error.completed().is_some_and(|done| !done.is_noop());
-            window.push_notification(
-                // A success says what already happened, so losing it costs
-                // nothing. A refusal is the only account of why the disk did
-                // not change, and the five seconds a notification otherwise
-                // gets is long enough to look away from. It stays until it is
-                // dismissed.
-                Notification::error(error.describe_under(roots.home()))
-                    .title(failed.to_string())
-                    .autohide(false),
+            // A success says what already happened, so losing it costs
+            // nothing. A refusal is the only account of why the disk did not
+            // change, and the five seconds a notification otherwise gets is
+            // long enough to look away from. It stays until it is cleared.
+            push_notice(
+                Notice::error(failed, error.describe_under(roots.home())),
+                window,
                 cx,
             );
             changed
         }
+    }
+}
+
+/// What a delete does to the disk, said the same way wherever it is confirmed.
+///
+/// One skill and several skills are the same operation, and the two dialogs
+/// used to describe it differently: the one for a single skill said it removed
+/// the directory, which sounds permanent, and never mentioned links. Both say
+/// this now. `directories` is how many real directories the delete would move,
+/// so the sentence counts what is actually going.
+pub fn delete_effect(directories: usize) -> String {
+    let plural = directories != 1;
+    format!(
+        "The director{} move{} to ~/.skillbase/trash and {} links are removed. The message that \
+         follows offers to put {} back.",
+        if plural { "ies" } else { "y" },
+        if plural { "" } else { "s" },
+        if plural { "their" } else { "its" },
+        if plural { "them" } else { "it" },
+    )
+}
+
+/// Report a delete, and offer to put it back.
+///
+/// Delete is the one operation here that cannot be corrected by repeating it.
+/// The directory is in `~/.skillbase/trash` under a name stamped with the
+/// second it landed, and until now getting it back meant leaving Skillbase for
+/// the Finder. So the report stays on screen until it is cleared, and carries
+/// the button that reverses it.
+///
+/// A delete that stopped part-way is offered the same button: six links
+/// removed and then a refusal is six links to put back.
+///
+/// `after` re-reads the disk once the undo has run, because nothing else
+/// notices that a directory came back.
+pub fn report_delete(
+    title: &str,
+    failed: &str,
+    result: Result<Outcome, InstallError>,
+    roots: &Roots,
+    after: Callback,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let home = roots.home();
+    let (notice, changed) = match &result {
+        Ok(outcome) if outcome.is_noop() => {
+            // Nothing was taken away, so there is nothing to put back and no
+            // reason for the sentence to stay.
+            window.push_notification(
+                Notification::info(outcome.describe_under(home)).title(title.to_string()),
+                cx,
+            );
+            return false;
+        }
+        Ok(outcome) => (Notice::info(title, outcome.describe_under(home)), true),
+        Err(error) => (
+            Notice::error(failed, error.describe_under(home)),
+            error.completed().is_some_and(|done| !done.is_noop()),
+        ),
+    };
+
+    let changes = match &result {
+        Ok(outcome) => outcome.changes.clone(),
+        Err(error) => error
+            .completed()
+            .map(|done| done.changes.clone())
+            .unwrap_or_default(),
+    };
+    let undoable = changes.iter().any(|change| {
+        matches!(
+            change,
+            Change::MovedToTrash { .. } | Change::RemovedSymlink { .. }
+        )
+    });
+
+    let notice = if undoable {
+        let roots = roots.clone();
+        notice.action("Undo", move |window, cx| {
+            undo_delete(changes.clone(), roots.clone(), after.clone(), window, cx);
+        })
+    } else {
+        notice
+    };
+    push_notice(notice, window, cx);
+    changed
+}
+
+/// Put back what a delete took away, and say how much of it came back.
+///
+/// On a background task, like the delete itself: putting a skill back is a
+/// rename, except across a filesystem boundary, where it is a copy of the
+/// whole directory.
+fn undo_delete(
+    changes: Vec<Change>,
+    roots: Roots,
+    after: Callback,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let installer_roots = roots.clone();
+    window
+        .spawn(cx, async move |cx| {
+            let restored = cx
+                .background_spawn(async move { Installer::new(installer_roots).restore(&changes) })
+                .await;
+            cx.update(|window, cx| {
+                report_restored(&restored, &roots, window, cx);
+                after(window, cx);
+            })
+            .ok();
+        })
+        .detach();
+}
+
+/// What an undo put back, and what it could not.
+///
+/// A restore that leaves anything out is reported as a message that stays:
+/// the skill is on screen again, which reads as though the delete was
+/// reversed, and the part that was not is the thing the user has to be told.
+fn report_restored(restored: &Restored, roots: &Roots, window: &mut Window, cx: &mut App) {
+    let message = restored.describe_under(roots.home());
+    if restored.is_noop() {
+        push_notice(
+            Notice::error("Could not undo the delete", message),
+            window,
+            cx,
+        );
+    } else if restored.missed.is_empty() {
+        window.push_notification(Notification::success(message).title("Put back"), cx);
+    } else {
+        push_notice(
+            Notice::warning("Part of it could not be put back", message),
+            window,
+            cx,
+        );
     }
 }
 
@@ -555,14 +689,15 @@ pub fn take_delete_cache_failure() -> Option<String> {
 /// `lead` opens the sentence, because a single install can say that the skill
 /// is installed and a batch cannot. The reason and what follows from it are the
 /// same either way.
-pub fn cache_failure_notification(lead: &str, reason: &str) -> Notification {
-    Notification::warning(format!(
-        "{lead}: {reason}. Without that record Skillbase cannot tell an edited copy from an \
-         untouched one, so it asks before replacing one, and the next update check spends \
-         GitHub's whole hourly budget again."
-    ))
-    .title("Install record not written")
-    .autohide(false)
+pub fn cache_failure_notification(lead: &str, reason: &str) -> Notice {
+    Notice::warning(
+        "Install record not written",
+        format!(
+            "{lead}: {reason}. Without that record Skillbase cannot tell an edited copy from an \
+             untouched one, so it asks before replacing one, and the next update check spends \
+             GitHub's whole hourly budget again."
+        ),
+    )
 }
 
 /// The warning for a delete whose install record could not be dropped.
@@ -573,15 +708,16 @@ pub fn cache_failure_notification(lead: &str, reason: &str) -> Notification {
 ///
 /// `lead` opens the sentence, because a single delete can name one record and a
 /// batch cannot. What follows from it is the same either way.
-pub fn delete_cache_failure_notification(lead: &str, reason: &str) -> Notification {
-    Notification::warning(format!(
-        "{lead}: {reason}. Install records are keyed by skill name, so the next skill to take \
-         that name inherits this one. Skillbase then measures it against the deleted skill's \
-         install-time contents, and its See what changed link opens the deleted skill's \
-         repository."
-    ))
-    .title("Install record not removed")
-    .autohide(false)
+pub fn delete_cache_failure_notification(lead: &str, reason: &str) -> Notice {
+    Notice::warning(
+        "Install record not removed",
+        format!(
+            "{lead}: {reason}. Install records are keyed by skill name, so the next skill to \
+             take that name inherits this one. Skillbase then measures it against the deleted \
+             skill's install-time contents, and its See what changed link opens the deleted \
+             skill's repository."
+        ),
+    )
 }
 
 /// The same sentence with an upper-case first letter, so an error written to
@@ -667,19 +803,19 @@ pub fn wrote_sentence(installed: &Installed, roots: &Roots) -> String {
 /// staging directory. Each gets its own notification beside the success.
 pub fn install_warnings(installed: &Installed, window: &mut Window, cx: &mut App) {
     if let Some(reason) = take_cache_failure() {
-        window.push_notification(
+        push_notice(
             cache_failure_notification(
                 "The skill was installed, but what it installed could not be recorded",
                 &reason,
             ),
+            window,
             cx,
         );
     }
     if let Some(warning) = installed.staging.warning() {
-        window.push_notification(
-            Notification::warning(warning)
-                .title("Staging directory not cleared")
-                .autohide(false),
+        push_notice(
+            Notice::warning("Staging directory not cleared", warning),
+            window,
             cx,
         );
     }
@@ -821,4 +957,193 @@ fn not_found_sentence(what: &str) -> String {
         sentence.push_str(" If the repository is private, check that your token can read it.");
     }
     sentence
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use gpui_kit::component::Root;
+    use gpui_kit::{TestAppContext, VisualTestContext};
+
+    use super::*;
+    use crate::ui::list::dialog_probe::window;
+
+    /// How many notification cards the window is showing.
+    ///
+    /// The count is the point: every outstanding notice is a row in one card,
+    /// so a second failure can never draw over the first.
+    fn cards(cx: &mut VisualTestContext) -> usize {
+        cx.update(|window, cx| {
+            Root::read(window, cx)
+                .notification
+                .read(cx)
+                .notifications()
+                .len()
+        })
+    }
+
+    /// The heading of every notice on the card, oldest first.
+    fn headings(cx: &mut VisualTestContext) -> Vec<String> {
+        cx.update(|_, cx| {
+            cx.default_global::<Notices>()
+                .items
+                .iter()
+                .map(|(_, notice)| notice.title.to_string())
+                .collect()
+        })
+    }
+
+    /// Two failures used to draw on top of one another. They are rows in one
+    /// card now, and the card draws.
+    #[gpui_kit::test]
+    fn two_notices_are_two_rows_of_one_card(cx: &mut TestAppContext) {
+        let (mut cx, _) = window(cx);
+        cx.update(|window, cx| {
+            push_notice(
+                Notice::error("Could not install", "The repository is too large."),
+                window,
+                cx,
+            );
+            push_notice(
+                Notice::warning("Nothing was updated", "GitHub answered nothing."),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(cards(&mut cx), 1, "the two notices took two cards");
+        assert_eq!(
+            headings(&mut cx),
+            ["Could not install", "Nothing was updated"]
+        );
+        assert!(
+            cx.debug_bounds("notices").is_some(),
+            "the notices never drew"
+        );
+    }
+
+    /// A notice carrying a button is built by the same closure, on the frame
+    /// after it is pushed. This is the draw that runs it.
+    #[gpui_kit::test]
+    fn a_notice_with_a_button_draws(cx: &mut TestAppContext) {
+        let (mut cx, _) = window(cx);
+        cx.update(|window, cx| {
+            push_notice(
+                Notice::info("Deleted", "moved ~/.agents/skills/alpha to the trash")
+                    .action("Undo", |_, _| {}),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(cards(&mut cx), 1);
+        assert!(
+            cx.debug_bounds("notices").is_some(),
+            "the notice never drew"
+        );
+    }
+
+    /// Clearing the card has to forget the rows with it, or they would come
+    /// back under the next notice pushed.
+    #[gpui_kit::test]
+    fn clearing_the_card_forgets_every_notice(cx: &mut TestAppContext) {
+        let (mut cx, _) = window(cx);
+        cx.update(|window, cx| {
+            push_notice(Notice::error("One", "A"), window, cx);
+            push_notice(Notice::error("Two", "B"), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(headings(&mut cx).len(), 2);
+
+        cx.update(|window, cx| {
+            Root::update(window, cx, |root, window, cx| {
+                root.clear_notifications(window, cx);
+            });
+        });
+        // The card stays mounted until its exit transition is over, and it is
+        // the unmount that clears the rows.
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        assert!(headings(&mut cx).is_empty(), "the rows outlived the card");
+        assert_eq!(cards(&mut cx), 0);
+
+        cx.update(|window, cx| push_notice(Notice::error("Three", "C"), window, cx));
+        cx.run_until_parked();
+        assert_eq!(headings(&mut cx), ["Three"]);
+    }
+
+    /// A delete that took something away offers to put it back. One that took
+    /// nothing away has nothing to offer, and says so and goes.
+    #[gpui_kit::test]
+    fn only_a_delete_that_changed_something_offers_an_undo(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        let roots = cx.update(|_, cx| skillbase.read(cx).roots.clone());
+
+        cx.update(|window, cx| {
+            report_delete(
+                "Deleted",
+                "Could not delete",
+                Ok(Outcome::one(Change::NoChange {
+                    path: PathBuf::from("/nowhere"),
+                    reason: "not there",
+                })),
+                &roots,
+                Rc::new(|_, _| {}),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            headings(&mut cx).is_empty(),
+            "a delete that did nothing left a message that stays"
+        );
+
+        cx.update(|window, cx| {
+            report_delete(
+                "Deleted",
+                "Could not delete",
+                Ok(Outcome::one(Change::MovedToTrash {
+                    from: roots.store_dir().join("alpha"),
+                    to: roots.trash_dir().join("alpha-1"),
+                })),
+                &roots,
+                Rc::new(|_, _| {}),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(headings(&mut cx), ["Deleted"]);
+        assert!(
+            cx.debug_bounds("notices").is_some(),
+            "the delete's message never drew"
+        );
+    }
+
+    /// The two delete dialogs describe the same operation, so they say it in
+    /// the same sentence.
+    #[test]
+    fn the_delete_sentence_counts_what_is_going() {
+        let one = delete_effect(1);
+        assert!(
+            one.starts_with("The directory moves to ~/.skillbase/trash"),
+            "{one}"
+        );
+        assert!(one.contains("its links are removed"), "{one}");
+        assert!(one.contains("offers to put it back"), "{one}");
+
+        let many = delete_effect(3);
+        assert!(
+            many.starts_with("The directories move to ~/.skillbase/trash"),
+            "{many}"
+        );
+        assert!(many.contains("their links are removed"), "{many}");
+        assert!(many.contains("offers to put them back"), "{many}");
+    }
 }

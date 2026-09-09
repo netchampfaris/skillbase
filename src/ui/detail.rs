@@ -52,8 +52,9 @@ use super::model::{
 };
 use super::{
     BAND_HEIGHT, PROSE_MAX_WIDTH, agent_icon, cache_failure_notification,
-    delete_cache_failure_notification, drag_band, install_skill, remember_delete_cache_failure,
-    report, report_install, take_delete_cache_failure,
+    delete_cache_failure_notification, delete_effect, drag_band, install_skill, push_notice,
+    remember_delete_cache_failure, report, report_delete, report_install,
+    take_delete_cache_failure,
 };
 
 /// How many differing paths a duplicate lists before it starts counting.
@@ -1068,12 +1069,13 @@ impl DetailPane {
                             );
                         }
                         if let Some(reason) = cache_failure {
-                            window.push_notification(
+                            push_notice(
                                 cache_failure_notification(
                                     "The skill was renamed, but its install record could not be \
                                      moved with it",
                                     &reason,
                                 ),
+                                window,
                                 cx,
                             );
                         }
@@ -1111,6 +1113,30 @@ impl DetailPane {
     ) where
         F: FnOnce(Installer) -> Result<Outcome, InstallError> + Send + 'static,
     {
+        self.run_op(title, failed, false, op, window, cx);
+    }
+
+    /// The same, for the delete: its report carries the button that puts the
+    /// skill back.
+    fn run_delete<F>(&mut self, op: F, window: &mut Window, cx: &mut Context<Self>)
+    where
+        F: FnOnce(Installer) -> Result<Outcome, InstallError> + Send + 'static,
+    {
+        self.run_op("Deleted", "Could not delete", true, op, window, cx);
+    }
+
+    /// The body of [`DetailPane::run`] and [`DetailPane::run_delete`].
+    fn run_op<F>(
+        &mut self,
+        title: &'static str,
+        failed: &'static str,
+        undoable: bool,
+        op: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(Installer) -> Result<Outcome, InstallError> + Send + 'static,
+    {
         if self.busy {
             return;
         }
@@ -1125,16 +1151,40 @@ impl DetailPane {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;
-                report(title, failed, result, &this.roots, window, cx);
+                if undoable {
+                    // The undo runs long after this task is over, and nothing
+                    // else would notice that a directory came back, so it
+                    // carries the rescan with it. The skill it puts back is
+                    // the one to land on.
+                    let entity = cx.entity().downgrade();
+                    let restored = select.clone();
+                    report_delete(
+                        title,
+                        failed,
+                        result,
+                        &this.roots,
+                        Rc::new(move |_, cx| {
+                            let select = restored.clone();
+                            entity
+                                .update(cx, |_, cx| cx.emit(DetailEvent::Changed { select }))
+                                .ok();
+                        }),
+                        window,
+                        cx,
+                    );
+                } else {
+                    report(title, failed, result, &this.roots, window, cx);
+                }
                 // Delete is the one operation run from here that writes the
                 // remote cache, and the slot it writes into is its own, so a
                 // failure waiting in it belongs to the delete just reported.
                 if let Some(reason) = take_delete_cache_failure() {
-                    window.push_notification(
+                    push_notice(
                         delete_cache_failure_notification(
                             "The skill was deleted, but its install record could not be removed",
                             &reason,
                         ),
+                        window,
                         cx,
                     );
                 }
@@ -1562,6 +1612,11 @@ impl DetailPane {
             } else {
                 format!("Removes {}:", in_a_list(&kinds))
             };
+            // The same sentence the marked-set dialog ends on. Without it this
+            // one read as though the directory were destroyed, and said
+            // nothing about the links.
+            let directories = usize::from(plan.origin.is_some()) + plan.copy_count();
+
             let description = v_flex()
                 .gap_3()
                 .text_sm()
@@ -1572,6 +1627,14 @@ impl DetailPane {
                         .text_color(cx.theme().muted_foreground)
                         .child(path.clone())
                 })))
+                .when(directories > 0, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(delete_effect(directories)),
+                    )
+                })
                 .when(!kept.is_empty(), |this| {
                     this.child(
                         v_flex()
@@ -1610,9 +1673,7 @@ impl DetailPane {
                     this.update(cx, |this, cx| {
                         let plan = plan.clone();
                         let roots = roots.clone();
-                        this.run(
-                            "Deleted",
-                            "Could not delete",
+                        this.run_delete(
                             move |installer| {
                                 let result = installer.delete(&plan);
                                 // The record of a skill that is gone would
@@ -2098,6 +2159,14 @@ impl DetailPane {
         // lie. Once a scan is in, an empty pane means the scope is empty and
         // the sentence points somewhere real.
         let scanning = self.scan.is_none();
+        // On a machine with no skills at all, telling the reader to pick one
+        // from the list points at an empty list. The list's own first-run text
+        // says what a skill is and offers Discover; this says the same thing
+        // about the same machine so the two panes do not disagree.
+        let nothing_yet = self
+            .scan
+            .as_ref()
+            .is_some_and(|scan| scan.skills.is_empty());
 
         v_flex()
             .size_full()
@@ -2129,13 +2198,25 @@ impl DetailPane {
                             .large()
                             .text_color(cx.theme().muted_foreground),
                     )
-                    .child(div().text_sm().font_medium().child("No skill selected"))
+                    .child(div().text_sm().font_medium().child(if nothing_yet {
+                        "No skills yet"
+                    } else {
+                        "No skill selected"
+                    }))
                     .when(!scanning, |this| {
                         this.child(
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("Pick a skill from the list to read or edit it."),
+                                .max_w(px(PROSE_MAX_WIDTH))
+                                .text_center()
+                                .child(if nothing_yet {
+                                    "A skill is a folder with a SKILL.md file in it that tells \
+                                     an agent how to do one thing. This pane reads and edits \
+                                     the one you pick."
+                                } else {
+                                    "Pick a skill from the list to read or edit it."
+                                }),
                         )
                     }),
             )
@@ -2342,7 +2423,7 @@ impl DetailPane {
                             .text_xs()
                             .truncate()
                             .text_color(cx.theme().muted_foreground)
-                            .child(reach(skill, cx)),
+                            .child(reach(skill, &installed, cx)),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.visibility_open = !this.visibility_open;
@@ -4156,14 +4237,29 @@ fn scope_label(agent_id: &str) -> &'static str {
 /// the information the list rows used to carry as a row of tags under every
 /// skill, which was three lines of chrome per row for a question the reader
 /// was rarely asking at that moment.
-fn reach(skill: &SkillView, cx: &mut Context<DetailPane>) -> SharedString {
+///
+/// Only agents on this machine, `installed`, which is the filter
+/// [`SkillView::reach`] applies. `visible_to` on its own answers "would this
+/// agent reach the skill", which is true of every agent that reads the shared
+/// directory whether or not it is here, and naming one of those put it in this
+/// line and in the "not installed" sentence two rows below at the same time.
+fn reach(
+    skill: &SkillView,
+    installed: &[&'static AgentDef],
+    cx: &mut Context<DetailPane>,
+) -> SharedString {
     const NAMED: usize = 3;
 
     let mut names: Vec<&'static str> = Vec::new();
     if skill.in_shared {
         names.push("Shared");
     }
-    names.extend(skill.visible_to.iter().copied().map(agent_label));
+    names.extend(
+        skill
+            .reach(installed)
+            .into_iter()
+            .map(|agent| agent.display_name),
+    );
 
     let _ = cx;
     match names.len() {

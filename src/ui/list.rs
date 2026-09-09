@@ -32,8 +32,8 @@ use crate::menus::{ClearMarks, MarkAll};
 
 use super::model::{Library, Scan, Scope, SkillSort, SkillView, display_path, join_and};
 use super::{
-    agent_icon, delete_cache_failure_notification, remember_delete_cache_failure, report,
-    take_delete_cache_failure,
+    agent_icon, delete_cache_failure_notification, delete_effect, push_notice,
+    remember_delete_cache_failure, report, report_delete, take_delete_cache_failure,
 };
 
 /// A comfortable default: long enough for a skill name plus a description
@@ -1280,6 +1280,31 @@ impl Skillbase {
     ) where
         F: FnOnce(Installer) -> Result<Outcome, InstallError> + Send + 'static,
     {
+        self.run_on_marked_op(title, failed, false, op, window, cx);
+    }
+
+    /// The same, for the delete: its report carries the button that puts every
+    /// skill in the set back.
+    fn run_delete_marked<F>(&mut self, op: F, window: &mut Window, cx: &mut Context<Self>)
+    where
+        F: FnOnce(Installer) -> Result<Outcome, InstallError> + Send + 'static,
+    {
+        self.run_on_marked_op("Deleted", "Could not delete", true, op, window, cx);
+    }
+
+    /// The body of [`SkillList::run_on_marked`] and
+    /// [`SkillList::run_delete_marked`].
+    fn run_on_marked_op<F>(
+        &mut self,
+        title: &'static str,
+        failed: &'static str,
+        undoable: bool,
+        op: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(Installer) -> Result<Outcome, InstallError> + Send + 'static,
+    {
         if self.bulk_busy {
             return;
         }
@@ -1293,17 +1318,38 @@ impl Skillbase {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.bulk_busy = false;
-                report(title, failed, result, &this.roots, window, cx);
+                if undoable {
+                    // The undo runs long after this task is over, and nothing
+                    // else would notice that the directories came back, so it
+                    // carries the rescan with it.
+                    let entity = cx.entity().downgrade();
+                    report_delete(
+                        title,
+                        failed,
+                        result,
+                        &this.roots,
+                        Rc::new(move |window, cx| {
+                            entity
+                                .update(cx, |this, cx| this.rescan(None, window, cx))
+                                .ok();
+                        }),
+                        window,
+                        cx,
+                    );
+                } else {
+                    report(title, failed, result, &this.roots, window, cx);
+                }
                 // Delete is the one operation run from here that writes the
                 // remote cache, and the slot it writes into is its own, so a
                 // failure waiting in it belongs to the delete just reported.
                 if let Some(reason) = take_delete_cache_failure() {
-                    window.push_notification(
+                    push_notice(
                         delete_cache_failure_notification(
                             "The skills were deleted, but their install records could not be \
                              removed",
                             &reason,
                         ),
+                        window,
                         cx,
                     );
                 }
@@ -1643,13 +1689,16 @@ impl Skillbase {
                         }))),
                 )
                 // The one thing the path list cannot say: a directory is not
-                // destroyed, so a mistake here is recoverable.
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Directories move to ~/.skillbase/trash. Links are removed."),
-                )
+                // destroyed, so a mistake here is recoverable. The same
+                // sentence the single-skill dialog ends on.
+                .when(origins + copies > 0, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(delete_effect(origins + copies)),
+                    )
+                })
                 .when(!kept.is_empty(), |this| {
                     this.child(
                         v_flex()
@@ -1692,9 +1741,7 @@ impl Skillbase {
                     let plans = plans.clone();
                     let roots = roots.clone();
                     this.update(cx, |this, cx| {
-                        this.run_on_marked(
-                            "Deleted",
-                            "Could not delete",
+                        this.run_delete_marked(
                             move |installer| {
                                 let mut done = Outcome::default();
                                 let mut stopped = None;
@@ -2011,7 +2058,13 @@ impl Skillbase {
         const SHOWN: usize = 4;
 
         let id = ElementId::from((ElementId::from("skill-reach"), skill.name.clone()));
-        let agents = skill.reach();
+        // Only the agents this machine actually has. `SkillView::reach` answers
+        // "would this agent reach the skill", which is true of every agent that
+        // reads ~/.agents/skills whether or not it is installed — so a row for
+        // a shared skill drew a dozen logos on a machine the sidebar said held
+        // one agent.
+        let present = self.scan().map(|scan| scan.installed.as_slice());
+        let agents = skill.reach(present.unwrap_or_default());
         if agents.is_empty() {
             // A skill nothing can load is a fact worth a word. The lane is at
             // the trailing edge, so saying it moves nothing else on the row.
@@ -2367,6 +2420,7 @@ fn name_problem(name: &str, scan: Option<&Scan>) -> Option<SharedString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skillbase_core::{Location, LocationKind};
     use std::path::PathBuf;
 
     fn skill_named(name: &str, description: &str) -> SkillView {
@@ -2498,6 +2552,49 @@ mod tests {
         }
         let said = scope_explanation(Scope::Agent("claude-code"));
         assert!(said.contains("Claude Code"), "{said}");
+    }
+
+    /// The row icons used to be drawn from `visible_to`, which names every
+    /// agent that reads ~/.agents/skills whether or not it is on the machine —
+    /// so a shared skill wore a dozen logos beside a sidebar saying one agent
+    /// was here.
+    #[test]
+    fn a_row_names_only_the_agents_that_are_on_this_machine() {
+        let cursor = Registry::get("cursor").expect("cursor is in the registry");
+
+        let mut shared = skill_named("shared-one", "");
+        shared.in_shared = true;
+        shared.visible_to = vec!["cursor", "gemini-cli", "zed"];
+        let named: Vec<&str> = shared
+            .reach(&[cursor])
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect();
+        assert_eq!(named, ["cursor"]);
+        assert!(shared.reach(&[]).is_empty());
+        // Presence is the whole of the filter: with all three on the machine
+        // all three are named.
+        let gemini = Registry::get("gemini-cli").expect("gemini-cli is in the registry");
+        let zed = Registry::get("zed").expect("zed is in the registry");
+        assert_eq!(shared.reach(&[cursor, gemini, zed]).len(), 3);
+
+        // A link on disk is kept whatever presence says: it is the thing the
+        // reader can act on.
+        let mut linked = skill_named("linked-one", "");
+        linked.visible_to = vec!["claude-code"];
+        linked.locations = vec![Location {
+            agent_id: "claude-code",
+            path: PathBuf::from("/home/.claude/skills/linked-one"),
+            kind: LocationKind::Symlink {
+                target: PathBuf::from("/store/linked-one"),
+            },
+        }];
+        let named: Vec<&str> = linked
+            .reach(&[])
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect();
+        assert_eq!(named, ["claude-code"]);
     }
 }
 
