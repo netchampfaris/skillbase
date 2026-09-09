@@ -75,6 +75,44 @@ fn resolves_and_installs_a_skill_from_github() {
     eprintln!("tree sha = {sha}");
 }
 
+/// A skill in a repository whose archive is 86 MB, which is past
+/// `MAX_BODY_BYTES`. Before the files were fetched one at a time this could not
+/// be installed at all: the download was refused for its size after about
+/// fourteen seconds. Nothing in the unit tests can catch GitHub withdrawing
+/// `raw.githubusercontent.com` or changing what a tree listing carries, which
+/// is why this one reads the real thing.
+#[test]
+#[ignore = "makes real network requests"]
+fn installs_a_skill_out_of_a_repository_too_large_to_download_whole() {
+    let home = tempfile::tempdir().expect("temp home");
+    let roots = Roots::new(home.path());
+    let github = GitHub::from_env(UreqHttp::new());
+
+    let location =
+        SkillLocation::parse("github/awesome-copilot/skills/pdftk-server").expect("parse");
+    let installer = Installer::new(roots.clone());
+    let mut cache = RemoteCache::read(&roots);
+    let installed = install_from_github(
+        &installer,
+        &github,
+        &location,
+        &InstallOptions::new(),
+        &mut cache,
+    )
+    .expect("install a skill out of a large monorepo");
+
+    eprintln!(
+        "installed {} ({} files) in {} requests",
+        installed.name,
+        installed.files,
+        github.requests_made()
+    );
+    assert!(installed.dir.join("SKILL.md").is_file());
+    assert!(installed.dir.join("references").is_dir());
+    // The whole repository would be tens of thousands of files.
+    assert!(installed.files < 50, "{} files", installed.files);
+}
+
 #[test]
 #[ignore = "makes real network requests"]
 fn a_freshly_installed_skill_reports_no_update() {

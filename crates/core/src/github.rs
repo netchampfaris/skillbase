@@ -14,9 +14,17 @@
 //!    roughly 160 KB `?recursive=1` returns for the same repository. A
 //!    truncated response falls back to the recursive form, which is the only
 //!    case where it is worth paying for.
-//! 3. **Give me the bytes.** `https://codeload.github.com/{o}/{r}/tar.gz/{sha}`
-//!    is one request, pinned to a sha, and is not counted against the API rate
-//!    limit. [`extract_subdir`] then writes out only the wanted subdirectory.
+//! 3. **Give me the bytes.** [`GitHub::fetch_files`] lists the skill's own
+//!    directory with one recursive tree request and then pulls each file from
+//!    `https://raw.githubusercontent.com/{o}/{r}/{sha}/{path}`, which is not
+//!    counted against the API rate limit. Installing `skills/pdftk-server` out
+//!    of `github/awesome-copilot` moves about 29 KB that way; the repository's
+//!    own archive is 86 MB, which is past the transport's
+//!    [`MAX_BODY_BYTES`](crate::http::MAX_BODY_BYTES) and so could not be
+//!    downloaded at all. The whole archive,
+//!    `https://codeload.github.com/{o}/{r}/tar.gz/{sha}` unpacked by
+//!    [`extract_subdir`], is the fallback for the cases the file-by-file fetch
+//!    cannot serve — see [`WholeRepoReason`].
 //!
 //! The contents API is never used to detect change. It does not recurse, so an
 //! edit inside `scripts/` does not alter anything it reports.
@@ -65,8 +73,20 @@ pub const GITHUB_API_BASE: &str = "https://api.github.com";
 /// The host that serves repository archives. Not on the API rate limit.
 pub const GITHUB_CODELOAD_BASE: &str = "https://codeload.github.com";
 
+/// The host that serves single files out of a repository, pinned to a sha.
+/// Not on the API rate limit either; it sends no `x-ratelimit-*` header at all.
+pub const GITHUB_RAW_BASE: &str = "https://raw.githubusercontent.com";
+
 /// The REST API version this crate asks for.
 const API_VERSION: &str = "2022-11-28";
+
+/// How many files [`GitHub::fetch_files`] will fetch one at a time before it
+/// downloads the whole repository archive instead.
+///
+/// A skill is a `SKILL.md` and a handful of references and scripts; the largest
+/// in the wild are a few dozen files. Past this many, one archive request beats
+/// a hundred file requests, and a directory that big is not a skill.
+pub const MAX_SUBTREE_FILES: usize = 100;
 
 /// What the rate limit headers said on the last API response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +198,26 @@ pub enum GitHubError {
         detail: String,
     },
 
+    /// The repository's archive is bigger than
+    /// [`MAX_BODY_BYTES`](crate::http::MAX_BODY_BYTES), and the wanted files
+    /// could not be fetched one at a time either.
+    ///
+    /// [`GitHub::fetch_files`] reaches for the archive only when
+    /// [`WholeRepoReason`] says the file-by-file fetch cannot serve the
+    /// request, so this error always carries why it had to.
+    #[error("{}", too_large_message(.repo, .path, .limit, .reason))]
+    RepoTooLarge {
+        /// The repository, as `owner/repo`.
+        repo: String,
+        /// The directory that was wanted, empty for the repository root.
+        path: String,
+        /// The cap that was passed,
+        /// [`MAX_BODY_BYTES`](crate::http::MAX_BODY_BYTES).
+        limit: usize,
+        /// Why the whole archive was the only way to get the files.
+        reason: WholeRepoReason,
+    },
+
     /// Writing an extracted file failed.
     #[error("{path}: {source}")]
     Io {
@@ -203,6 +243,68 @@ impl GitHubError {
     /// rest of its list on the same answer.
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, Self::RateLimited { .. })
+    }
+}
+
+/// Why [`GitHub::fetch_files`] downloaded the whole repository archive rather
+/// than the wanted directory alone.
+///
+/// Only interesting when the archive then turned out to be too large: it is
+/// what lets [`GitHubError::RepoTooLarge`] say whether the user asked for the
+/// whole repository, in which case naming one skill inside it works, or asked
+/// for a directory that could not be fetched by itself, in which case it does
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WholeRepoReason {
+    /// The repository root was asked for, so the whole repository *is* the
+    /// skill and there is no smaller thing to fetch.
+    WholeRepository,
+    /// The directory holds a symlink. Only [`extract_subdir`] recreates one,
+    /// and only it checks where the link points.
+    HasSymlink,
+    /// The directory holds more than [`MAX_SUBTREE_FILES`] files.
+    TooManyFiles,
+    /// GitHub could not list the directory in one response, so an entry that
+    /// is absent from the listing proves nothing.
+    Truncated,
+}
+
+impl WholeRepoReason {
+    /// The clause that finishes "…could not be fetched on its own because …".
+    fn because(self) -> &'static str {
+        match self {
+            // Never reached: the whole-repository case takes the other branch
+            // of `too_large_message`.
+            Self::WholeRepository => "it is the whole repository",
+            Self::HasSymlink => "it holds a symlink",
+            Self::TooManyFiles => "it holds more files than can be fetched one at a time",
+            Self::Truncated => "GitHub could not list it in one response",
+        }
+    }
+}
+
+/// What [`GitHubError::RepoTooLarge`] says.
+///
+/// Two sentences, and the second is the one that matters: it is the difference
+/// between a user who tries the next thing and one who concludes the skill is
+/// broken. Asking for the whole repository has a real next step — name the one
+/// skill wanted — so the message names it, spelled the way the field takes it.
+/// The other cases have no shorter download to offer and say so.
+fn too_large_message(repo: &str, path: &str, limit: &usize, reason: &WholeRepoReason) -> String {
+    let megabytes = limit / (1024 * 1024);
+    match reason {
+        WholeRepoReason::WholeRepository => format!(
+            "{repo} is too large to download whole (over {megabytes} MB). Install one skill \
+             from it instead of the whole repository, by naming that skill's directory: \
+             {repo}/path/to/skill."
+        ),
+        other => format!(
+            "{repo} is too large to download whole (over {megabytes} MB), and `{path}` could \
+             not be fetched on its own because {}. Clone the repository and install the skill \
+             from that folder instead.",
+            other.because()
+        ),
     }
 }
 
@@ -409,6 +511,12 @@ impl TreeEntry {
     pub fn is_blob(&self) -> bool {
         self.kind == "blob"
     }
+
+    /// True for a symlink, which git records as a blob with mode `120000`
+    /// whose content is the target path.
+    pub fn is_symlink(&self) -> bool {
+        self.mode == "120000"
+    }
 }
 
 /// One git tree, as GitHub returns it.
@@ -442,6 +550,7 @@ pub struct GitHub<H: Http> {
     token: Option<String>,
     api_base: String,
     codeload_base: String,
+    raw_base: String,
     rate_limit: Mutex<Option<RateLimit>>,
     requests: AtomicUsize,
 }
@@ -453,6 +562,7 @@ impl<H: Http + fmt::Debug> fmt::Debug for GitHub<H> {
             .field("token", &self.token.as_ref().map(|_| "set"))
             .field("api_base", &self.api_base)
             .field("codeload_base", &self.codeload_base)
+            .field("raw_base", &self.raw_base)
             .field("rate_limit", &self.rate_limit)
             .field("requests", &self.requests)
             .finish()
@@ -467,6 +577,7 @@ impl<H: Http> GitHub<H> {
             token: None,
             api_base: GITHUB_API_BASE.to_string(),
             codeload_base: GITHUB_CODELOAD_BASE.to_string(),
+            raw_base: GITHUB_RAW_BASE.to_string(),
             rate_limit: Mutex::new(None),
             requests: AtomicUsize::new(0),
         }
@@ -490,9 +601,11 @@ impl<H: Http> GitHub<H> {
         mut self,
         api_base: impl Into<String>,
         codeload_base: impl Into<String>,
+        raw_base: impl Into<String>,
     ) -> Self {
         self.api_base = api_base.into().trim_end_matches('/').to_string();
         self.codeload_base = codeload_base.into().trim_end_matches('/').to_string();
+        self.raw_base = raw_base.into().trim_end_matches('/').to_string();
         self
     }
 
@@ -512,10 +625,12 @@ impl<H: Http> GitHub<H> {
         &self.http
     }
 
-    /// How many requests this client has made, API and archive together.
+    /// How many requests this client has made: API, archive and single file
+    /// downloads together.
     ///
     /// The number the interface can quote when it explains why an update check
-    /// used part of an hourly budget.
+    /// used part of an hourly budget. Only the API requests spend that budget;
+    /// codeload and `raw.githubusercontent.com` are not on it.
     pub fn requests_made(&self) -> usize {
         self.requests.load(Ordering::Relaxed)
     }
@@ -865,14 +980,7 @@ impl<H: Http> GitHub<H> {
     /// extracted is exactly what the tree sha recorded as provenance describes.
     pub fn download_tarball(&self, repo: &RepoRef, sha: &str) -> Result<Vec<u8>, GitHubError> {
         let url = format!("{}/{}/tar.gz/{sha}", self.codeload_base, repo.slug());
-        let mut headers: Vec<(&str, &str)> = Vec::new();
-        let authorization;
-        if let Some(token) = &self.token {
-            authorization = format!("Bearer {token}");
-            headers.push(("Authorization", &authorization));
-        }
-        self.requests.fetch_add(1, Ordering::Relaxed);
-        let response = self.http.get(&url, &headers)?;
+        let response = self.fetch_bytes(&url)?;
         match response.status {
             200..=299 => Ok(response.body),
             404 => Err(GitHubError::NotFound {
@@ -881,6 +989,193 @@ impl<H: Http> GitHub<H> {
             _ => Err(status_error(&url, &response)),
         }
     }
+
+    /// Writes the files of one directory of a repository into `dest`, and
+    /// returns how many were written.
+    ///
+    /// This is the step that gets the bytes, and it prefers the small request.
+    /// One recursive tree request lists the wanted directory, and each file
+    /// then comes from `raw.githubusercontent.com`, pinned to `commit_sha`.
+    /// Installing `skills/pdftk-server` out of `github/awesome-copilot` moves
+    /// about 29 KB. Downloading that repository's archive moves 86 MB, which is
+    /// past [`MAX_BODY_BYTES`](crate::http::MAX_BODY_BYTES), so before this the
+    /// skill could not be installed at all — and every skill in a large
+    /// monorepo was in the same position.
+    ///
+    /// The cost is one API request. Nothing already fetched holds the listing
+    /// of the wanted directory, so an unauthenticated install spends four of
+    /// its sixty hourly requests rather than three. The file downloads spend
+    /// none, and neither does the archive: only `api.github.com` is on the
+    /// rate limit.
+    ///
+    /// Falls back to the whole archive, unpacked by [`extract_subdir`], for the
+    /// four cases in [`WholeRepoReason`]. When *that* is refused for its size,
+    /// the reason travels with the error, so [`GitHubError::RepoTooLarge`] can
+    /// say whether there is a smaller thing to ask for.
+    pub fn fetch_files(
+        &self,
+        repo: &RepoRef,
+        commit_sha: &str,
+        tree_sha: &str,
+        path: &str,
+        dest: &Path,
+    ) -> Result<usize, GitHubError> {
+        let path = path.trim_matches('/');
+        let reason = match self.plan_subtree(repo, tree_sha, path)? {
+            SubtreePlan::Files(entries) => {
+                return self.write_subtree(repo, commit_sha, path, &entries, dest);
+            }
+            SubtreePlan::WholeArchive(reason) => reason,
+        };
+
+        let archive = self.download_tarball(repo, commit_sha).map_err(|e| {
+            match e {
+                // The one error the user cannot act on as written. It names a
+                // codeload URL and a byte count, and neither says that the
+                // repository is too big or what to do instead.
+                GitHubError::Http(HttpError::TooLarge { limit, .. }) => GitHubError::RepoTooLarge {
+                    repo: repo.slug(),
+                    path: path.to_string(),
+                    limit,
+                    reason,
+                },
+                other => other,
+            }
+        })?;
+        extract_subdir(&archive, path, dest)
+    }
+
+    /// Decides whether the wanted directory can be fetched file by file, and
+    /// lists it when it can.
+    ///
+    /// An empty `path` is the repository root: the whole repository is the
+    /// skill, so there is nothing smaller to fetch and the archive is the right
+    /// request rather than a fallback.
+    fn plan_subtree(
+        &self,
+        repo: &RepoRef,
+        tree_sha: &str,
+        path: &str,
+    ) -> Result<SubtreePlan, GitHubError> {
+        if path.is_empty() {
+            return Ok(SubtreePlan::WholeArchive(WholeRepoReason::WholeRepository));
+        }
+        let tree = self.tree(repo, tree_sha, true)?;
+        if tree.truncated {
+            return Ok(SubtreePlan::WholeArchive(WholeRepoReason::Truncated));
+        }
+        if tree.tree.iter().any(|entry| entry.is_symlink()) {
+            return Ok(SubtreePlan::WholeArchive(WholeRepoReason::HasSymlink));
+        }
+        if tree.tree.iter().filter(|entry| entry.is_blob()).count() > MAX_SUBTREE_FILES {
+            return Ok(SubtreePlan::WholeArchive(WholeRepoReason::TooManyFiles));
+        }
+        Ok(SubtreePlan::Files(tree.tree))
+    }
+
+    /// Downloads each listed file into `dest`, keeping the directory shape.
+    ///
+    /// The entry paths come from GitHub, but they are checked all the same:
+    /// this writes to disk from a remote listing, and [`extract_subdir`] holds
+    /// the same line for the same reason. A submodule is skipped, because the
+    /// archive holds nothing for one either.
+    fn write_subtree(
+        &self,
+        repo: &RepoRef,
+        commit_sha: &str,
+        path: &str,
+        entries: &[TreeEntry],
+        dest: &Path,
+    ) -> Result<usize, GitHubError> {
+        fs::create_dir_all(dest).map_err(|e| GitHubError::io(dest, e))?;
+
+        let mut written = 0usize;
+        for entry in entries {
+            let relative = Path::new(&entry.path);
+            if entry.path.is_empty() || !is_contained(relative) {
+                continue;
+            }
+            let target = dest.join(relative);
+            if entry.is_tree() {
+                fs::create_dir_all(&target).map_err(|e| GitHubError::io(&target, e))?;
+                continue;
+            }
+            if !entry.is_blob() {
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| GitHubError::io(parent, e))?;
+            }
+
+            let url = format!(
+                "{}/{}/{commit_sha}/{}",
+                self.raw_base,
+                repo.slug(),
+                encode_path(&format!("{path}/{}", entry.path))
+            );
+            let response = self.fetch_bytes(&url)?;
+            match response.status {
+                200..=299 => {}
+                404 => {
+                    return Err(GitHubError::NotFound {
+                        what: format!("{}/{} at {commit_sha}", repo.slug(), entry.path),
+                    });
+                }
+                _ => return Err(status_error(&url, &response)),
+            }
+            fs::write(&target, &response.body).map_err(|e| GitHubError::io(&target, e))?;
+            set_executable(&target, mode_bits(&entry.mode))?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// A `GET` to a host that serves bytes rather than JSON — codeload for an
+    /// archive, raw for one file. Neither is on the API rate limit, so neither
+    /// carries rate limit headers to record, and a status is left to the
+    /// caller, which knows what a 404 means there.
+    fn fetch_bytes(&self, url: &str) -> Result<HttpResponse, GitHubError> {
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        let authorization;
+        if let Some(token) = &self.token {
+            authorization = format!("Bearer {token}");
+            headers.push(("Authorization", &authorization));
+        }
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        Ok(self.http.get(url, &headers)?)
+    }
+}
+
+/// What [`GitHub::plan_subtree`] decided.
+enum SubtreePlan {
+    /// The directory listing, to fetch one file at a time.
+    Files(Vec<TreeEntry>),
+    /// The directory cannot be fetched that way, for this reason.
+    WholeArchive(WholeRepoReason),
+}
+
+/// A git file mode as a number. `0` when it is missing or unreadable, which
+/// leaves the file its default permissions rather than guessing at them.
+fn mode_bits(mode: &str) -> u32 {
+    u32::from_str_radix(mode, 8).unwrap_or(0)
+}
+
+/// Percent-encodes a repository path for a URL, leaving `/` as the separator.
+///
+/// A git path may hold anything but a NUL and a slash, and skills in the wild
+/// have spaces and `#` in their reference filenames. Unescaped, a `#` truncates
+/// the URL at the fragment and the file downloads as the wrong thing.
+fn encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Turns a non-2xx response into a [`GitHubError::Status`], pulling out
@@ -1129,7 +1424,11 @@ mod tests {
     use crate::http::fake::FakeHttp;
 
     fn client(http: FakeHttp) -> GitHub<FakeHttp> {
-        GitHub::new(http).with_endpoints("https://api.test", "https://codeload.test")
+        GitHub::new(http).with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        )
     }
 
     #[test]
@@ -1501,5 +1800,256 @@ mod tests {
             .download_tarball(&RepoRef::new("o", "r", "main"), "c0ffee")
             .unwrap();
         assert_eq!(bytes, b"gzip bytes");
+    }
+
+    // -- fetching the files --------------------------------------------------
+
+    fn repo() -> RepoRef {
+        RepoRef::new("o", "r", "main")
+    }
+
+    /// A listing of `skills/pdf`, with whatever entries the test needs, plus
+    /// the archive that the fallback would download instead.
+    fn fetch_http(listing: &str) -> FakeHttp {
+        let http = FakeHttp::new();
+        http.json(
+            "https://api.test/repos/o/r/git/trees/pdf-tree?recursive=1",
+            listing,
+        );
+        http.reply(
+            "https://raw.test/o/r/c0ffee/skills/pdf/SKILL.md",
+            HttpResponse::new(200, "---\nname: pdf\n---\n"),
+        );
+        http.reply(
+            "https://raw.test/o/r/c0ffee/skills/pdf/scripts/run.sh",
+            HttpResponse::new(200, "#!/bin/sh\necho hi\n"),
+        );
+        http.reply(
+            "https://codeload.test/o/r/tar.gz/c0ffee",
+            HttpResponse::new(
+                200,
+                tarball(
+                    "r-c0ffee",
+                    &[
+                        ("README.md", "not the skill\n"),
+                        ("skills/pdf/SKILL.md", "---\nname: pdf\n---\n"),
+                        ("skills/pdf/scripts/run.sh", "#!/bin/sh\necho hi\n"),
+                    ],
+                ),
+            ),
+        );
+        http
+    }
+
+    const PDF_LISTING: &str = r#"{"sha":"pdf-tree","truncated":false,"tree":[
+        {"path":"SKILL.md","mode":"100644","type":"blob","sha":"b1"},
+        {"path":"scripts","mode":"040000","type":"tree","sha":"t1"},
+        {"path":"scripts/run.sh","mode":"100755","type":"blob","sha":"b2"}]}"#;
+
+    /// The fix for a skill that could not be installed at all: fetching only
+    /// the skill's directory never asks for the repository archive, so the
+    /// archive's size stops mattering.
+    #[test]
+    fn a_subtree_is_fetched_file_by_file_and_never_asks_for_the_archive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let gh = client(fetch_http(PDF_LISTING));
+
+        let written = gh
+            .fetch_files(&repo(), "c0ffee", "pdf-tree", "skills/pdf", &dest)
+            .unwrap();
+
+        assert_eq!(written, 2, "two blobs, and the directory is not a file");
+        assert_eq!(
+            fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "---\nname: pdf\n---\n"
+        );
+        assert!(dest.join("scripts/run.sh").is_file());
+        assert!(
+            gh.http().urls().iter().all(|url| !url.contains("codeload")),
+            "the archive was downloaded anyway: {:?}",
+            gh.http().urls()
+        );
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(dest.join("scripts/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "mode 100755 keeps the executable bit");
+    }
+
+    /// The repository root is the one case where the whole archive is the
+    /// right request rather than a fallback: there is nothing smaller to ask
+    /// for.
+    #[test]
+    fn the_repository_root_is_fetched_as_the_whole_archive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let gh = client(fetch_http(PDF_LISTING));
+
+        let written = gh
+            .fetch_files(&repo(), "c0ffee", "root-tree", "", &dest)
+            .unwrap();
+
+        assert_eq!(written, 3);
+        assert!(dest.join("README.md").is_file());
+        assert!(
+            gh.http().urls().iter().any(|url| url.contains("codeload")),
+            "the root has to come from the archive"
+        );
+    }
+
+    /// A symlink is the one shape the file-by-file fetch will not recreate:
+    /// only [`extract_subdir`] checks where the link points before writing it.
+    #[test]
+    fn a_subtree_holding_a_symlink_falls_back_to_the_archive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let gh = client(fetch_http(
+            r#"{"sha":"pdf-tree","truncated":false,"tree":[
+                {"path":"SKILL.md","mode":"100644","type":"blob","sha":"b1"},
+                {"path":"link","mode":"120000","type":"blob","sha":"b3"}]}"#,
+        ));
+
+        gh.fetch_files(&repo(), "c0ffee", "pdf-tree", "skills/pdf", &dest)
+            .unwrap();
+
+        assert!(
+            gh.http().urls().iter().any(|url| url.contains("codeload")),
+            "a symlink sends it to the archive"
+        );
+    }
+
+    #[test]
+    fn a_directory_of_too_many_files_falls_back_to_the_archive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let entries: Vec<String> = (0..=MAX_SUBTREE_FILES)
+            .map(|n| format!(r#"{{"path":"f{n}","mode":"100644","type":"blob","sha":"b{n}"}}"#))
+            .collect();
+        let gh = client(fetch_http(&format!(
+            r#"{{"sha":"pdf-tree","truncated":false,"tree":[{}]}}"#,
+            entries.join(",")
+        )));
+
+        gh.fetch_files(&repo(), "c0ffee", "pdf-tree", "skills/pdf", &dest)
+            .unwrap();
+
+        assert!(gh.http().urls().iter().any(|url| url.contains("codeload")));
+    }
+
+    /// A truncated listing is not evidence of anything: a file missing from it
+    /// may still be in the repository, so the archive is the only complete
+    /// answer.
+    #[test]
+    fn a_truncated_listing_falls_back_to_the_archive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let gh = client(fetch_http(
+            r#"{"sha":"pdf-tree","truncated":true,"tree":[
+                {"path":"SKILL.md","mode":"100644","type":"blob","sha":"b1"}]}"#,
+        ));
+
+        gh.fetch_files(&repo(), "c0ffee", "pdf-tree", "skills/pdf", &dest)
+            .unwrap();
+
+        assert!(gh.http().urls().iter().any(|url| url.contains("codeload")));
+    }
+
+    /// The message issue 12 is about. Asking for the whole repository has a
+    /// real next step, so the sentence names it and spells it the way the
+    /// field takes it.
+    #[test]
+    fn a_repository_too_large_to_download_whole_says_to_name_one_skill() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let http = fetch_http(PDF_LISTING);
+        http.too_large("https://codeload.test/o/r/tar.gz/c0ffee");
+        let gh = client(http);
+
+        let error = gh
+            .fetch_files(&repo(), "c0ffee", "root-tree", "", &dest)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                GitHubError::RepoTooLarge {
+                    reason: WholeRepoReason::WholeRepository,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "o/r is too large to download whole (over 64 MB). Install one skill from it \
+             instead of the whole repository, by naming that skill's directory: \
+             o/r/path/to/skill."
+        );
+        assert!(
+            !message.contains("bytes") && !message.contains("codeload"),
+            "no byte counts and no URLs: {message}"
+        );
+    }
+
+    /// The other half: a directory that could not be fetched on its own has no
+    /// shorter download to offer, so the message says why and points at the
+    /// one thing that does work.
+    #[test]
+    fn a_directory_that_needed_the_archive_says_why_it_could_not_be_fetched_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let http = fetch_http(
+            r#"{"sha":"pdf-tree","truncated":false,"tree":[
+                {"path":"link","mode":"120000","type":"blob","sha":"b3"}]}"#,
+        );
+        http.too_large("https://codeload.test/o/r/tar.gz/c0ffee");
+        let gh = client(http);
+
+        let error = gh
+            .fetch_files(&repo(), "c0ffee", "pdf-tree", "skills/pdf", &dest)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "o/r is too large to download whole (over 64 MB), and `skills/pdf` could not be \
+             fetched on its own because it holds a symlink. Clone the repository and install \
+             the skill from that folder instead."
+        );
+    }
+
+    /// A `#` unescaped would truncate the URL at the fragment and download the
+    /// wrong file; a space would not be a URL at all.
+    #[test]
+    fn a_file_name_that_is_not_url_safe_is_encoded() {
+        assert_eq!(
+            encode_path("skills/pdf/refs/a b#c.md"),
+            "skills/pdf/refs/a%20b%23c.md"
+        );
+        assert_eq!(encode_path("a/b-c_d.e~f"), "a/b-c_d.e~f");
+    }
+
+    /// The listing comes from GitHub, but it is still remote input that this
+    /// writes to disk from.
+    #[test]
+    fn a_listed_path_that_would_escape_the_destination_is_skipped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("out");
+        let gh = client(fetch_http(
+            r#"{"sha":"pdf-tree","truncated":false,"tree":[
+                {"path":"SKILL.md","mode":"100644","type":"blob","sha":"b1"},
+                {"path":"../escaped.txt","mode":"100644","type":"blob","sha":"b9"}]}"#,
+        ));
+
+        let written = gh
+            .fetch_files(&repo(), "c0ffee", "pdf-tree", "skills/pdf", &dest)
+            .unwrap();
+
+        assert_eq!(written, 1);
+        assert!(dest.join("SKILL.md").is_file());
+        assert!(!dir.path().join("escaped.txt").exists());
     }
 }

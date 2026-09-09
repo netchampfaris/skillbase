@@ -104,8 +104,9 @@ pub use frontmatter::{
     SkillFrontmatter,
 };
 pub use github::{
-    GITHUB_API_BASE, GITHUB_CODELOAD_BASE, GITHUB_TOKEN_ENV, GitHub, GitHubError, ParsedLocation,
-    RateLimit, RefState, RepoRef, SkillLocation, Tree, TreeEntry, extract_subdir,
+    GITHUB_API_BASE, GITHUB_CODELOAD_BASE, GITHUB_RAW_BASE, GITHUB_TOKEN_ENV, GitHub, GitHubError,
+    MAX_SUBTREE_FILES, ParsedLocation, RateLimit, RefState, RepoRef, SkillLocation, Tree,
+    TreeEntry, WholeRepoReason, extract_subdir,
 };
 pub use github_token::{TokenSource, github_token_source, refresh_github_token};
 pub use http::{Http, HttpError, HttpResponse, MAX_BODY_BYTES, USER_AGENT, UreqHttp};
