@@ -8,6 +8,7 @@
 //! the root view scans again, so the interface never asserts a state the
 //! filesystem does not back up.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -176,6 +177,13 @@ const BINARY_EXTENSIONS: [&str; 21] = [
 const MAX_TREE_DEPTH: usize = 3;
 const MAX_TREE_ENTRIES: usize = 200;
 
+/// How many rows the Files listing may hold and still open with the skill.
+///
+/// Eight is about a third of the Overview at the pane's usual height. A listing
+/// that long is read at a glance, so showing it costs the reader nothing; a
+/// longer one is a section of its own and waits to be asked for.
+const MAX_ROWS_OPEN: usize = 8;
+
 /// Which of the pane's tabs is showing.
 ///
 /// The Overview is a variant rather than index 0 of the file list, so that
@@ -186,6 +194,45 @@ const MAX_TREE_ENTRIES: usize = 200;
 enum Showing {
     Overview,
     File(SharedString),
+}
+
+/// The unsaved edits to `SKILL.md`, by the tab they were made in.
+///
+/// Two tabs write this one file: the Overview, through the Name and Description
+/// fields, and the `SKILL.md` tab, through the editor. Saving either saves the
+/// file, so [`Self::any`] is what the Save button and every "you have unsaved
+/// work" question read.
+///
+/// The dot on a tab is a different question. It says "the work you have not
+/// saved is in here", and a file the user has never opened is not where it is:
+/// typing in the Name field used to put a dot on the `SKILL.md` tab as well,
+/// which told the reader they had edited a file they had not looked at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SkillFileEdits {
+    /// The Overview's Name and Description fields.
+    fields: bool,
+    /// The `SKILL.md` editor.
+    body: bool,
+}
+
+impl SkillFileEdits {
+    /// Whether `SKILL.md` has edits that have not been written, wherever they
+    /// were made.
+    fn any(self) -> bool {
+        self.fields || self.body
+    }
+
+    /// Whether `showing` wears the unsaved-edits dot.
+    ///
+    /// Only the two tabs that write `SKILL.md` are answered here. Every other
+    /// file tracks its own edits in its own [`OpenFile`].
+    fn dot(self, showing: &Showing) -> bool {
+        match showing {
+            Showing::Overview => self.fields,
+            Showing::File(rel) if rel == SKILL_FILE_NAME => self.body,
+            Showing::File(_) => false,
+        }
+    }
 }
 
 /// A bundled file open in a tab, with its own editor.
@@ -240,6 +287,10 @@ pub struct DetailPane {
     /// Whether the "Visible to" section is open. Closed on every selection,
     /// because the pane's usual job is the editor below it.
     visibility_open: bool,
+    /// Whether the "Files" listing is open. Decided for each skill as its
+    /// directory is read — see [`files_open_by_default`] — and the user's
+    /// answer after that.
+    files_open: bool,
     /// Bumped on every comparison, so one that lands after the selection moved
     /// on is dropped.
     duplicates_generation: u64,
@@ -252,10 +303,6 @@ pub struct DetailPane {
     /// covers every skill at once and lands long after any one selection, so
     /// it is handed over rather than read across.
     updates: Option<Rc<UpdateReport>>,
-    /// Set while the update dialog's checkbox is ticked. Reset every time the
-    /// dialog opens, so an acknowledgement never carries over to another
-    /// skill or another day.
-    update_acknowledged: bool,
     /// What the discard confirmation should do once it is answered. Held here
     /// rather than captured by the dialog, because the dialog's builder runs on
     /// every frame and a continuation can only run once.
@@ -270,7 +317,8 @@ pub struct DetailPane {
     name_taken: Option<SharedString>,
     description: Entity<TextareaState>,
     body: Entity<EditorState>,
-    dirty: bool,
+    /// The unsaved edits to `SKILL.md`, and which tab they were made in.
+    edits: SkillFileEdits,
     /// True while a write is in flight, so a second click cannot start one.
     busy: bool,
     /// Bumped on every load, so a read that lands after the selection moved on
@@ -295,10 +343,10 @@ impl DetailPane {
                 this.mark_name_edited(event, cx)
             }),
             cx.subscribe(&description, |this, _, event: &InputEvent, cx| {
-                this.mark_edited(event, cx)
+                this.mark_fields_edited(event, cx)
             }),
             cx.subscribe(&body, |this, _, event: &InputEvent, cx| {
-                this.mark_edited(event, cx)
+                this.mark_body_edited(event, cx)
             }),
         ];
 
@@ -319,14 +367,14 @@ impl DetailPane {
             remote: Remote::None,
             remote_generation: 0,
             updates: None,
-            update_acknowledged: false,
             visibility_open: false,
+            files_open: true,
             pending: None,
             name,
             name_taken: None,
             description,
             body,
-            dirty: false,
+            edits: SkillFileEdits::default(),
             busy: false,
             generation: 0,
             _subscriptions: subscriptions,
@@ -380,7 +428,7 @@ impl DetailPane {
         // Re-reading the file under an unsaved edit would throw the edit away.
         // A mutation that only moved links leaves the bytes alone, so keep what
         // the editor holds and just refresh the metadata around it.
-        if same_file && (self.dirty || matches!(self.source, Source::Loaded)) {
+        if same_file && (self.edits.any() || matches!(self.source, Source::Loaded)) {
             cx.notify();
             return;
         }
@@ -395,11 +443,11 @@ impl DetailPane {
     fn load_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
-        self.dirty = false;
+        self.edits = SkillFileEdits::default();
 
         let Some(skill) = self.skill.clone() else {
             self.source = Source::Empty;
-            self.tree.clear();
+            self.set_tree(Vec::new());
             self.set_fields("", "", "", window, cx);
             cx.notify();
             return;
@@ -422,11 +470,11 @@ impl DetailPane {
                 }
                 match loaded.0 {
                     Ok(text) => {
-                        this.tree = loaded.1;
+                        this.set_tree(loaded.1);
                         this.adopt_source(&text, window, cx);
                     }
                     Err(error) => {
-                        this.tree.clear();
+                        this.set_tree(Vec::new());
                         this.source = Source::Failed(error.to_string().into());
                         this.set_fields("", "", "", window, cx);
                         cx.notify();
@@ -436,6 +484,15 @@ impl DetailPane {
             .ok();
         })
         .detach();
+    }
+
+    /// Take the listing of a skill directory, and decide whether it opens.
+    ///
+    /// The two go together: the listing is the only thing that knows how long
+    /// it is, and its length is the whole of the decision.
+    fn set_tree(&mut self, tree: Vec<FileNode>) {
+        self.files_open = files_open_by_default(tree.len());
+        self.tree = tree;
     }
 
     /// Compare the selected skill's duplicate directories against its origin.
@@ -646,7 +703,7 @@ impl DetailPane {
         self.loaded_name = name.clone().into();
         self.loaded_description = description.clone().into();
         self.source = Source::Loaded;
-        self.dirty = false;
+        self.edits = SkillFileEdits::default();
         self.set_fields(&name, &description, text, window, cx);
         cx.notify();
     }
@@ -675,14 +732,26 @@ impl DetailPane {
         self.refresh_name_taken(cx);
     }
 
-    fn mark_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
-        if matches!(event, InputEvent::Change) && !self.dirty {
-            self.dirty = true;
+    /// The Description field was typed in: the Overview holds unsaved work.
+    fn mark_fields_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
+        if matches!(event, InputEvent::Change) && !self.edits.fields {
+            self.edits.fields = true;
             cx.notify();
         }
     }
 
-    /// [`Self::mark_edited`] for the Name field, which redraws on every
+    /// The `SKILL.md` editor was typed in.
+    ///
+    /// Recorded apart from the fields above, though both write the same file,
+    /// so that the dot lands on the tab the work is in.
+    fn mark_body_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
+        if matches!(event, InputEvent::Change) && !self.edits.body {
+            self.edits.body = true;
+            cx.notify();
+        }
+    }
+
+    /// [`Self::mark_fields_edited`] for the Name field, which redraws on every
     /// keystroke rather than only the first.
     ///
     /// What the field says about itself — the reason a name is refused, and
@@ -692,7 +761,7 @@ impl DetailPane {
     /// instead, once per keystroke rather than once per frame.
     fn mark_name_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
         if matches!(event, InputEvent::Change) {
-            self.dirty = true;
+            self.edits.fields = true;
             self.refresh_name_taken(cx);
             cx.notify();
         }
@@ -1493,7 +1562,6 @@ impl DetailPane {
             } else {
                 format!("Removes {}:", in_a_list(&kinds))
             };
-
             let description = v_flex()
                 .gap_3()
                 .text_sm()
@@ -1750,6 +1818,14 @@ impl DetailPane {
     /// difference is, do nothing by default, and take one explicit tick to go
     /// ahead. An edited skill needs that tick; a skill Skillbase simply has no
     /// record of needs the sentence but not the ceremony.
+    ///
+    /// The tick is held in a cell the dialog owns rather than on the pane. The
+    /// builder runs while this method's caller still has the pane open for
+    /// writing, so anything the builder reads out of the pane is a read of an
+    /// entity that is mid-update — the panic that killed the New skill dialog.
+    /// A cell is not read through the entity at all, and it is a fresh one on
+    /// every open, so an acknowledgement still cannot carry over to another
+    /// skill or another day.
     fn confirm_update(
         &mut self,
         skill: &SkillView,
@@ -1757,7 +1833,10 @@ impl DetailPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.update_acknowledged = false;
+        // One cell per dialog, so it starts unticked and nothing else can see
+        // it. Shared with the checkbox that writes it and the footer that reads
+        // it, both of which live for as long as the dialog does.
+        let acknowledged = Rc::new(Cell::new(false));
 
         let name = skill.name.clone();
         let dir = display_path(&skill.origin, &self.roots);
@@ -1776,9 +1855,9 @@ impl DetailPane {
         let this = cx.entity().downgrade();
 
         // The builder runs on every frame the dialog is up, so the confirm
-        // button's disabled state is read from the view each time rather than
+        // button's disabled state is read from the cell each time rather than
         // captured once when the dialog opened.
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, _, _| {
             // Says what happens to the directory and where it goes.
             // `replace_existing` in `skillbase-core` routes through
             // `Installer::remove_real_dir`, which moves the old directory into
@@ -1800,17 +1879,18 @@ impl DetailPane {
             };
             let this = this.clone();
             let upstream = upstream.clone();
+            let acknowledged = acknowledged.clone();
 
             dialog
                 .title(format!("Update {name}?"))
                 .width(px(480.))
                 .content({
                     let this = this.clone();
-                    move |content, _, cx| {
-                        let acknowledged = this
-                            .read_with(cx, |this, _| this.update_acknowledged)
-                            .unwrap_or(false);
+                    let acknowledged = acknowledged.clone();
+                    move |content, _, _| {
+                        let ticked = acknowledged.get();
                         let this = this.clone();
+                        let acknowledged = acknowledged.clone();
                         content.child(
                             v_flex()
                                 .p_4()
@@ -1826,18 +1906,19 @@ impl DetailPane {
                                 .when(edited, |content| {
                                     content.child(
                                         Checkbox::new("acknowledge-update")
-                                            .checked(acknowledged)
+                                            .checked(ticked)
                                             // Not "discarding those edits":
                                             // they go to the trash, and the
                                             // sentence above says where.
                                             .label("Replace anyway")
                                             .on_click(move |checked: &bool, _, cx| {
-                                                let checked = *checked;
-                                                this.update(cx, |this, cx| {
-                                                    this.update_acknowledged = checked;
-                                                    cx.notify();
-                                                })
-                                                .ok();
+                                                acknowledged.set(*checked);
+                                                // Nothing on the pane changed,
+                                                // but the dialog is redrawn
+                                                // with the pane, and the tick
+                                                // and the Replace button have
+                                                // to follow the click.
+                                                this.update(cx, |_, cx| cx.notify()).ok();
                                             }),
                                     )
                                 }),
@@ -1846,10 +1927,7 @@ impl DetailPane {
                 })
                 .footer({
                     let this = this.clone();
-                    let blocked = edited
-                        && !this
-                            .read_with(cx, |this, _| this.update_acknowledged)
-                            .unwrap_or(false);
+                    let blocked = edited && !acknowledged.get();
                     DialogFooter::new()
                         .p_4()
                         .child(
@@ -2535,6 +2613,21 @@ impl DetailPane {
             Some(LocationKind::Symlink { .. }) => format!("Linked at {dir}"),
             _ => format!("Links {dir}"),
         };
+        // What turning this switch off does. The row can carry two switches a
+        // word apart, and the words alone never said which was which: Linked is
+        // whether the agent has the skill at all, Enabled is whether it reads
+        // the copy it has. Each switch now says its own half on hover.
+        let unlink = if via_shared {
+            format!(
+                "On because {} reads the shared directory; the Shared switch above is what turns \
+                 it off.",
+                agent.display_name
+            )
+        } else if matches!(kind, Some(LocationKind::Origin)) {
+            format!("The skill itself lives at {dir}, so there is no link here to remove.")
+        } else {
+            format!("Off removes the link at {dir} and leaves the skill in the store.")
+        };
 
         let switchable = has_disable_state(agent) && (present || via_shared);
         // Codex's off state is a line in its own config file, so writing it
@@ -2618,6 +2711,7 @@ impl DetailPane {
                                 // below the row says where the control is.
                                 .disabled(!managed || self.busy || via_shared)
                                 .label("Linked")
+                                .tooltip(unlink)
                                 .accessibility_label(if via_shared {
                                     format!(
                                         "{} reached through Shared, not linked separately",
@@ -3183,36 +3277,85 @@ impl DetailPane {
     /// The skill directory, as rows the user can click to open a file.
     ///
     /// This replaces the row of tags that named the bundled files without
-    /// letting the user do anything with them. A directory is a heading rather
-    /// than a control: there is nothing to open, and a disclosure triangle over
-    /// a listing this short would hide files behind a click for no gain.
+    /// letting the user do anything with them.
+    ///
+    /// A disclosure, in the same shape as "Visible to" above it, because the
+    /// listing is not always short: `docx` is thirty rows, which is a screen
+    /// and a half of the Overview for a question — what is in the directory —
+    /// that most readers are not asking. A long listing therefore arrives
+    /// closed, a short one open ([`files_open_by_default`]), and the heading
+    /// carries the count either way so a closed one still says how much is
+    /// there.
+    ///
+    /// Collapsing rather than scrolling in a pane of its own: the tab around it
+    /// is already a scroll container, and a second one nested inside means the
+    /// wheel moves whichever of the two the pointer happens to be over, which
+    /// is not something the user can predict.
     fn folder_structure(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.files_open;
+        let summary = files_summary(&self.tree);
+
         v_flex()
             .flex_shrink_0()
             .gap_2()
-            .child(section_title("Files", cx))
-            .child(if self.tree.is_empty() {
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("The skill directory could not be read.")
-                    .into_any_element()
-            } else {
-                v_flex()
-                    // No height cap and no scrolling of its own. The tab around
-                    // it is already a scroll container, and a second one nested
-                    // inside means the wheel moves whichever of the two the
-                    // pointer happens to be over, which is not something the
-                    // user can predict.
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    // The rows are square. Without this the top and bottom
-                    // row's hover and selected fills paint over the card's
-                    // corner curve.
-                    .overflow_hidden()
-                    .bg(cx.theme().group_box)
-                    .children(self.tree.clone().iter().map(|node| self.file_row(node, cx)))
-                    .into_any_element()
+            // A Button rather than a hand-rolled row, for the reasons the
+            // "Visible to" header gives: only a Button here carries a focus
+            // handle, so only a Button answers Enter and Space.
+            .child(
+                Button::new("files-header")
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .accessibility_label("Files")
+                    // The chevron is the only thing that says open or closed,
+                    // and a listener cannot see it.
+                    .toggled(open)
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall()
+                        .flex_shrink_0()
+                        .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(section_title("Files", cx))
+                    .child(div().flex_1().min_w_0())
+                    .when_some(summary, |this, summary| {
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .text_xs()
+                                .truncate()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(summary),
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.files_open = !this.files_open;
+                        cx.notify();
+                    })),
+            )
+            .when(open, |this| {
+                this.child(if self.tree.is_empty() {
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("The skill directory could not be read.")
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .py_1()
+                        .rounded(cx.theme().radius)
+                        // The rows are square. Without this the top and bottom
+                        // row's hover and selected fills paint over the card's
+                        // corner curve.
+                        .overflow_hidden()
+                        .bg(cx.theme().group_box)
+                        .children(self.tree.clone().iter().map(|node| self.file_row(node, cx)))
+                        .into_any_element()
+                })
             })
     }
 
@@ -3316,12 +3459,17 @@ impl DetailPane {
     ///
     /// Read from outside the pane: every way out of an edit — another skill,
     /// another scope, Cmd-W, Cmd-Q — asks this before it takes the work away.
+    ///
+    /// Not the same question as which tab wears a dot. Both tabs that write
+    /// `SKILL.md` answer for the whole file here, whichever of them the edit
+    /// was made in: Save has to stay live, and switching away has to still ask,
+    /// for work typed into the Overview and read from the `SKILL.md` tab.
     pub(crate) fn showing_dirty(&self) -> bool {
         match &self.showing {
             // The Overview edits `SKILL.md`'s frontmatter, so it saves what the
             // `SKILL.md` tab saves and is dirty when it is.
-            Showing::Overview => self.dirty,
-            Showing::File(rel) if rel == SKILL_FILE_NAME => self.dirty,
+            Showing::Overview => self.edits.any(),
+            Showing::File(rel) if rel == SKILL_FILE_NAME => self.edits.any(),
             Showing::File(rel) => self
                 .open
                 .iter()
@@ -3708,12 +3856,21 @@ impl DetailPane {
     /// under it — which would fight the drag band the strip now sits inside
     /// instead of reading as part of it.
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The dot marks where the unsaved work was done, not every tab that
+        // would write it: a user who has only renamed the skill has not opened
+        // `SKILL.md`, and a dot on it would say they had.
+        let skill_file = Showing::File(SKILL_FILE_NAME.into());
         let mut labels: Vec<(Showing, SharedString, bool, bool)> = vec![
-            (Showing::Overview, "Overview".into(), self.dirty, false),
             (
-                Showing::File(SKILL_FILE_NAME.into()),
+                Showing::Overview,
+                "Overview".into(),
+                self.edits.dot(&Showing::Overview),
+                false,
+            ),
+            (
+                skill_file.clone(),
                 SKILL_FILE_NAME.into(),
-                self.dirty,
+                self.edits.dot(&skill_file),
                 false,
             ),
         ];
@@ -4127,6 +4284,40 @@ fn section_title(label: &'static str, cx: &mut Context<DetailPane>) -> impl Into
         .child(label)
 }
 
+/// Whether a listing of `rows` rows opens with the skill.
+///
+/// A skill with three files is answered by its listing, so it is shown. A skill
+/// with thirty is not: the listing is then the whole of the Overview, and the
+/// sections under it — Location, Visible to, Source — are off the screen. The
+/// heading says how many there are, so nothing is hidden without being counted.
+fn files_open_by_default(rows: usize) -> bool {
+    rows <= MAX_ROWS_OPEN
+}
+
+/// What the Files heading says beside itself, so a closed listing still reports
+/// the size of the directory.
+///
+/// Folders are counted separately from files: they are rows of the listing but
+/// not things to open, and "30 files" for a directory holding 24 would be
+/// wrong. Nothing at all for a directory that could not be read — the line
+/// under the heading says that instead.
+fn files_summary(tree: &[FileNode]) -> Option<String> {
+    if tree.is_empty() {
+        return None;
+    }
+    let dirs = tree.iter().filter(|node| node.is_dir).count();
+    let files = tree.len() - dirs;
+    let files = match files {
+        1 => "1 file".to_string(),
+        n => format!("{n} files"),
+    };
+    Some(match dirs {
+        0 => files,
+        1 => format!("{files} in 1 folder"),
+        n => format!("{files} in {n} folders"),
+    })
+}
+
 /// The top-level entries beside `SKILL.md`, directories marked with a slash.
 /// List a skill directory depth-first, `SKILL.md` first and the rest sorted
 /// with directories before files.
@@ -4478,12 +4669,18 @@ impl DetailPane {
                 )
             })
             .child(self.fields(skill, cx))
-            .child(self.folder_structure(cx))
             // Location before Visibility: the switches below are read-only
             // until an unmanaged skill is adopted, and Adopt lives in
             // Location. Ownership answered first, then what it allows.
             .child(self.location(skill, cx))
             .child(self.visibility(skill, cx))
+            // The listing comes after both, because it is the one section
+            // whose height is the skill's rather than the pane's: thirty rows
+            // for `docx`, one for a skill that is a single file. Above them it
+            // decided how far down "Visible to" — the answer to "can my agent
+            // use this yet" — began. Below them the answer is always in the
+            // same place, and the listing can be as long as the directory is.
+            .child(self.folder_structure(cx))
             .child(self.duplicates_section(cx))
             .child(self.source_section(skill, cx))
             .into_any_element()
@@ -4608,7 +4805,9 @@ mod tests {
 
     use super::super::model::{Scan, SkillView};
     use super::{
-        absent_sentence, destination_taken, fs, in_a_list, name_rules, rename_problem, upstream_for,
+        FileNode, MAX_ROWS_OPEN, SKILL_FILE_NAME, Showing, SkillFileEdits, absent_sentence,
+        destination_taken, files_open_by_default, files_summary, fs, in_a_list, name_rules,
+        rename_problem, upstream_for,
     };
 
     /// A directory of this test's own, named so two runs cannot collide.
@@ -4764,6 +4963,107 @@ mod tests {
             absent_sentence(&["Cursor", "Gemini CLI", "Amp"]),
             "These agents are not installed on this machine, so they have no rows here: Cursor, \
              Gemini CLI, Amp."
+        );
+    }
+
+    /// Both tabs write `SKILL.md`, so both have to offer Save and both have to
+    /// ask before the work is taken away — but the dot says where the work is,
+    /// and a file the user has not opened is not where it is.
+    #[test]
+    fn only_the_tab_the_edit_was_made_in_wears_the_dot() {
+        let overview = Showing::Overview;
+        let file = Showing::File(SKILL_FILE_NAME.into());
+
+        let nothing = SkillFileEdits::default();
+        assert!(!nothing.any());
+        assert!(!nothing.dot(&overview));
+        assert!(!nothing.dot(&file));
+
+        // Renaming the skill in the Name field. `SKILL.md` is what a save
+        // writes, so the file is dirty; the user has not opened it, so its tab
+        // is not marked.
+        let renamed = SkillFileEdits {
+            fields: true,
+            body: false,
+        };
+        assert!(renamed.any(), "the file still has to be saveable");
+        assert!(renamed.dot(&overview));
+        assert!(!renamed.dot(&file));
+
+        // Typing in the editor. The Overview shows the same file's frontmatter
+        // but the user did not type there.
+        let edited = SkillFileEdits {
+            fields: false,
+            body: true,
+        };
+        assert!(edited.any());
+        assert!(!edited.dot(&overview));
+        assert!(edited.dot(&file));
+
+        // Both, which is one save and two places with work in them.
+        let both = SkillFileEdits {
+            fields: true,
+            body: true,
+        };
+        assert!(both.dot(&overview));
+        assert!(both.dot(&file));
+
+        // A bundled file keeps its own dirty flag; this rule has nothing to say
+        // about it.
+        assert!(!both.dot(&Showing::File("references/api.md".into())));
+    }
+
+    #[test]
+    fn a_long_listing_arrives_closed_and_a_short_one_open() {
+        assert!(files_open_by_default(0));
+        assert!(files_open_by_default(1));
+        assert!(files_open_by_default(MAX_ROWS_OPEN));
+        // `docx` is thirty rows. Open, it puts Location, Visible to and Source
+        // a screen and a half down the Overview.
+        assert!(!files_open_by_default(MAX_ROWS_OPEN + 1));
+        assert!(!files_open_by_default(30));
+    }
+
+    #[test]
+    fn the_files_heading_counts_files_apart_from_folders() {
+        fn node(rel: &str, is_dir: bool) -> FileNode {
+            FileNode {
+                rel: rel.into(),
+                label: rel.into(),
+                depth: 0,
+                is_dir,
+                editable: !is_dir,
+            }
+        }
+
+        // A directory that could not be read says so under the heading, so the
+        // heading itself has nothing to add.
+        assert_eq!(files_summary(&[]), None);
+        assert_eq!(
+            files_summary(&[node(SKILL_FILE_NAME, false)]),
+            Some("1 file".to_string())
+        );
+        assert_eq!(
+            files_summary(&[node(SKILL_FILE_NAME, false), node("notes.md", false)]),
+            Some("2 files".to_string())
+        );
+        // The folders are rows of the listing but not things to open, so they
+        // are counted apart from the files rather than added to them.
+        assert_eq!(
+            files_summary(&[
+                node(SKILL_FILE_NAME, false),
+                node("references", true),
+                node("references/api.md", false),
+            ]),
+            Some("2 files in 1 folder".to_string())
+        );
+        assert_eq!(
+            files_summary(&[
+                node(SKILL_FILE_NAME, false),
+                node("references", true),
+                node("scripts", true),
+            ]),
+            Some("1 file in 2 folders".to_string())
         );
     }
 
