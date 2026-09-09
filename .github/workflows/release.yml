@@ -7,19 +7,27 @@
 # somebody edited Cargo.toml to 0.2.0 in the pull request that earned it.
 # Nothing here ever raises the major number on its own.
 #
-# Run it by hand on a branch, with `Dry run` left ticked, to build all four
-# artifacts and download them without tagging or publishing anything.
+# Only a push to main publishes. A pull request that touches the release
+# machinery, and a run started by hand, build all four artifacts and attach
+# them to the run without tagging anything — which is how a change to any of
+# this gets tested before it is trusted.
 name: Release
 
 on:
   push:
     branches: [main]
+  # Narrowed to the files that decide what a release contains, because
+  # building four release binaries is not something every pull request needs.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/actions/**
+      - script/bundle-linux.sh
+      - script/bundle-macos.sh
+      - script/dmg-macos.sh
+      - script/next-version.sh
+      - script/set-version.sh
   workflow_dispatch:
-    inputs:
-      dry-run:
-        description: Build the artifacts but do not tag or publish
-        type: boolean
-        default: true
 
 # One release at a time, and never cancel one half-way: a cancelled run can
 # leave a tag with no release attached to it.
@@ -55,30 +63,45 @@ jobs:
           version="$(script/next-version.sh)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+          # Anything that is not a merge into main builds and stops there.
+          # Re-running a failed release run keeps the event it started from, so
+          # nothing is lost by leaving the hand-run path unable to publish.
           if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "v$version is already tagged. Nothing to release." \
-              >> "$GITHUB_STEP_SUMMARY"
-          elif [ "${{ inputs.dry-run }}" = "true" ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Dry run: building v$version without publishing it." \
-              >> "$GITHUB_STEP_SUMMARY"
+            publish=false
+            note="v$version is already tagged. Nothing to release."
+          elif [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            publish=false
+            note="Building v$version without publishing it: this is a ${GITHUB_EVENT_NAME//_/ }."
           else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "Releasing v$version." >> "$GITHUB_STEP_SUMMARY"
+            publish=true
+            note="Releasing v$version."
           fi
+
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "$note" >> "$GITHUB_STEP_SUMMARY"
 
   # The same checks a pull request gets. They ran on the branch already, but a
   # merge produces a commit that has not been tested as such, and a release is
   # the wrong place to find that out.
+  #
+  # Not on a pull request: ci.yml is already running on it under its own
+  # trigger, and the suite is slow enough that running it twice would be felt.
   checks:
     name: Checks
     needs: version
+    if: github.event_name == 'push'
     uses: ./.github/workflows/ci.yml
 
   build:
     name: ${{ matrix.name }}
     needs: [version, checks]
+    # A skipped `needs` skips the job that waits on it, unless the condition
+    # says otherwise — which is what `!cancelled()` is doing here, not
+    # ignoring a failure. `checks` is skipped on everything but a push.
+    if: >-
+      !cancelled()
+      && needs.version.result == 'success'
+      && needs.checks.result != 'failure'
     runs-on: ${{ matrix.runner }}
     strategy:
       # One target failing should not hide what the other three did. The
