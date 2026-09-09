@@ -1287,11 +1287,13 @@ fn replace_existing(installer: &Installer, dest: &Path) -> Result<Outcome, Insta
         source: e,
     })?;
     if meta.file_type().is_symlink() {
+        // Read before removing, so a restore can write the link again.
+        let target = fs::read_link(&dest).ok();
         fs::remove_file(&dest).map_err(|e| InstallError::Io {
             path: dest.clone(),
             source: e,
         })?;
-        return Ok(Outcome::one(Change::RemovedSymlink { path: dest }));
+        return Ok(Outcome::one(Change::RemovedSymlink { path: dest, target }));
     }
     installer.remove_real_dir(&dest)
 }

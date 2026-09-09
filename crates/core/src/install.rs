@@ -395,6 +395,9 @@ pub enum Change {
     RemovedSymlink {
         /// Where the link was.
         path: PathBuf,
+        /// What it pointed at, as written, so the link can be written again.
+        /// `None` when it could not be read.
+        target: Option<PathBuf>,
     },
     /// A directory was copied.
     Copied {
@@ -468,7 +471,9 @@ impl Change {
             Self::CreatedSymlink { path, target } => {
                 write!(f, "linked {} -> {}", p(path), target.display())
             }
-            Self::RemovedSymlink { path } => write!(f, "removed the link {}", p(path)),
+            // The target is recorded so a restore can write the link again. It
+            // is not worth a line in a notification, so it stays out of here.
+            Self::RemovedSymlink { path, .. } => write!(f, "removed the link {}", p(path)),
             Self::Copied { from, to } => write!(f, "copied {} to {}", p(from), p(to)),
             Self::MovedToTrash { from, to } => {
                 write!(f, "moved {} to the trash at {}", p(from), p(to))
@@ -559,6 +564,107 @@ impl Outcome {
 
     /// How many changes a description names before it starts counting.
     const MAX_DESCRIBED: usize = 6;
+}
+
+/// What a restore put back, and what it could not.
+///
+/// A restore is offered from a notification, seconds after the delete, and the
+/// user has already stopped watching. So it never fails outright: it puts back
+/// everything it can and names the rest. A half-restore that says nothing is
+/// the failure this type exists to prevent.
+#[derive(Debug, Default, Clone)]
+pub struct Restored {
+    /// What went back on the disk.
+    pub outcome: Outcome,
+    /// What could not go back, and why.
+    pub missed: Vec<Missed>,
+}
+
+impl Restored {
+    /// True when nothing went back.
+    pub fn is_noop(&self) -> bool {
+        self.outcome.is_noop()
+    }
+
+    /// How many directories were moved back out of the trash.
+    pub fn directories(&self) -> usize {
+        self.outcome
+            .changes
+            .iter()
+            .filter(|change| matches!(change, Change::Moved { .. }))
+            .count()
+    }
+
+    /// How many links were written again.
+    pub fn links(&self) -> usize {
+        self.outcome
+            .changes
+            .iter()
+            .filter(|change| matches!(change, Change::CreatedSymlink { .. }))
+            .count()
+    }
+
+    /// One line per change and per miss, with `home` written as `~`.
+    pub fn describe_under(&self, home: &Path) -> String {
+        let mut lines = Vec::new();
+        if !self.outcome.changes.is_empty() {
+            lines.push(self.outcome.describe_under(home));
+        }
+        lines.extend(self.missed.iter().map(|miss| miss.describe_under(home)));
+        lines.join("\n")
+    }
+
+    /// Records one thing that could not go back.
+    fn miss(&mut self, path: PathBuf, reason: MissReason) {
+        self.missed.push(Missed { path, reason });
+    }
+}
+
+/// One thing a restore could not put back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Missed {
+    /// Where it was meant to go.
+    pub path: PathBuf,
+    /// Why it did not.
+    pub reason: MissReason,
+}
+
+/// Why a restore left something out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MissReason {
+    /// Something else is at that path now.
+    Occupied,
+    /// What the delete took is no longer where it left it.
+    Gone,
+    /// Skillbase did not record what the link pointed at.
+    TargetUnknown,
+    /// The path is outside every directory Skillbase may write to.
+    OutsideScope,
+    /// The filesystem refused. Carries the message.
+    Failed(String),
+}
+
+impl Missed {
+    /// The miss as one sentence, with `home` written as `~`.
+    pub fn describe_under(&self, home: &Path) -> String {
+        let path = abbreviate(&self.path, home);
+        match &self.reason {
+            MissReason::Occupied => {
+                format!("could not put back {path}: something else is there now")
+            }
+            MissReason::Gone => {
+                format!("could not put back {path}: what the delete took is no longer in the trash")
+            }
+            MissReason::TargetUnknown => format!(
+                "could not put back the link {path}: Skillbase did not record what it pointed at"
+            ),
+            MissReason::OutsideScope => format!(
+                "could not put back {path}: it is outside the directories Skillbase may write to"
+            ),
+            MissReason::Failed(message) => format!("could not put back {path}: {message}"),
+        }
+    }
 }
 
 /// What a delete would remove, counted before anything is removed.
@@ -1127,8 +1233,14 @@ impl Installer {
         let mut outcome = Outcome::default();
         match fs::symlink_metadata(&dest) {
             Ok(meta) if meta.file_type().is_symlink() => {
+                // Read before removing: afterwards there is nothing left to
+                // read, and a restore needs the target to write the link again.
+                let target = fs::read_link(&dest).ok();
                 fs::remove_file(&dest).map_err(|e| InstallError::io(&dest, e))?;
-                outcome.push(Change::RemovedSymlink { path: dest.clone() });
+                outcome.push(Change::RemovedSymlink {
+                    path: dest.clone(),
+                    target,
+                });
             }
             Ok(meta) => {
                 return Err(InstallError::NotALink {
@@ -1291,8 +1403,11 @@ impl Installer {
                         kind: if meta.is_dir() { "directory" } else { "file" },
                     });
                 }
+                // Read before removing, so a restore can put the link back
+                // pointing where it pointed.
+                let target = fs::read_link(&path).ok();
                 fs::remove_file(&path).map_err(|e| InstallError::io(&path, e))?;
-                outcome.push(Change::RemovedSymlink { path });
+                outcome.push(Change::RemovedSymlink { path, target });
             }
         }
         for path in plan.copies.iter().chain(plan.origin.iter()) {
@@ -1300,6 +1415,126 @@ impl Installer {
             outcome.changes.extend(self.remove_real_dir(&path)?.changes);
         }
         Ok(())
+    }
+
+    /// Put back what a delete took away.
+    ///
+    /// Pass the changes an [`Installer::delete`] reported.
+    ///
+    /// The changes are walked in reverse, because a delete removes the links
+    /// first and moves the directories after. Going back the other way round
+    /// means every directory is out of the trash before a link is written at
+    /// it, so no link ever points at nothing.
+    ///
+    /// Never returns an error. A restore is offered from a notification the
+    /// user is about to dismiss, so it does as much as it can and reports the
+    /// rest in [`Restored::missed`] rather than stopping at the first refusal
+    /// and leaving the skill in a third state.
+    ///
+    /// Only [`Change::MovedToTrash`] and [`Change::RemovedSymlink`] mean
+    /// anything here: a restore reverses a delete, and every other change came
+    /// from some other operation. Both ends of every write go through
+    /// [`Installer::ensure_in_scope`], because the changes are a plain value a
+    /// caller can build by hand and a restore must not write anywhere a delete
+    /// could not have written.
+    pub fn restore(&self, changes: &[Change]) -> Restored {
+        let mut restored = Restored::default();
+        for change in changes.iter().rev() {
+            match change {
+                Change::MovedToTrash { from, to } => {
+                    self.restore_directory(from, to, &mut restored);
+                }
+                Change::RemovedSymlink { path, target } => {
+                    self.restore_link(path, target.as_deref(), &mut restored);
+                }
+                _ => {}
+            }
+        }
+        restored
+    }
+
+    /// Moves one directory back out of the trash to where it was.
+    ///
+    /// `from` is where it lived, `to` where the delete put it: the same two
+    /// paths [`Change::MovedToTrash`] carries, used the other way round.
+    fn restore_directory(&self, from: &Path, to: &Path, restored: &mut Restored) {
+        let (Ok(from), Ok(to)) = (self.ensure_in_scope(from), self.ensure_in_scope(to)) else {
+            restored.miss(from.to_path_buf(), MissReason::OutsideScope);
+            return;
+        };
+        // Never clobber. Something at the old path is a skill the user has put
+        // there since, and a restore that silently replaced it would be the
+        // same loss the restore exists to undo.
+        if fs::symlink_metadata(&from).is_ok() {
+            restored.miss(from, MissReason::Occupied);
+            return;
+        }
+        // The user emptied the trash, or moved the directory out of it by hand.
+        if fs::symlink_metadata(&to).is_err() {
+            restored.miss(from, MissReason::Gone);
+            return;
+        }
+        if let Some(parent) = from.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            restored.miss(from, MissReason::Failed(e.to_string()));
+            return;
+        }
+
+        if let Err(rename_error) = fs::rename(&to, &from) {
+            if !crosses_filesystems(&rename_error) {
+                restored.miss(from, MissReason::Failed(rename_error.to_string()));
+                return;
+            }
+            // The trash and the directory the skill came from can sit on
+            // different volumes, which is the one case `move_to_trash` copies
+            // its way past on the way in.
+            if let Err(e) = copy_dir(&to, &from) {
+                restored.miss(from, MissReason::Failed(e.to_string()));
+                return;
+            }
+            // The skill is back either way. A copy left behind in the trash is
+            // not a miss: nothing reads the trash, and saying the restore
+            // failed when the files are where the user asked for them would be
+            // worse than saying nothing.
+            let _ = fs::remove_dir_all(&to);
+        }
+        restored.outcome.push(Change::Moved { from: to, to: from });
+    }
+
+    /// Writes one removed link again, exactly as it was written.
+    ///
+    /// The recorded target is used verbatim rather than computed afresh: a
+    /// link the user wrote by hand may be absolute, or relative through a path
+    /// this crate would not have chosen, and a restore that changed it would
+    /// not be a restore.
+    fn restore_link(&self, path: &Path, target: Option<&Path>, restored: &mut Restored) {
+        let Ok(path) = self.ensure_in_scope(path) else {
+            restored.miss(path.to_path_buf(), MissReason::OutsideScope);
+            return;
+        };
+        let Some(target) = target else {
+            restored.miss(path, MissReason::TargetUnknown);
+            return;
+        };
+        if fs::symlink_metadata(&path).is_ok() {
+            restored.miss(path, MissReason::Occupied);
+            return;
+        }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            restored.miss(path, MissReason::Failed(e.to_string()));
+            return;
+        }
+        if let Err(e) = symlink(target, &path) {
+            restored.miss(path, MissReason::Failed(e.to_string()));
+            return;
+        }
+        restored.outcome.push(Change::CreatedSymlink {
+            path,
+            target: target.to_path_buf(),
+        });
     }
 
     /// Works out what consolidating this skill would replace, without
@@ -1674,9 +1909,11 @@ impl Installer {
     fn clear_for_import(&self, dest: &Path) -> Result<Outcome, InstallError> {
         let meta = fs::symlink_metadata(dest).map_err(|e| InstallError::io(dest, e))?;
         if meta.file_type().is_symlink() {
+            let target = fs::read_link(dest).ok();
             fs::remove_file(dest).map_err(|e| InstallError::io(dest, e))?;
             return Ok(Outcome::one(Change::RemovedSymlink {
                 path: dest.to_path_buf(),
+                target,
             }));
         }
         self.remove_real_dir(dest)
@@ -1926,9 +2163,11 @@ impl Installer {
             }
         };
         if meta.file_type().is_symlink() {
+            let target = fs::read_link(dest).ok();
             fs::remove_file(dest).map_err(|e| InstallError::io(dest, e))?;
             return Ok(Outcome::one(Change::RemovedSymlink {
                 path: dest.to_path_buf(),
+                target,
             }));
         }
         if meta.is_dir() && mode == LinkMode::Copy {
@@ -2033,9 +2272,15 @@ impl Installer {
 
         if meta.file_type().is_symlink() {
             let target = fs::canonicalize(&from).map_err(|e| InstallError::io(&from, e))?;
+            // What the old link said, as written, rather than the resolved
+            // target above: a restore rewrites the link exactly as it was.
+            let written = fs::read_link(&from).ok();
             let mut outcome = self.place_symlink(&to, &target)?;
             fs::remove_file(&from).map_err(|e| InstallError::io(&from, e))?;
-            outcome.push(Change::RemovedSymlink { path: from });
+            outcome.push(Change::RemovedSymlink {
+                path: from,
+                target: written,
+            });
             return Ok(outcome);
         }
 
@@ -2682,7 +2927,8 @@ mod tests {
         assert_eq!(
             outcome.changes,
             [Change::RemovedSymlink {
-                path: fx.agent("claude-code").join("shared-one")
+                path: fx.agent("claude-code").join("shared-one"),
+                target: Some(PathBuf::from("../../.agents/skills/shared-one")),
             }]
         );
         assert!(!fx.agent("claude-code").join("shared-one").exists());
@@ -3070,7 +3316,8 @@ mod tests {
             outcome.changes,
             [
                 Change::RemovedSymlink {
-                    path: origin.clone()
+                    path: origin.clone(),
+                    target: Some(PathBuf::from("../../.agents/skills/claude-only")),
                 },
                 Change::Moved {
                     from: fx.store().join("claude-only"),
@@ -3517,6 +3764,19 @@ mod tests {
         found
     }
 
+    /// A listing with the trash left out.
+    ///
+    /// A delete creates `~/.skillbase/trash` and a restore does not take the
+    /// now-empty directory away again, so that entry is the only difference a
+    /// full round trip is allowed to leave behind.
+    fn without_trash(entries: &[String]) -> Vec<String> {
+        entries
+            .iter()
+            .filter(|line| !line.starts_with(".skillbase/trash"))
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn delete_moves_the_origin_to_the_trash_instead_of_destroying_it() {
         let fx = Fixture::realistic();
@@ -3634,6 +3894,268 @@ mod tests {
         );
     }
 
+    // -- undoing a delete ------------------------------------------------
+
+    #[test]
+    fn restore_puts_the_origin_and_every_link_back_where_they_were() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let before = listing(fx.home());
+        let plan = installer.plan_delete(fx.scan().get("shared-one").unwrap());
+        let deleted = installer.delete(&plan).unwrap();
+
+        let restored = installer.restore(&deleted.changes);
+
+        assert!(!restored.is_noop());
+        assert_eq!(restored.directories(), 1);
+        assert_eq!(restored.links(), 1);
+        assert!(restored.missed.is_empty(), "{:?}", restored.missed);
+        assert!(
+            fs::read_to_string(fx.shared().join("shared-one").join(SKILL_FILE_NAME))
+                .unwrap()
+                .contains("shared-one"),
+            "the files came back out of the trash with their bytes"
+        );
+        assert_eq!(
+            fs::read_link(fx.agent("claude-code").join("shared-one")).unwrap(),
+            PathBuf::from("../../.agents/skills/shared-one"),
+            "and the link points where it pointed"
+        );
+        assert_eq!(
+            without_trash(&before),
+            without_trash(&listing(fx.home())),
+            "the home is as it was before the delete"
+        );
+        assert!(
+            fx.scan().get("shared-one").is_some(),
+            "it is back in the list"
+        );
+
+        let described = restored.describe_under(fx.home());
+        assert!(
+            described.contains("to ~/.agents/skills/shared-one"),
+            "{described}"
+        );
+        assert!(
+            described
+                .contains("linked ~/.claude/skills/shared-one -> ../../.agents/skills/shared-one"),
+            "{described}"
+        );
+    }
+
+    #[test]
+    fn restore_brings_a_trashed_duplicate_directory_back_too() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        // `copied-around` is the origin in the store plus one real copy under
+        // Gemini, so the delete trashes two directories.
+        let plan = installer.plan_delete(fx.scan().get("copied-around").unwrap());
+        assert_eq!(plan.copy_count(), 1);
+        let deleted = installer.delete(&plan).unwrap();
+        assert!(!fx.agent("gemini-cli").join("copied-around").exists());
+
+        let restored = installer.restore(&deleted.changes);
+
+        assert_eq!(restored.directories(), 2);
+        assert!(restored.missed.is_empty(), "{:?}", restored.missed);
+        for dir in [
+            fx.shared().join("copied-around"),
+            fx.agent("gemini-cli").join("copied-around"),
+        ] {
+            assert!(
+                dir.join(SKILL_FILE_NAME).is_file(),
+                "{} came back",
+                dir.display()
+            );
+        }
+        assert!(
+            trashed(&fx).is_empty(),
+            "and nothing was left behind in the trash: {:?}",
+            trashed(&fx)
+        );
+    }
+
+    #[test]
+    fn a_removed_link_records_what_it_pointed_at() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let plan = installer.plan_delete(fx.scan().get("hidden-one").unwrap());
+
+        let outcome = installer.delete(&plan).unwrap();
+
+        assert!(
+            outcome.changes.contains(&Change::RemovedSymlink {
+                path: fx.agent("claude-code").join("hidden-one"),
+                target: Some(PathBuf::from("../../.skillbase/private/hidden-one")),
+            }),
+            "the target is kept as it was written: {:?}",
+            outcome.changes
+        );
+    }
+
+    #[test]
+    fn restore_leaves_a_link_path_something_else_now_holds_alone() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let plan = installer.plan_delete(fx.scan().get("shared-one").unwrap());
+        let deleted = installer.delete(&plan).unwrap();
+        // The user has written a skill of their own where the link was.
+        let taken = fx.skill(".claude/skills/shared-one", "written-since");
+
+        let restored = installer.restore(&deleted.changes);
+
+        assert_eq!(restored.links(), 0);
+        assert_eq!(
+            restored.missed,
+            vec![Missed {
+                path: taken.clone(),
+                reason: MissReason::Occupied,
+            }]
+        );
+        assert!(
+            fs::read_to_string(taken.join(SKILL_FILE_NAME))
+                .unwrap()
+                .contains("written-since"),
+            "what was there is untouched"
+        );
+        assert!(
+            restored.describe_under(fx.home()).contains(
+                "could not put back ~/.claude/skills/shared-one: something else is there now"
+            ),
+            "{}",
+            restored.describe_under(fx.home())
+        );
+    }
+
+    #[test]
+    fn restore_leaves_a_directory_whose_old_path_is_taken_alone() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let plan = installer.plan_delete(fx.scan().get("shared-one").unwrap());
+        let deleted = installer.delete(&plan).unwrap();
+        let taken = fx.skill(".agents/skills/shared-one", "written-since");
+
+        let restored = installer.restore(&deleted.changes);
+
+        assert_eq!(restored.directories(), 0);
+        assert!(
+            restored.missed.contains(&Missed {
+                path: taken.clone(),
+                reason: MissReason::Occupied,
+            }),
+            "{:?}",
+            restored.missed
+        );
+        assert!(
+            fs::read_to_string(taken.join(SKILL_FILE_NAME))
+                .unwrap()
+                .contains("written-since"),
+            "the skill written since is untouched"
+        );
+        assert_eq!(
+            trashed(&fx).len(),
+            1,
+            "and what the delete took is still in the trash to be got back by hand"
+        );
+    }
+
+    #[test]
+    fn restore_reports_a_directory_the_user_has_emptied_out_of_the_trash() {
+        let fx = Fixture::realistic();
+        let installer = fx.installer();
+        let plan = installer.plan_delete(fx.scan().get("shared-one").unwrap());
+        let deleted = installer.delete(&plan).unwrap();
+        fs::remove_dir_all(fx.roots().trash_dir()).unwrap();
+
+        let restored = installer.restore(&deleted.changes);
+
+        assert_eq!(restored.directories(), 0);
+        assert!(
+            restored.missed.contains(&Missed {
+                path: fx.shared().join("shared-one"),
+                reason: MissReason::Gone,
+            }),
+            "{:?}",
+            restored.missed
+        );
+        assert!(
+            restored.describe_under(fx.home()).contains(
+                "could not put back ~/.agents/skills/shared-one: what the delete took is no \
+                 longer in the trash"
+            ),
+            "{}",
+            restored.describe_under(fx.home())
+        );
+    }
+
+    #[test]
+    fn restore_cannot_write_a_link_whose_target_was_never_recorded() {
+        let fx = Fixture::realistic();
+        let path = fx.agent("cursor").join("shared-one");
+
+        let restored = fx.installer().restore(&[Change::RemovedSymlink {
+            path: path.clone(),
+            target: None,
+        }]);
+
+        assert!(restored.is_noop());
+        assert_eq!(
+            restored.missed,
+            vec![Missed {
+                path: path.clone(),
+                reason: MissReason::TargetUnknown,
+            }]
+        );
+        assert!(fs::symlink_metadata(&path).is_err());
+    }
+
+    #[test]
+    fn restore_refuses_a_change_naming_a_path_outside_every_scope() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+        // Hand-made changes, not ones a delete produced: the guard is what
+        // stops a caller turning a restore into a write anywhere it likes.
+        let changes = vec![
+            Change::MovedToTrash {
+                from: fx.home().join("Documents/secret"),
+                to: fx.roots().trash_dir().join("secret-1"),
+            },
+            Change::RemovedSymlink {
+                path: fx.home().join("Documents/link"),
+                target: Some(PathBuf::from("secret")),
+            },
+        ];
+
+        let restored = fx.installer().restore(&changes);
+
+        assert!(restored.is_noop());
+        assert_eq!(restored.missed.len(), 2);
+        assert!(
+            restored
+                .missed
+                .iter()
+                .all(|miss| miss.reason == MissReason::OutsideScope),
+            "{:?}",
+            restored.missed
+        );
+        assert_eq!(before, listing(fx.home()), "and nothing was written");
+    }
+
+    #[test]
+    fn restore_of_nothing_changes_nothing() {
+        let fx = Fixture::realistic();
+        let before = listing(fx.home());
+
+        let restored = fx.installer().restore(&[]);
+
+        assert!(restored.is_noop());
+        assert_eq!(restored.directories(), 0);
+        assert_eq!(restored.links(), 0);
+        assert!(restored.missed.is_empty());
+        assert_eq!(restored.describe_under(fx.home()), "");
+        assert_eq!(before, listing(fx.home()));
+    }
+
     // -- a half-finished operation reports the damage --------------------------
 
     #[test]
@@ -3657,7 +4179,8 @@ mod tests {
         assert_eq!(
             done.changes,
             [Change::RemovedSymlink {
-                path: fx.agent("claude-code").join("shared-one")
+                path: fx.agent("claude-code").join("shared-one"),
+                target: Some(PathBuf::from("../../.agents/skills/shared-one")),
             }]
         );
         assert!(matches!(
@@ -4392,6 +4915,7 @@ mod tests {
         for n in 0..9 {
             outcome.push(Change::RemovedSymlink {
                 path: home.join(format!(".claude/skills/skill-{n}")),
+                target: None,
             });
         }
 
@@ -4408,6 +4932,7 @@ mod tests {
     fn describe_under_leaves_a_path_outside_home_alone() {
         let outcome = Outcome::one(Change::RemovedSymlink {
             path: PathBuf::from("/opt/skills/thing"),
+            target: None,
         });
 
         assert_eq!(

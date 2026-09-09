@@ -1714,8 +1714,9 @@ fn report_update_all(
     // Every skill here was installed through `install_skill`, so a failed
     // install record is reported the same way a single install reports it.
     if let Some(reason) = take_cache_failure() {
-        window.push_notification(
+        push_notice(
             cache_failure_notification("What was downloaded could not be recorded", &reason),
+            window,
             cx,
         );
     }

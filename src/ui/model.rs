@@ -919,16 +919,32 @@ impl SkillView {
         }
     }
 
-    /// The agents this skill reaches, in the order the registry lists them.
+    /// The agents on this machine that reach this skill, in registry order.
     ///
-    /// `visible_to` is built by walking the registry, so this is normally the
-    /// same order; sorting here keeps a row's icons in one order whether or not
-    /// that stays true.
-    pub fn reach(&self) -> Vec<&'static AgentDef> {
+    /// `visible_to` is built by walking the whole registry, so on a shared
+    /// skill most of what it holds is software nobody has installed: every
+    /// agent that reads `~/.agents/skills` reaches anything in it. `present`
+    /// is what [`Roots::present_agents`] found, which the scan keeps as
+    /// [`Scan::installed`] — the one answer to "is this agent here", so a
+    /// row's icons, the sidebar's counts and the detail pane's list all draw
+    /// the line in the same place. There is no unfiltered form of this
+    /// question: the one that existed was answered on screen, and named agents
+    /// the sidebar said were not there.
+    ///
+    /// An agent that holds a link of its own is kept whatever `present` says.
+    /// The link is on disk, and hiding it would hide the thing the reader can
+    /// act on.
+    ///
+    /// `visible_to` is already in registry order; sorting here keeps a row's
+    /// icons in one order whether or not that stays true.
+    ///
+    /// [`Roots::present_agents`]: skillbase_core::Roots::present_agents
+    pub fn reach(&self, present: &[&'static AgentDef]) -> Vec<&'static AgentDef> {
         let mut agents: Vec<&'static AgentDef> = self
             .visible_to
             .iter()
             .filter_map(|id| Registry::get(id))
+            .filter(|agent| present.contains(agent) || self.linked_to(agent.id))
             .collect();
         agents.sort_by_key(|agent| Registry::order_of(agent.id));
         agents

@@ -112,7 +112,7 @@ pub use github_token::{TokenSource, github_token_source, refresh_github_token};
 pub use http::{Http, HttpError, HttpResponse, MAX_BODY_BYTES, USER_AGENT, UreqHttp};
 pub use install::{
     COPY_MARKER, Change, ConsolidatePlan, ContentDiff, DeletePlan, Duplicate, ImportOptions,
-    InstallError, Installer, Outcome,
+    InstallError, Installer, MissReason, Missed, Outcome, Restored,
 };
 pub use provenance::{
     DEFAULT_BRANCH, KEY_GITHUB_PATH, KEY_GITHUB_REF, KEY_GITHUB_REPO, KEY_GITHUB_TREE_SHA,
