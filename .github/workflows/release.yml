@@ -246,17 +246,25 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # The tag names the commit the four builds were made from, which is
+          # the one this job checked out. Anything that lands on main while
+          # those builds run belongs to the next release, not this one.
+          git tag -a "v$VERSION" -m "Skillbase v$VERSION"
+
+          # The bump itself is bookkeeping: it is what next-version.sh reads
+          # next time, and what somebody building from source sees. So the
+          # tagged tree still says the version before this one, and that is
+          # the honest thing for it to say.
           script/set-version.sh "$VERSION"
           git add Cargo.toml Cargo.lock
-          # A pull request that bumped the version by hand leaves nothing to
-          # commit here, and the tag still has to be written.
+          # A pull request that raised the version by hand leaves nothing to
+          # commit, and the tag still has to be pushed.
           git diff --cached --quiet || git commit -m "Release v$VERSION"
 
-          # Another merge may have landed while the four builds ran. Rebase
-          # before tagging: a rebase rewrites the commit, and a tag made first
-          # would name the one it replaced.
+          # Another merge may have landed while the builds ran. Only the bump
+          # commit is replayed onto it; the tag was made first and stays where
+          # it is, on a commit that is still an ancestor of main.
           git pull --rebase origin "${{ github.ref_name }}"
-          git tag -a "v$VERSION" -m "Skillbase v$VERSION"
           git push origin "HEAD:${{ github.ref_name }}" "refs/tags/v$VERSION"
 
       - name: Checksums
