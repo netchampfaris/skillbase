@@ -48,7 +48,7 @@ use thiserror::Error;
 use crate::discovery::DiscoveredSkill;
 use crate::doc::SkillDoc;
 use crate::error::SkillError;
-use crate::github::{GitHub, GitHubError, RateLimit, RepoRef, SkillLocation, extract_subdir};
+use crate::github::{GitHub, GitHubError, RateLimit, RepoRef, SkillLocation};
 use crate::http::Http;
 use crate::install::{
     Change, DeletePlan, InstallError, Installer, Outcome, copy_dir, crosses_filesystems,
@@ -557,8 +557,13 @@ pub fn upstream_state<H: Http>(
     let staged = Staging::new(roots, "compare")?;
     let commit = gh.ref_sha(&location.repo)?;
     let tree_sha = gh.subtree_sha(&location.repo, &commit, &location.path)?;
-    let archive = gh.download_tarball(&location.repo, &commit)?;
-    extract_subdir(&archive, &location.path, staged.path())?;
+    gh.fetch_files(
+        &location.repo,
+        &commit,
+        &tree_sha,
+        &location.path,
+        staged.path(),
+    )?;
 
     let bare = content_digest(staged.path()).map_err(|e| FetchError::io(staged.path(), e))?;
     if bare == local {
@@ -1107,8 +1112,10 @@ pub struct Installed {
 /// 1. Resolve the ref to a commit sha, then the subdirectory to a tree sha.
 ///    The tree sha is what later answers "has upstream changed?", so it is
 ///    resolved before anything is downloaded rather than guessed after.
-/// 2. Download the archive pinned to that commit sha, and extract only the
-///    wanted subdirectory into [`STAGING_DIR`].
+/// 2. Fetch the skill's own directory, pinned to that commit sha, into
+///    [`STAGING_DIR`]. [`GitHub::fetch_files`] downloads the files one at a
+///    time where it can, and only falls back to the whole repository archive
+///    where it cannot.
 /// 3. Write the provenance into the staged `SKILL.md`, under `metadata`.
 /// 4. Move the staged directory into the store. Nothing appears in
 ///    `~/.agents/skills` until the skill is complete.
@@ -1145,10 +1152,14 @@ pub fn install_from_github<H: Http>(
     if options.cancelled() {
         return Err(FetchError::Cancelled);
     }
-    let archive = gh.download_tarball(&location.repo, &commit)?;
-
     let staged = Staging::new(roots, location.dir_name())?;
-    let files = extract_subdir(&archive, &location.path, staged.path())?;
+    let files = gh.fetch_files(
+        &location.repo,
+        &commit,
+        &tree_sha,
+        &location.path,
+        staged.path(),
+    )?;
     if !staged.path().join(SKILL_FILE_NAME).is_file() {
         return Err(FetchError::NotASkill {
             repo: location.repo.slug(),
@@ -2038,7 +2049,11 @@ mod tests {
     }
 
     fn client(http: FakeHttp) -> GitHub<FakeHttp> {
-        GitHub::new(http).with_endpoints("https://api.test", "https://codeload.test")
+        GitHub::new(http).with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        )
     }
 
     fn target(name: &str, repo: &str, path: &str, sha: Option<&str>) -> UpdateTarget {
@@ -2347,7 +2362,15 @@ mod tests {
 
     // -- installing ----------------------------------------------------------
 
+    /// The `SKILL.md` of the skill every install test downloads.
+    const PDF_SKILL_MD: &str = "---\nname: pdf\ndescription: Reads PDFs.\n---\n\n# pdf\n";
+
     /// A repository holding one skill under `skills/pdf`.
+    ///
+    /// Scripted for both ways of getting the bytes, because an install takes
+    /// whichever one it can: the recursive listing of `skills/pdf` and its two
+    /// files from the raw host, and the whole repository archive that
+    /// [`GitHub::fetch_files`] falls back to.
     fn install_http() -> FakeHttp {
         let http = FakeHttp::new();
         http.json(
@@ -2364,6 +2387,37 @@ mod tests {
             r#"{"sha":"skills","truncated":false,"tree":[
                 {"path":"pdf","type":"tree","sha":"pdf-tree-sha"}]}"#,
         );
+        http.json(
+            "https://api.test/repos/o/r/git/trees/pdf-tree-sha?recursive=1",
+            r#"{"sha":"pdf-tree-sha","truncated":false,"tree":[
+                {"path":"SKILL.md","mode":"100644","type":"blob","sha":"skill-blob"},
+                {"path":"scripts","mode":"040000","type":"tree","sha":"scripts-tree"},
+                {"path":"scripts/run.sh","mode":"100755","type":"blob","sha":"run-blob"}]}"#,
+        );
+        // `skills` itself, for the test that asks to install a directory of
+        // skills rather than a skill.
+        http.json(
+            "https://api.test/repos/o/r/git/trees/skills?recursive=1",
+            r#"{"sha":"skills","truncated":false,"tree":[
+                {"path":"pdf","mode":"040000","type":"tree","sha":"pdf-tree-sha"},
+                {"path":"pdf/SKILL.md","mode":"100644","type":"blob","sha":"skill-blob"},
+                {"path":"pdf/scripts","mode":"040000","type":"tree","sha":"scripts-tree"},
+                {"path":"pdf/scripts/run.sh","mode":"100755","type":"blob","sha":"run-blob"},
+                {"path":"other","mode":"040000","type":"tree","sha":"other-tree"},
+                {"path":"other/SKILL.md","mode":"100644","type":"blob","sha":"other-blob"}]}"#,
+        );
+        http.reply(
+            "https://raw.test/o/r/c0ffee/skills/pdf/SKILL.md",
+            HttpResponse::new(200, PDF_SKILL_MD),
+        );
+        http.reply(
+            "https://raw.test/o/r/c0ffee/skills/pdf/scripts/run.sh",
+            HttpResponse::new(200, "#!/bin/sh\n"),
+        );
+        http.reply(
+            "https://raw.test/o/r/c0ffee/skills/other/SKILL.md",
+            HttpResponse::new(200, "---\nname: other\n---\n"),
+        );
         http.reply(
             "https://codeload.test/o/r/tar.gz/c0ffee",
             HttpResponse::new(
@@ -2372,10 +2426,7 @@ mod tests {
                     "r-c0ffee",
                     &[
                         ("README.md", "not the skill\n"),
-                        (
-                            "skills/pdf/SKILL.md",
-                            "---\nname: pdf\ndescription: Reads PDFs.\n---\n\n# pdf\n",
-                        ),
+                        ("skills/pdf/SKILL.md", PDF_SKILL_MD),
                         ("skills/pdf/scripts/run.sh", "#!/bin/sh\n"),
                         ("skills/other/SKILL.md", "---\nname: other\n---\n"),
                     ],
@@ -2385,7 +2436,7 @@ mod tests {
         http
     }
 
-    /// Sets a cancel flag while the archive is being fetched.
+    /// Sets a cancel flag while the skill's files are being fetched.
     ///
     /// The only injection point an install has after the first cancel check:
     /// every later step is filesystem work with nothing to substitute. Without
@@ -2401,7 +2452,7 @@ mod tests {
             url: &str,
             headers: &[(&str, &str)],
         ) -> Result<HttpResponse, crate::http::HttpError> {
-            if url.contains("codeload.test") {
+            if url.contains("raw.test") || url.contains("codeload.test") {
                 self.cancel.store(true, Ordering::SeqCst);
             }
             self.inner.get(url, headers)
@@ -2672,7 +2723,11 @@ mod tests {
             inner: install_http(),
             cancel: Arc::clone(&cancel),
         })
-        .with_endpoints("https://api.test", "https://codeload.test");
+        .with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        );
         let mut cache = RemoteCache::new();
         let options = InstallOptions::new()
             .replacing()
@@ -2723,6 +2778,65 @@ mod tests {
         assert_eq!(
             fs::read_dir(fx.home().join(STAGING_DIR)).unwrap().count(),
             0
+        );
+    }
+
+    /// Issue 12: `pdftk-server` sits in `github/awesome-copilot`, whose archive
+    /// is 86 MB, and installing it failed on the transport's size cap. The
+    /// skill's own directory is a few files, and that is all this now asks for,
+    /// so the archive's size stops mattering.
+    #[test]
+    fn a_skill_installs_out_of_a_repository_too_large_to_download_whole() {
+        let fx = Fixture::empty();
+        let http = install_http();
+        http.too_large("https://codeload.test/o/r/tar.gz/c0ffee");
+        let gh = client(http);
+        let mut cache = RemoteCache::new();
+
+        let installed = install_from_github(
+            &fx.installer(),
+            &gh,
+            &SkillLocation::parse("o/r/skills/pdf").unwrap(),
+            &InstallOptions::new(),
+            &mut cache,
+        )
+        .expect("the skill's own directory is small whatever the repository weighs");
+
+        assert_eq!(installed.name, "pdf");
+        assert_eq!(installed.files, 2);
+        assert!(installed.dir.join("scripts/run.sh").is_file());
+    }
+
+    /// The other half of issue 12: installing the whole repository has no
+    /// smaller request to fall back on, so the failure has to be a sentence the
+    /// user can act on rather than a URL and a byte count.
+    #[test]
+    fn installing_a_whole_repository_too_large_to_download_says_what_to_do_instead() {
+        let fx = Fixture::empty();
+        let http = install_http();
+        http.too_large("https://codeload.test/o/r/tar.gz/c0ffee");
+        let gh = client(http);
+        let mut cache = RemoteCache::new();
+
+        let err = install_from_github(
+            &fx.installer(),
+            &gh,
+            &SkillLocation::parse("o/r").unwrap(),
+            &InstallOptions::new(),
+            &mut cache,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.describe_under(fx.home()),
+            "o/r is too large to download whole (over 64 MB). Install one skill from it \
+             instead of the whole repository, by naming that skill's directory: \
+             o/r/path/to/skill."
+        );
+        assert_eq!(
+            fs::read_dir(fx.home().join(STAGING_DIR)).unwrap().count(),
+            0,
+            "and it leaves no staging directory behind"
         );
     }
 

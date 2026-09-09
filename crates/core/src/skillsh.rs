@@ -377,7 +377,11 @@ mod tests {
                 {"path":"b/pdf/SKILL.md","type":"blob","sha":"b2"},
                 {"path":"b/other/SKILL.md","type":"blob","sha":"b3"}]}"#,
         );
-        let gh = GitHub::new(http).with_endpoints("https://api.test", "https://codeload.test");
+        let gh = GitHub::new(http).with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        );
 
         let hit = SearchHit {
             id: "cm7".into(),
@@ -409,7 +413,11 @@ mod tests {
             r#"{"sha":"root","truncated":false,"tree":[
                 {"path":"SKILL.md","type":"blob","sha":"b1"}]}"#,
         );
-        let gh = GitHub::new(http).with_endpoints("https://api.test", "https://codeload.test");
+        let gh = GitHub::new(http).with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        );
         let hit = SearchHit {
             id: "x".into(),
             skill_id: "pdf".into(),
@@ -432,7 +440,11 @@ mod tests {
     #[test]
     fn a_hit_whose_source_is_not_a_repository_is_refused() {
         let http = FakeHttp::new();
-        let gh = GitHub::new(http).with_endpoints("https://api.test", "https://codeload.test");
+        let gh = GitHub::new(http).with_endpoints(
+            "https://api.test",
+            "https://codeload.test",
+            "https://raw.test",
+        );
         let hit = SearchHit {
             source: "nonsense".into(),
             ..SearchHit {
