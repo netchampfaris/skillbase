@@ -1,6 +1,11 @@
-//! The detail pane: the selected skill's name and description as form fields,
-//! the agents it is visible to, the whole `SKILL.md` in a code editor, and the
-//! actions that change any of it on disk.
+//! The detail pane: what the selected skill says it is, the agents it is
+//! visible to, the whole `SKILL.md` in a code editor, and the actions that
+//! change any of it on disk.
+//!
+//! The name and the description are frontmatter, so the `SKILL.md` tab is
+//! where they are edited. The Overview reads them out and nothing more. The
+//! one exception is renaming, which moves a directory rather than editing a
+//! line, and has its own action and its own confirmation.
 //!
 //! Every write goes through `skillbase-core` against the one [`Roots`] the
 //! application resolved at startup, and every write happens on a background
@@ -8,7 +13,7 @@
 //! the root view scans again, so the interface never asserts a state the
 //! filesystem does not back up.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,11 +24,10 @@ use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{DialogButtonProps, DialogClose, DialogFooter};
-use gpui_kit::component::input::{
-    Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState,
-};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::link::Link;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
@@ -197,51 +201,47 @@ enum Showing {
     File(SharedString),
 }
 
-/// The unsaved edits to `SKILL.md`, by the tab they were made in.
-///
-/// Two tabs write this one file: the Overview, through the Name and Description
-/// fields, and the `SKILL.md` tab, through the editor. Saving either saves the
-/// file, so [`Self::any`] is what the Save button and every "you have unsaved
-/// work" question read.
-///
-/// The dot on a tab is a different question. It says "the work you have not
-/// saved is in here", and a file the user has never opened is not where it is:
-/// typing in the Name field used to put a dot on the `SKILL.md` tab as well,
-/// which told the reader they had edited a file they had not looked at.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SkillFileEdits {
-    /// The Overview's Name and Description fields.
-    fields: bool,
-    /// The `SKILL.md` editor.
-    body: bool,
-}
-
-impl SkillFileEdits {
-    /// Whether `SKILL.md` has edits that have not been written, wherever they
-    /// were made.
-    fn any(self) -> bool {
-        self.fields || self.body
-    }
-
-    /// Whether `showing` wears the unsaved-edits dot.
+impl Showing {
+    /// Whether this tab wears the unsaved-edits dot, given whether `SKILL.md`
+    /// has been typed into.
     ///
-    /// Only the two tabs that write `SKILL.md` are answered here. Every other
-    /// file tracks its own edits in its own [`OpenFile`].
-    fn dot(self, showing: &Showing) -> bool {
-        match showing {
-            Showing::Overview => self.fields,
-            Showing::File(rel) if rel == SKILL_FILE_NAME => self.body,
+    /// The dot says "the work you have not saved is in here". Only the
+    /// `SKILL.md` tab is written from the pane's own editor; the Overview
+    /// reads that file rather than editing it, so it never wears the dot even
+    /// though Save on it writes the same file. Every other file tracks its own
+    /// edits in its own [`OpenFile`].
+    fn dot(&self, source_edited: bool) -> bool {
+        match self {
+            Showing::Overview => false,
+            Showing::File(rel) if rel == SKILL_FILE_NAME => source_edited,
             Showing::File(_) => false,
         }
     }
 }
 
+/// What the Rename dialog's field says about itself, worked out on each
+/// keystroke and read by the dialog while it draws.
+///
+/// A plain `Rc`, not the pane and not the field's own entity. The dialog's
+/// builder runs from inside the pane's own render, so reading an entity there
+/// aborts the process; the subscription on the field writes this instead. Once
+/// per keystroke is also the right rate for the half of the answer that costs
+/// a `symlink_metadata` call.
+#[derive(Default)]
+struct RenameCheck {
+    /// Why the name typed cannot be used, or `None` when it can.
+    problem: Option<SharedString>,
+    /// Whether the field holds a name other than the one the skill has. A
+    /// rename to the name it already has moves nothing.
+    changed: bool,
+}
+
 /// A bundled file open in a tab, with its own editor.
 ///
-/// `SKILL.md` is not one of these. Its frontmatter is what the Overview's Name
-/// and Description fields edit, so it keeps the dedicated `body` editor and the
-/// existing save path. Everything else is a plain text file: read, edited, and
-/// written back with nothing in between.
+/// `SKILL.md` is not one of these. It is the file the Overview reads its name
+/// and description out of, so it keeps the dedicated `body` editor and the
+/// save path that can rename the directory with it. Everything else is a plain
+/// text file: read, edited, and written back with nothing in between.
 struct OpenFile {
     /// Path relative to the skill directory. Identity for the tab and for the
     /// row that opened it.
@@ -308,18 +308,16 @@ pub struct DetailPane {
     /// rather than captured by the dialog, because the dialog's builder runs on
     /// every frame and a continuation can only run once.
     pending: Option<Proceed>,
+    /// The Rename dialog's field. It lives on the pane rather than in the
+    /// dialog because the dialog's builder runs on every frame and would
+    /// rebuild the field, and what was typed into it, each time.
     name: Entity<InputState>,
-    /// Whether the directory a rename would move to is occupied, worked out
-    /// when the Name field changes rather than while the pane renders: the
-    /// answer costs a `symlink_metadata` call, and rendering asks for it on
-    /// every frame the user is typing in. `None` when the destination is free,
-    /// when the name is one the cheap rules refuse anyway, or when there is no
-    /// skill.
-    name_taken: Option<SharedString>,
-    description: Entity<TextareaState>,
+    /// What that field says about itself, while the dialog is open. `None`
+    /// when it is not.
+    rename: Option<Rc<RefCell<RenameCheck>>>,
     body: Entity<EditorState>,
-    /// The unsaved edits to `SKILL.md`, and which tab they were made in.
-    edits: SkillFileEdits,
+    /// Whether `SKILL.md` has been typed into and not written back.
+    source_edited: bool,
     /// True while a write is in flight, so a second click cannot start one.
     busy: bool,
     /// Bumped on every load, so a read that lands after the selection moved on
@@ -333,18 +331,11 @@ impl EventEmitter<DetailEvent> for DetailPane {}
 impl DetailPane {
     pub fn new(roots: Roots, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("my-skill"));
-        let description = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .placeholder("What the skill does, and when an agent should load it.")
-        });
         let body = cx.new(|cx| EditorState::new(window, cx).language("markdown"));
 
         let subscriptions = vec![
             cx.subscribe(&name, |this, _, event: &InputEvent, cx| {
-                this.mark_name_edited(event, cx)
-            }),
-            cx.subscribe(&description, |this, _, event: &InputEvent, cx| {
-                this.mark_fields_edited(event, cx)
+                this.check_rename(event, cx)
             }),
             cx.subscribe(&body, |this, _, event: &InputEvent, cx| {
                 this.mark_body_edited(event, cx)
@@ -372,10 +363,9 @@ impl DetailPane {
             files_open: true,
             pending: None,
             name,
-            name_taken: None,
-            description,
+            rename: None,
             body,
-            edits: SkillFileEdits::default(),
+            source_edited: false,
             busy: false,
             generation: 0,
             _subscriptions: subscriptions,
@@ -399,10 +389,6 @@ impl DetailPane {
         };
         self.scan = Some(scan);
         self.skill = skill;
-        // Both halves of the answer depend on the skill and the scan that have
-        // just arrived, and the disk half is not asked for again until the next
-        // keystroke.
-        self.refresh_name_taken(cx);
         if !same_file {
             // A different skill is a fresh question, so the section closes
             // again. Re-showing the same file — which is what follows every
@@ -429,7 +415,7 @@ impl DetailPane {
         // Re-reading the file under an unsaved edit would throw the edit away.
         // A mutation that only moved links leaves the bytes alone, so keep what
         // the editor holds and just refresh the metadata around it.
-        if same_file && (self.edits.any() || matches!(self.source, Source::Loaded)) {
+        if same_file && (self.source_edited || matches!(self.source, Source::Loaded)) {
             cx.notify();
             return;
         }
@@ -444,12 +430,12 @@ impl DetailPane {
     fn load_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
-        self.edits = SkillFileEdits::default();
+        self.source_edited = false;
 
         let Some(skill) = self.skill.clone() else {
             self.source = Source::Empty;
             self.set_tree(Vec::new());
-            self.set_fields("", "", "", window, cx);
+            self.set_body("", window, cx);
             cx.notify();
             return;
         };
@@ -477,7 +463,7 @@ impl DetailPane {
                     Err(error) => {
                         this.set_tree(Vec::new());
                         this.source = Source::Failed(error.to_string().into());
-                        this.set_fields("", "", "", window, cx);
+                        this.set_body("", window, cx);
                         cx.notify();
                     }
                 }
@@ -689,7 +675,8 @@ impl DetailPane {
         cx.notify();
     }
 
-    /// Put the file into the editor and the Name and Description fields.
+    /// Put the file into the editor, and its frontmatter into what the
+    /// Overview reads out.
     fn adopt_source(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let parsed = SkillDoc::parse(text).ok();
         let name = parsed
@@ -701,87 +688,59 @@ impl DetailPane {
             .and_then(|doc| doc.frontmatter.description().map(str::to_string))
             .unwrap_or_default();
 
-        self.loaded_name = name.clone().into();
-        self.loaded_description = description.clone().into();
+        self.loaded_name = name.into();
+        self.loaded_description = description.into();
         self.source = Source::Loaded;
-        self.edits = SkillFileEdits::default();
-        self.set_fields(&name, &description, text, window, cx);
+        self.source_edited = false;
+        self.set_body(text, window, cx);
         cx.notify();
     }
 
-    fn set_fields(
-        &mut self,
-        name: &str,
-        description: &str,
-        body: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Put `text` into the `SKILL.md` editor.
+    fn set_body(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         // `set_value` does not emit a change event, so loading never marks the
         // pane dirty.
-        self.name.update(cx, |state, cx| {
-            state.set_value(name.to_string(), window, cx)
-        });
-        self.description.update(cx, |state, cx| {
-            state.set_value(description.to_string(), window, cx)
-        });
         self.body.update(cx, |state, cx| {
-            state.set_value(body.to_string(), window, cx)
+            state.set_value(text.to_string(), window, cx)
         });
-        // `set_value` emits no change event, so the check the change would have
-        // run is run here: this is where a new skill's name arrives.
-        self.refresh_name_taken(cx);
-    }
-
-    /// The Description field was typed in: the Overview holds unsaved work.
-    fn mark_fields_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
-        if matches!(event, InputEvent::Change) && !self.edits.fields {
-            self.edits.fields = true;
-            cx.notify();
-        }
     }
 
     /// The `SKILL.md` editor was typed in.
-    ///
-    /// Recorded apart from the fields above, though both write the same file,
-    /// so that the dot lands on the tab the work is in.
     fn mark_body_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
-        if matches!(event, InputEvent::Change) && !self.edits.body {
-            self.edits.body = true;
+        if matches!(event, InputEvent::Change) && !self.source_edited {
+            self.source_edited = true;
             cx.notify();
         }
     }
 
-    /// [`Self::mark_fields_edited`] for the Name field, which redraws on every
-    /// keystroke rather than only the first.
+    /// Work out what the Rename dialog's field now holds, for the dialog to
+    /// draw on this frame and the ones after it.
     ///
-    /// What the field says about itself — the reason a name is refused, and
-    /// whether Save is offered — is worked out from its value while the pane
-    /// renders, so the pane has to render again each time that value changes.
-    /// The one part of that answer which touches the disk is worked out here
-    /// instead, once per keystroke rather than once per frame.
-    fn mark_name_edited(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
-        if matches!(event, InputEvent::Change) {
-            self.edits.fields = true;
-            self.refresh_name_taken(cx);
-            cx.notify();
+    /// Once per keystroke rather than once per frame, because half the answer
+    /// is a `symlink_metadata` call: [`rename_problem`] asks the disk whether
+    /// the destination is occupied, and a dialog that asked while it drew
+    /// would ask on every frame the user was typing in.
+    fn check_rename(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
+        if !matches!(event, InputEvent::Change) {
+            return;
         }
-    }
-
-    /// Ask the filesystem whether the rename now typed has anywhere to land,
-    /// and keep the answer for the frames that follow.
-    ///
-    /// Only asked for a name the cheap rules already accept, so an empty or
-    /// malformed name never reaches the disk.
-    fn refresh_name_taken(&mut self, cx: &mut Context<Self>) {
+        let Some(check) = self.rename.clone() else {
+            return;
+        };
         let typed = self.name.read(cx).value();
         let typed = typed.trim();
-        self.name_taken = self.skill.as_ref().and_then(|skill| {
-            if name_rules(typed, skill, self.scan.as_deref()).is_some() {
-                return None;
-            }
-            destination_taken(typed, skill, &self.roots)
-        });
+        let Some(skill) = self.skill.as_ref() else {
+            return;
+        };
+        // Against the name the skill has, not the one its frontmatter gives
+        // itself. The two can differ, and it is the directory that moves, so
+        // this is the same comparison [`rename_problem`] makes when it decides
+        // a rename has nothing to do.
+        *check.borrow_mut() = RenameCheck {
+            problem: rename_problem(typed, skill, self.scan.as_deref(), &self.roots),
+            changed: typed != skill.name.as_ref(),
+        };
+        cx.notify();
     }
 
     // ---------------------------------------------------------------- saving
@@ -789,19 +748,12 @@ impl DetailPane {
     /// Write the edits back through `skillbase-core`.
     ///
     /// **The editor holds the document.** Its text is parsed and becomes the
-    /// file. A form field is applied on top of it only when the user actually
-    /// changed that field — comparing it against the value the file had when it
-    /// was loaded. So editing `description:` in the editor is honoured, editing
-    /// the Description field is honoured, and when both were edited the form
-    /// field wins, because it is the control built for that key.
+    /// file, so a save writes exactly what the `SKILL.md` tab shows. The
+    /// frontmatter is edited there like everything else; nothing on the
+    /// Overview writes into it.
     ///
     /// A file that does not parse cannot be saved; the parse error comes back
     /// as a notification and nothing is written.
-    ///
-    /// The Name field is the exception to "the editor holds the document": a
-    /// skill's name is also its directory's name, so changing it moves a real
-    /// directory. It is checked before anything is written and confirmed before
-    /// the move, and only then does the write run.
     ///
     /// `then` runs once the write has landed. The write is a background task,
     /// so anything waiting on it — the quit the user chose Save from, the skill
@@ -812,67 +764,163 @@ impl DetailPane {
         if self.skill.is_none() || self.busy {
             return;
         }
-        let Some(new_name) = self.name_edit(cx) else {
-            self.write_source(None, then, window, cx);
+        self.write_source(None, then, window, cx);
+    }
+
+    /// Ask for a new name, and rename the skill if one is given.
+    ///
+    /// A rename is not an edit to a field. `name:` in the frontmatter is only
+    /// half of a skill's name — the directory it lives in is the other half —
+    /// so editing that line in the `SKILL.md` tab leaves the folder behind
+    /// under the old name. This is the action that moves both, and it is why
+    /// the name is not a form field on the Overview.
+    pub(crate) fn open_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(skill) = self.skill.clone() else {
             return;
         };
-        // Refused here rather than by the installer a moment later, so the
-        // reason arrives while the field that caused it is still on screen.
-        // Reachable from the File menu as well as the Save button, which is why
-        // disabling Save is not enough on its own.
-        if let Some(problem) = self.name_problem_now(cx) {
-            window.push_notification(Notification::error(problem).title("Could not save"), cx);
-            return;
-        }
-        self.confirm_rename(new_name, then, window, cx);
+        // The name it has now, so the field opens on something the reader
+        // recognises and a rename is an edit to it rather than a retyping.
+        let current = skill.name.clone();
+        self.name.update(cx, |state, cx| {
+            state.set_value(current.to_string(), window, cx)
+        });
+        // Fresh for each dialog, so nothing the last one was told is still
+        // being drawn. Nothing has been typed yet, so there is no problem to
+        // report and nothing to rename to.
+        let check = Rc::new(RefCell::new(RenameCheck::default()));
+        self.rename = Some(check.clone());
+
+        let field = self.name.clone();
+        let this = cx.entity().downgrade();
+
+        // Nothing in this builder may read an entity: it runs from inside the
+        // pane's own render, and reading one there aborts the process. What
+        // the field says about itself comes from `check`, which the
+        // subscription on the field writes once per keystroke.
+        window.open_dialog(cx, move |dialog, _, _| {
+            let field = field.clone();
+            let (ok, cancel) = (this.clone(), this.clone());
+            // Read out and the borrow dropped, rather than held for the rest
+            // of the builder: what is drawn is a copy of what the last
+            // keystroke worked out.
+            let (problem, changed) = {
+                let check = check.borrow();
+                (check.problem.clone(), check.changed)
+            };
+            let blocked = !changed || problem.is_some();
+
+            dialog
+                .title(format!("Rename {current}"))
+                .width(px(460.))
+                .content(move |content, _, cx| {
+                    content.child(
+                        v_flex()
+                            .p_4()
+                            .gap_2()
+                            .child(Label::new("Name"))
+                            .child(Input::new(&field).small())
+                            .child(
+                                // One line, under the field it is about: what
+                                // a name has to look like and what changing it
+                                // moves, until it is a name that cannot be
+                                // used, and then why.
+                                div()
+                                    .text_xs()
+                                    .text_color(match &problem {
+                                        Some(_) => cx.theme().danger,
+                                        None => cx.theme().muted_foreground,
+                                    })
+                                    .child(problem.clone().unwrap_or_else(|| {
+                                        "kebab-case, and the directory's name as well: renaming \
+                                         moves the folder on disk and rewrites the frontmatter \
+                                         block, so comments in it are dropped."
+                                            .into()
+                                    })),
+                            ),
+                    )
+                })
+                .footer(
+                    DialogFooter::new()
+                        .p_4()
+                        .child(
+                            Button::new("cancel-rename")
+                                .outline()
+                                .label("Cancel")
+                                .on_click(move |_, window, cx| {
+                                    cancel.update(cx, |this, _| this.rename = None).ok();
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("confirm-rename")
+                                .primary()
+                                .label("Rename…")
+                                // Off until the field holds a name that is
+                                // both different and usable, with the reason
+                                // showing under it.
+                                .disabled(blocked)
+                                .on_click(move |_, window, cx| {
+                                    let name = ok
+                                        .update(cx, |this, cx| this.accept_rename(cx))
+                                        .ok()
+                                        .flatten();
+                                    // A name the disk has taken since the last
+                                    // keystroke keeps the dialog, and the line
+                                    // under the field now says why.
+                                    let Some(name) = name else {
+                                        return;
+                                    };
+                                    // This dialog goes first: `close_dialog`
+                                    // pops whichever is on top, and the
+                                    // confirmation below would be the one
+                                    // popped.
+                                    window.close_dialog(cx);
+                                    ok.update(cx, |this, cx| {
+                                        this.confirm_rename(name, None, window, cx)
+                                    })
+                                    .ok();
+                                }),
+                        ),
+                )
+        });
+
+        // After `open_dialog`, which focuses a handle of its own. The dialog
+        // has one field and nothing else to type into.
+        self.name.update(cx, |state, cx| state.focus(window, cx));
     }
 
-    /// The name in the field when it differs from the one the file was loaded
-    /// with, and `None` when the user has not touched it.
-    fn name_edit(&self, cx: &App) -> Option<String> {
-        let typed = self.name.read(cx).value();
-        let typed = typed.trim();
-        (typed != self.loaded_name.as_ref()).then(|| typed.to_string())
-    }
-
-    /// Why the name in the field cannot be used, or `None` when it can.
+    /// The name typed into the Rename dialog, once the disk has been asked
+    /// again about it.
     ///
-    /// Rendered on every frame, so the rules are applied here and the one
-    /// answer that costs a syscall comes from [`Self::name_taken`], which was
-    /// worked out when the field last changed.
-    fn name_problem(&self, cx: &App) -> Option<SharedString> {
+    /// `None` when it cannot be used, and the reason is written back into the
+    /// dialog's own check so the line under the field says so. A directory can
+    /// appear between the last keystroke and the click, and this is the ask
+    /// that happens once per rename rather than once per frame.
+    fn accept_rename(&mut self, cx: &mut Context<Self>) -> Option<String> {
         let typed = self.name.read(cx).value();
+        let typed = typed.trim().to_string();
         let skill = self.skill.as_ref()?;
-        name_rules(typed.trim(), skill, self.scan.as_deref()).or_else(|| self.name_taken.clone())
-    }
-
-    /// [`Self::name_problem`], asking the disk again rather than trusting the
-    /// answer from the last keystroke.
-    ///
-    /// A directory can appear between the keystroke and the save, and this runs
-    /// once per save rather than once per frame.
-    fn name_problem_now(&self, cx: &App) -> Option<SharedString> {
-        let typed = self.name.read(cx).value();
-        rename_problem(
-            typed.trim(),
-            self.skill.as_ref()?,
-            self.scan.as_deref(),
-            &self.roots,
-        )
-    }
-
-    /// True when the tab showing writes `SKILL.md` and the Name field holds a
-    /// name that would be refused, so there is nothing Save can do.
-    fn name_blocked(&self, cx: &App) -> bool {
-        self.showing_file() == SKILL_FILE_NAME
-            && self.name_edit(cx).is_some()
-            && self.name_problem(cx).is_some()
+        // Nothing to move. The button that sends this is off for a name that
+        // has not changed, so this is the backstop rather than the path.
+        if typed == skill.name.as_ref() {
+            return None;
+        }
+        let problem = rename_problem(&typed, skill, self.scan.as_deref(), &self.roots);
+        if let Some(problem) = problem {
+            if let Some(check) = &self.rename {
+                check.borrow_mut().problem = Some(problem);
+            }
+            cx.notify();
+            return None;
+        }
+        self.rename = None;
+        Some(typed)
     }
 
     /// Confirm what renaming moves, and where to.
     ///
-    /// The name is the directory's name as well as the frontmatter's, so saving
-    /// the field moves a real directory. It gets the same confirmation shape as
+    /// The name is the directory's name as well as the frontmatter's, so the
+    /// rename moves a real directory. It gets the same confirmation shape as
     /// adopting and releasing: name the source, name the destination, and say
     /// what follows the skill.
     fn confirm_rename(
@@ -974,8 +1022,6 @@ impl DetailPane {
         };
 
         let text = self.body.read(cx).value().to_string();
-        let description_field = self.description.read(cx).value().to_string();
-        let description_edited = description_field != self.loaded_description.as_ref();
         let dir = skill.origin.clone();
         let roots = self.roots.clone();
 
@@ -986,10 +1032,6 @@ impl DetailPane {
             let written = cx
                 .background_spawn(async move {
                     let mut doc = SkillDoc::parse(&text)?;
-                    if description_edited {
-                        doc.frontmatter.set_description(&description_field);
-                    }
-
                     let installer = Installer::new(roots.clone());
                     let mut dir = dir;
                     let mut moved = None;
@@ -2237,11 +2279,6 @@ impl DetailPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Read once: the same answer decides whether Save is offered and what
-        // it says when it is not.
-        let blocked = self.name_blocked(cx);
-        let problem = blocked.then(|| self.name_problem(cx)).flatten();
-
         drag_band("detail-header", window, cx)
             .flex_shrink_0()
             .h(BAND_HEIGHT)
@@ -2298,15 +2335,13 @@ impl DetailPane {
                             )
                         },
                     )
+                    .child(self.actions_menu(cx))
                     .child(
                         Button::new("save")
                             .primary()
                             .small()
                             .label("Save")
-                            // Off while the Name field holds a name that would
-                            // be refused, with the reason under the field.
-                            .disabled(!self.showing_dirty() || self.busy || blocked)
-                            .when_some(problem, |button, problem| button.tooltip(problem))
+                            .disabled(!self.showing_dirty() || self.busy)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.save_active(window, cx)),
                             ),
@@ -2314,9 +2349,51 @@ impl DetailPane {
             )
     }
 
+    /// The pane's overflow menu: what acts on this skill but is not worth a
+    /// button of its own in a 48px band.
+    ///
+    /// Renaming is here rather than on the Overview because it is not an edit
+    /// to a field. It moves the skill's directory, which is why editing `name:`
+    /// in the `SKILL.md` tab does not do it.
+    fn actions_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let busy = self.busy;
+
+        Button::new("detail-actions")
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .tooltip("More actions")
+            .accessibility_label("More actions")
+            .dropdown_menu(move |menu, _, _| {
+                let (rename, edit) = (this.clone(), this.clone());
+                menu.min_w(px(200.))
+                    .item(PopupMenuItem::new("Rename…").disabled(busy).on_click(
+                        move |_, window, cx| {
+                            rename
+                                .update(cx, |this, cx| this.open_rename(window, cx))
+                                .ok();
+                        },
+                    ))
+                    .item(
+                        // The same command the Location section offers. It is
+                        // here as well because Location is on the Overview,
+                        // and this band is on every tab.
+                        PopupMenuItem::new("Open in editor").on_click(move |_, window, cx| {
+                            edit.update(cx, |this, cx| this.edit_externally(window, cx))
+                                .ok();
+                        }),
+                    )
+            })
+    }
+
     /// The 44px row under the band: the skill's name, a warning glyph when
-    /// its frontmatter fails to parse, and whether it is Managed or
-    /// Unmanaged.
+    /// its frontmatter fails to parse, and a tag when it is unmanaged.
+    ///
+    /// Only when it is unmanaged. Managed is the ordinary case — it is what
+    /// every skill Skillbase installed or created is — and a badge on almost
+    /// every skill in the library says nothing about the one being read. The
+    /// exception is worth a word; the rule is not.
     ///
     /// This used to sit in the band itself, next to the action buttons. The
     /// band's left side is the tab strip now, so the name needs a row of its
@@ -2345,11 +2422,18 @@ impl DetailPane {
                         .text_color(cx.theme().warning),
                 )
             })
-            .child(Tag::secondary().small().child(if skill.managed {
-                "Managed"
-            } else {
-                "Unmanaged"
-            }))
+            .when(!skill.managed, |this| {
+                // "Unmanaged" on its own does not say what follows from it.
+                // The `?` beside it does, and Location below offers Adopt.
+                this.child(Tag::secondary().small().child("Unmanaged"))
+                    .child(help_dot(
+                        ElementId::from("unmanaged-help"),
+                        "The directory is not in Skillbase's store, so another tool may own it. \
+                         Links and visibility are read-only until you adopt it."
+                            .to_string(),
+                        cx,
+                    ))
+            })
     }
 
     /// The "Visible to" section, closed until asked for.
@@ -2360,6 +2444,11 @@ impl DetailPane {
     /// off the bottom of the window. Closed, the header still answers the
     /// question the section exists to answer — who can see this — and opening
     /// it is one click.
+    ///
+    /// Open, it is a row per agent and nothing else. The paragraphs are gone:
+    /// what a switch does is on the switch, and what a row's own state means
+    /// is on the `?` beside its name. Fourteen rows of prose said the same
+    /// three sentences over and over, differing in one path segment.
     fn visibility(&self, skill: &SkillView, cx: &mut Context<Self>) -> impl IntoElement {
         let managed = skill.managed;
         let open = self.visibility_open;
@@ -2444,18 +2533,22 @@ impl DetailPane {
                 );
                 // Shared is the one switch that moves the directory rather
                 // than adding or removing a link, because the shared directory
-                // is the store. Say which way it will move, and where to.
+                // is the store. Say which way it will move, where to, and
+                // which agents read it — on the `?`, because it is three
+                // facts and none of them changes until the switch is thrown.
                 let shared_effect = if skill.in_shared {
                     format!(
-                        "Lives at {shared_path}, which {} agents read. \
-                         Switching off moves it to {private_path}.",
-                        covered.len()
+                        "Lives at {shared_path}, which {} agents read: {}. Switching off moves \
+                         it to {private_path}.",
+                        covered.len(),
+                        covered.join(", ")
                     )
                 } else {
                     format!(
-                        "Lives at {private_path}. Switching on moves it back to \
-                         {shared_path}, which {} agents read.",
-                        covered.len()
+                        "Lives at {private_path}. Switching on moves it back to {shared_path}, \
+                         which {} agents read: {}.",
+                        covered.len(),
+                        covered.join(", ")
                     )
                 };
 
@@ -2481,8 +2574,9 @@ impl DetailPane {
                             )
                         })
                         .child(
-                            v_flex()
-                                .gap_1()
+                            h_flex()
+                                .gap_2()
+                                .items_center()
                                 .child(
                                     Switch::new("visible-shared")
                                         .small()
@@ -2496,27 +2590,7 @@ impl DetailPane {
                                             },
                                         )),
                                 )
-                                .child(
-                                    div()
-                                        .id("shared-effect")
-                                        .pl_10()
-                                        // Prose, so it stops at a measure a
-                                        // reader can track rather than running
-                                        // the full width of the pane.
-                                        .max_w(px(PROSE_MAX_WIDTH))
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        // Fourteen agent names is two lines of
-                                        // text for a fact the reader can take
-                                        // on trust; the names are a hover away.
-                                        .tooltip({
-                                            let names = covered.join(", ");
-                                            move |window, cx| {
-                                                Tooltip::new(names.clone()).build(window, cx)
-                                            }
-                                        })
-                                        .child(shared_effect),
-                                ),
+                                .child(help_dot(ElementId::from("shared-help"), shared_effect, cx)),
                         )
                         // Nothing to act on when no agent below needs a link
                         // of its own; a pair of dead buttons over an empty
@@ -2554,8 +2628,10 @@ impl DetailPane {
     ///
     /// "All" is the agents listed below, minus the ones already reached
     /// through Shared: linking those would write a link that changes nothing
-    /// and contradict the note in their own row. The Shared switch above is
-    /// their control, and the caption says so.
+    /// and contradict what their own row says. Each button's tooltip names the
+    /// agents it would act on, which is the only honest answer to "all of
+    /// what" — and it replaced a caption that said the same thing in prose
+    /// above two buttons that could say it themselves.
     fn link_all_row(
         &self,
         skill: &SkillView,
@@ -2583,76 +2659,62 @@ impl DetailPane {
         let locked = !skill.managed || self.busy;
 
         h_flex()
-            .gap_3()
+            .gap_2()
             .items_center()
-            .justify_between()
+            .justify_end()
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .max_w(px(PROSE_MAX_WIDTH))
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "Acts on the agents below that need a link of their own. The ones \
-                         reached through Shared are left alone; the Shared switch above is \
-                         their control.",
-                    ),
+                Button::new("link-all")
+                    .outline()
+                    .small()
+                    .label("Link all")
+                    .tooltip(if link_names.is_empty() {
+                        "Every agent below already reaches this skill".to_string()
+                    } else {
+                        format!(
+                            "Links {link_names}, in one write. The agents reached through Shared \
+                             are left alone."
+                        )
+                    })
+                    .disabled(locked || to_link.is_empty())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_present_all(to_link.clone(), true, window, cx)
+                    })),
             )
             .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .gap_2()
-                    .child(
-                        Button::new("link-all")
-                            .outline()
-                            .small()
-                            .label("Link all")
-                            .tooltip(if link_names.is_empty() {
-                                "Every agent below already reaches this skill".to_string()
-                            } else {
-                                format!("Links {link_names}, in one write")
-                            })
-                            .disabled(locked || to_link.is_empty())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_present_all(to_link.clone(), true, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("unlink-all")
-                            .outline()
-                            .small()
-                            .label("Unlink all")
-                            .tooltip(if unlink_names.is_empty() {
-                                "No agent below has a link to remove".to_string()
-                            } else {
-                                format!("Removes the links at {unlink_names}, in one write")
-                            })
-                            .disabled(locked || to_unlink.is_empty())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_present_all(to_unlink.clone(), false, window, cx)
-                            })),
-                    ),
+                Button::new("unlink-all")
+                    .outline()
+                    .small()
+                    .label("Unlink all")
+                    .tooltip(if unlink_names.is_empty() {
+                        "No agent below has a link to remove".to_string()
+                    } else {
+                        format!("Removes the links at {unlink_names}, in one write")
+                    })
+                    .disabled(locked || to_unlink.is_empty())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_present_all(to_unlink.clone(), false, window, cx)
+                    })),
             )
     }
 
-    /// One agent's row: its mark and name, what a switch there would do, and
-    /// the one or two switches that do it.
+    /// One agent's row: its mark and name, and the one or two switches that
+    /// change what it can see. One line, always.
     ///
     /// Presence and "switched on" are different questions for Claude Code and
-    /// Codex, so they get two switches. They used to sit one above the other,
-    /// the second indented under the first with its own paragraph of
-    /// explanation — which read as a hierarchy that is not really there, and
-    /// made two agents' rows four times the height of everybody else's. Both
-    /// switches now sit on one line in fixed lanes, and the explanation is a
-    /// tooltip on the switch it explains.
+    /// Codex, so they get two switches, side by side in fixed lanes. What
+    /// turning each off does is a tooltip on the switch it belongs to.
     ///
-    /// The row's own sentence is a tooltip where the switches already say the
-    /// same thing: "Linked at ~/.claude/skills/foo" under a dozen rows is a
-    /// page of near-identical text differing in one path segment. It comes
-    /// back on screen for the states the switches cannot say — a copy that is
-    /// not a link, a directory parked out of the way, and an agent reached
-    /// through Shared, whose switch is not what controls it.
+    /// Nothing under the row. "Linked at ~/.claude/skills/foo" under a dozen
+    /// rows is a page of near-identical text differing in one path segment, so
+    /// it is a tooltip on the row itself. The two states a switch cannot say —
+    /// a copy that is not a link, and a directory parked out of the way — get
+    /// a `?` next to the agent's name instead, which is a glyph rather than a
+    /// paragraph and still holds the whole sentence.
+    ///
+    /// The other two states used to have notes of their own and no longer do.
+    /// An agent reached through Shared, and one reached through Shared as well
+    /// as by its own link, are both things the Linked switch is already
+    /// hovered to ask about, and its tooltip now answers there.
     fn agent_row(
         &self,
         skill: &SkillView,
@@ -2672,20 +2734,15 @@ impl DetailPane {
         );
 
         let kind = skill.location_kind(agent.id);
-        // What the row has to say without being hovered. A copy is not a link,
-        // a parked directory is not where the switch says it is, and a row
-        // whose switch cannot be its own control has to say what is.
+        // The two states neither switch can say, and the only prose left in a
+        // row: a copy is not a link, and a parked directory is not where the
+        // switch says it is. Both go on the `?`.
         let note: Option<String> = match kind {
-            Some(LocationKind::Copy) => Some(format!("A separate copy at {dir}, not a link")),
-            Some(LocationKind::Disabled) => Some(format!("Parked out of the way; {dir} is empty")),
-            _ if via_shared => Some(format!(
-                "Reached through Shared: {} reads the shared directory, so it sees this skill \
-                 without a link of its own. The Shared switch above is the control.",
-                agent.display_name
+            Some(LocationKind::Copy) => Some(format!(
+                "A separate copy at {dir}, not a link. Editing the skill here does not change it."
             )),
-            _ if also_shared => Some(format!(
-                "Also reached through Shared, so removing this link does not hide it from {}.",
-                agent.display_name
+            Some(LocationKind::Disabled) => Some(format!(
+                "Parked out of the way; {dir} is empty. The Enabled switch puts it back."
             )),
             _ => None,
         };
@@ -2697,15 +2754,23 @@ impl DetailPane {
         // What turning this switch off does. The row can carry two switches a
         // word apart, and the words alone never said which was which: Linked is
         // whether the agent has the skill at all, Enabled is whether it reads
-        // the copy it has. Each switch now says its own half on hover.
+        // the copy it has. Each switch says its own half on hover — and, for
+        // the two rows Shared has a hand in, whose switch is really the
+        // control.
         let unlink = if via_shared {
             format!(
-                "On because {} reads the shared directory; the Shared switch above is what turns \
-                 it off.",
+                "On because {} reads the shared directory, so it sees this skill without a link \
+                 of its own. The Shared switch above is what turns it off.",
                 agent.display_name
             )
         } else if matches!(kind, Some(LocationKind::Origin)) {
             format!("The skill itself lives at {dir}, so there is no link here to remove.")
+        } else if also_shared {
+            format!(
+                "Off removes the link at {dir}, but {} also reads the shared directory, so the \
+                 skill stays visible to it.",
+                agent.display_name
+            )
         } else {
             format!("Off removes the link at {dir} and leaves the skill in the store.")
         };
@@ -2719,110 +2784,102 @@ impl DetailPane {
         let enabled = skill.enabled_for(agent);
         let how = disable_effect(agent, &self.roots);
 
-        v_flex()
-            .gap_1()
+        h_flex()
+            .id(ElementId::from((ElementId::from("agent-row"), agent.id)))
+            .gap_3()
+            .items_center()
+            .when(note.is_none(), |this| {
+                this.tooltip(move |window, cx| Tooltip::new(effect.clone()).build(window, cx))
+            })
             .child(
                 h_flex()
-                    .id(ElementId::from((ElementId::from("agent-row"), agent.id)))
-                    .gap_3()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
                     .items_center()
-                    .when(note.is_none(), |this| {
-                        this.tooltip(move |window, cx| {
-                            Tooltip::new(effect.clone()).build(window, cx)
-                        })
-                    })
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_2()
-                            .items_center()
-                            .child(agent_icon(agent).xsmall())
-                            .child(div().min_w_0().truncate().child(agent.display_name)),
-                    )
-                    // Two fixed lanes, so the presence switch lands on the same
-                    // column in every row whether or not the agent has an
-                    // "enabled" state, and both switches carry their own label
-                    // rather than sharing one between them.
-                    //
-                    // Sized for the small switch: its track is 8px narrower
-                    // than medium, and its label sits at text_sm instead of
-                    // text_base, so both lanes shrank by a rem from the
-                    // widths a medium switch needed.
-                    .child(h_flex().flex_shrink_0().w(rems(5.5)).justify_end().when(
-                        switchable,
-                        |this| {
-                            this.child(
-                                Switch::new((ElementId::from("enabled"), agent.id))
-                                    .small()
-                                    .checked(enabled)
-                                    .disabled(locked || self.busy)
-                                    .label("Enabled")
-                                    // The visible label has room for one word;
-                                    // a reader who cannot see which row it sits
-                                    // in needs the agent named, and this
-                                    // switch moves files on disk.
-                                    .accessibility_label(format!("{} enabled", agent.display_name))
-                                    .tooltip(how)
-                                    .on_click(cx.listener(
-                                        move |this, checked: &bool, window, cx| {
-                                            this.set_enabled(agent, *checked, window, cx)
-                                        },
-                                    )),
-                            )
-                        },
-                    ))
-                    .child(
-                        h_flex().flex_shrink_0().w(rems(4.5)).justify_end().child(
-                            // "Linked", not "Visible": this switch adds or
-                            // removes the link, which is the word the row's
-                            // own caption and its notification already use.
-                            // "Visible" and "Enabled" side by side read as the
-                            // same question asked twice.
-                            Switch::new((ElementId::from("visible"), agent.id))
-                                .small()
-                                // On for an agent that is reached through
-                                // Shared, because it is. The section header
-                                // has always counted those agents as reached;
-                                // the row used to sit at Off beside it and say
-                                // the opposite about the same agent.
-                                .checked(present || via_shared)
-                                // ...and not the control that put it there, so
-                                // it does not offer to change it. The note
-                                // below the row says where the control is.
-                                .disabled(!managed || self.busy || via_shared)
-                                .label("Linked")
-                                .tooltip(unlink)
-                                .accessibility_label(if via_shared {
-                                    format!(
-                                        "{} reached through Shared, not linked separately",
-                                        agent.display_name
-                                    )
-                                } else {
-                                    format!("{} linked", agent.display_name)
-                                })
-                                .on_click(cx.listener(move |this, checked: &bool, window, cx| {
-                                    // What is written to disk is unchanged.
-                                    // The switch is clickable only where what
-                                    // it shows *is* the link state, so
-                                    // `checked` is never the Shared reading
-                                    // and this cannot write a link the row
-                                    // did not ask for.
-                                    this.set_present(agent, *checked, window, cx)
-                                })),
-                        ),
-                    ),
+                    .child(agent_icon(agent).xsmall())
+                    .child(div().min_w_0().truncate().child(agent.display_name))
+                    .children(note.map(|note| {
+                        help_dot(
+                            ElementId::from((ElementId::from("agent-help"), agent.id)),
+                            note,
+                            cx,
+                        )
+                    })),
             )
-            .when_some(note, |this, note| {
-                this.child(
-                    div()
-                        .pl_6()
-                        .max_w(px(PROSE_MAX_WIDTH))
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(note),
-                )
-            })
+            // Two fixed lanes, so the presence switch lands on the same
+            // column in every row whether or not the agent has an
+            // "enabled" state, and both switches carry their own label
+            // rather than sharing one between them.
+            //
+            // Sized for the small switch: its track is 8px narrower
+            // than medium, and its label sits at text_sm instead of
+            // text_base, so both lanes shrank by a rem from the
+            // widths a medium switch needed.
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .w(rems(5.5))
+                    .justify_end()
+                    .when(switchable, |this| {
+                        this.child(
+                            Switch::new((ElementId::from("enabled"), agent.id))
+                                .small()
+                                .checked(enabled)
+                                .disabled(locked || self.busy)
+                                .label("Enabled")
+                                // The visible label has room for one word;
+                                // a reader who cannot see which row it sits
+                                // in needs the agent named, and this
+                                // switch moves files on disk.
+                                .accessibility_label(format!("{} enabled", agent.display_name))
+                                .tooltip(how)
+                                .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                                    this.set_enabled(agent, *checked, window, cx)
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                h_flex().flex_shrink_0().w(rems(4.5)).justify_end().child(
+                    // "Linked", not "Visible": this switch adds or
+                    // removes the link, which is the word the row's
+                    // own caption and its notification already use.
+                    // "Visible" and "Enabled" side by side read as the
+                    // same question asked twice.
+                    Switch::new((ElementId::from("visible"), agent.id))
+                        .small()
+                        // On for an agent that is reached through
+                        // Shared, because it is. The section header
+                        // has always counted those agents as reached;
+                        // the row used to sit at Off beside it and say
+                        // the opposite about the same agent.
+                        .checked(present || via_shared)
+                        // ...and not the control that put it there, so
+                        // it does not offer to change it. Its own
+                        // tooltip says where the control is.
+                        .disabled(!managed || self.busy || via_shared)
+                        .label("Linked")
+                        .tooltip(unlink)
+                        .accessibility_label(if via_shared {
+                            format!(
+                                "{} reached through Shared, not linked separately",
+                                agent.display_name
+                            )
+                        } else {
+                            format!("{} linked", agent.display_name)
+                        })
+                        .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                            // What is written to disk is unchanged.
+                            // The switch is clickable only where what
+                            // it shows *is* the link state, so
+                            // `checked` is never the Shared reading
+                            // and this cannot write a link the row
+                            // did not ask for.
+                            this.set_present(agent, *checked, window, cx)
+                        })),
+                ),
+            )
             .into_any_element()
     }
 
@@ -3541,16 +3598,17 @@ impl DetailPane {
     /// Read from outside the pane: every way out of an edit — another skill,
     /// another scope, Cmd-W, Cmd-Q — asks this before it takes the work away.
     ///
-    /// Not the same question as which tab wears a dot. Both tabs that write
-    /// `SKILL.md` answer for the whole file here, whichever of them the edit
-    /// was made in: Save has to stay live, and switching away has to still ask,
-    /// for work typed into the Overview and read from the `SKILL.md` tab.
+    /// Not the same question as which tab wears a dot. The Overview answers
+    /// for `SKILL.md` here even though it does not edit it, because it is the
+    /// file that tab would save: a user who typed in the editor, came back to
+    /// the Overview and then picked another skill has to be asked, or the work
+    /// goes without a word.
     pub(crate) fn showing_dirty(&self) -> bool {
         match &self.showing {
-            // The Overview edits `SKILL.md`'s frontmatter, so it saves what the
-            // `SKILL.md` tab saves and is dirty when it is.
-            Showing::Overview => self.edits.any(),
-            Showing::File(rel) if rel == SKILL_FILE_NAME => self.edits.any(),
+            // Save on the Overview writes `SKILL.md`, so it is live exactly
+            // when that file has something to write.
+            Showing::Overview => self.source_edited,
+            Showing::File(rel) if rel == SKILL_FILE_NAME => self.source_edited,
             Showing::File(rel) => self
                 .open
                 .iter()
@@ -3562,8 +3620,8 @@ impl DetailPane {
     /// The file the active tab writes, relative to the skill directory.
     fn showing_file(&self) -> SharedString {
         match &self.showing {
-            // The Overview edits `SKILL.md`'s frontmatter, so the file it has
-            // to write is that one.
+            // The Overview reads `SKILL.md`, so that is the file its Save
+            // writes.
             Showing::Overview => SKILL_FILE_NAME.into(),
             Showing::File(rel) => rel.clone(),
         }
@@ -3938,20 +3996,20 @@ impl DetailPane {
     /// instead of reading as part of it.
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // The dot marks where the unsaved work was done, not every tab that
-        // would write it: a user who has only renamed the skill has not opened
-        // `SKILL.md`, and a dot on it would say they had.
+        // would write it. The Overview reads `SKILL.md` rather than editing
+        // it, so a dot there would point at a tab with nothing to fix in it.
         let skill_file = Showing::File(SKILL_FILE_NAME.into());
         let mut labels: Vec<(Showing, SharedString, bool, bool)> = vec![
             (
                 Showing::Overview,
                 "Overview".into(),
-                self.edits.dot(&Showing::Overview),
+                Showing::Overview.dot(self.source_edited),
                 false,
             ),
             (
                 skill_file.clone(),
                 SKILL_FILE_NAME.into(),
-                self.edits.dot(&skill_file),
+                skill_file.dot(self.source_edited),
                 false,
             ),
         ];
@@ -4279,6 +4337,30 @@ fn row_note(text: &'static str, cx: &App) -> impl IntoElement + use<> {
         .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child(text)
+}
+
+/// A `?` a reader can hover for the sentence a row would otherwise carry under
+/// it.
+///
+/// The rows in "Visible to" each used to sit above a paragraph explaining
+/// them, which made a dozen switches into a page of prose. What a row's state
+/// means is worth keeping and is worth reading once, so it goes here: a glyph
+/// the width of the switch labels beside it, and the sentence a hover away.
+// `use<>`: the element owns everything it needs, so it must not be tied to the
+// borrow of `App` the colours were read through.
+fn help_dot(id: ElementId, text: String, cx: &App) -> impl IntoElement + use<> {
+    h_flex()
+        .id(id)
+        .flex_shrink_0()
+        .size_4()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(cx.theme().muted)
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child("?")
+        .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
 }
 
 /// One agent's share of linking or unlinking, appended to `done`.
@@ -4636,20 +4718,25 @@ impl Render for DetailPane {
 }
 
 impl DetailPane {
-    /// The two frontmatter fields the Overview edits, and what saving one
-    /// costs.
+    /// What the skill's frontmatter says it is: the name it gives itself and
+    /// the description an agent matches against.
     ///
-    /// The name is here as well as in the identity row above, because the row
-    /// is the pane's title and a title is not a control. Changing it is the
-    /// thing the row cannot do, and doing it by hand in the SKILL.md tab left
-    /// the directory behind under the old name.
+    /// Read out, not edited. Both are lines in `SKILL.md`, and the `SKILL.md`
+    /// tab is where a line in `SKILL.md` is changed — a second control on the
+    /// same two keys meant the file could be edited from two places at once
+    /// and one of them had to win.
     ///
-    /// Both fields go quiet for a skill whose frontmatter does not parse: there
-    /// is nothing to load into them, and a save would have nothing to put a
-    /// value into. The band above says so and points at the tab that fixes it.
-    fn fields(&self, skill: &SkillView, cx: &mut Context<Self>) -> impl IntoElement {
-        let locked = skill.parse_error.is_some() || self.busy;
-        let problem = self.name_edit(cx).and_then(|_| self.name_problem(cx));
+    /// Renaming is the exception, and it is not an edit to this text: the name
+    /// is the directory's name too, so it moves a folder. It has its own
+    /// action in the band above.
+    ///
+    /// Both go quiet for a skill whose frontmatter does not parse: there is
+    /// nothing to read out of it. The band above says so and points at the tab
+    /// that fixes it.
+    fn summary(&self, skill: &SkillView, cx: &mut Context<Self>) -> impl IntoElement {
+        // An empty value is a fact about the file, not a blank: a skill with
+        // no description is one an agent has nothing to match against.
+        let muted = cx.theme().muted_foreground;
 
         v_flex()
             .flex_shrink_0()
@@ -4657,56 +4744,31 @@ impl DetailPane {
             .max_w(px(PROSE_MAX_WIDTH))
             .child(
                 v_flex()
-                    .gap_2()
-                    .child(Label::new("Name"))
-                    .child(Input::new(&self.name).small().disabled(locked))
-                    // One line, under the field it is about: what a name has to
-                    // look like and what changing it moves, until it is a name
-                    // that cannot be used, and then why.
-                    .child(
+                    .gap_1()
+                    .child(section_title("Name", cx))
+                    .child(if self.loaded_name.is_empty() {
                         div()
-                            .text_xs()
-                            .text_color(match &problem {
-                                Some(_) => cx.theme().danger,
-                                None => cx.theme().muted_foreground,
-                            })
-                            .child(problem.clone().unwrap_or_else(|| {
-                                "kebab-case, and the directory's name as well: saving a new one \
-                                 moves the folder on disk."
-                                    .into()
-                            })),
-                    )
+                            .text_sm()
+                            .text_color(muted)
+                            .child("No name in the frontmatter")
+                    } else {
+                        div().text_sm().child(self.loaded_name.clone())
+                    })
                     .children(issue_lines(issues_for(&skill.issues, "name"), cx)),
             )
             .child(
                 v_flex()
-                    .gap_2()
-                    .child(Label::new("Description"))
-                    .child(
-                        // Tall enough for the descriptions people actually
-                        // write. A skill's description is the sentence an agent
-                        // matches against, so it runs long, and at three lines
-                        // the field cut the fourth in half and looked broken
-                        // rather than scrollable.
-                        Textarea::new(&self.description)
-                            .h(rems(7.5))
-                            .disabled(locked),
-                    )
+                    .gap_1()
+                    .child(section_title("Description", cx))
+                    .child(if self.loaded_description.is_empty() {
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("No description in the frontmatter")
+                    } else {
+                        div().text_sm().child(self.loaded_description.clone())
+                    })
                     .children(issue_lines(issues_for(&skill.issues, "description"), cx)),
-            )
-            // Before they type, not after they have lost a comment. A
-            // `SKILL.md` is reproduced byte for byte until a frontmatter field
-            // is edited; from then on the block is written out again from the
-            // values in it.
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "Saving either field rewrites the whole frontmatter block: comments in it \
-                         are dropped and quoting is normalised. Everything below it is left as it \
-                         is.",
-                    ),
             )
     }
 
@@ -4758,13 +4820,13 @@ impl DetailPane {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
-                                    "The Name and Description fields stay empty until the \
+                                    "The name and description below stay empty until the \
                                      frontmatter parses. Fix it in the SKILL.md tab and save.",
                                 ),
                         ),
                 )
             })
-            .child(self.fields(skill, cx))
+            .child(self.summary(skill, cx))
             // Location before Visibility: the switches below are read-only
             // until an unmanaged skill is adopted, and Adopt lives in
             // Location. Ownership answered first, then what it allows.
@@ -4850,8 +4912,8 @@ fn rename_problem(
 /// The half of [`rename_problem`] that only reads memory: the rules creation
 /// applies, plus the one a rename raises on its own — a name cannot be emptied.
 ///
-/// Split out because the pane asks this question while it renders, and the
-/// other half is a syscall.
+/// Split out because the other half is a syscall, and the two are asked
+/// separately when only one of them can have changed.
 fn name_rules(typed: &str, skill: &SkillView, scan: Option<&Scan>) -> Option<SharedString> {
     if typed == skill.name.as_ref() {
         return None;
@@ -4878,7 +4940,7 @@ fn name_rules(typed: &str, skill: &SkillView, scan: Option<&Scan>) -> Option<Sha
 ///
 /// The scan cannot answer this, because a directory can sit beside the store
 /// without holding a skill the scan would list. Call it when the name changes,
-/// not while rendering: [`DetailPane::name_taken`] holds the answer in between.
+/// not while rendering: [`RenameCheck`] holds the answer in between.
 fn destination_taken(typed: &str, skill: &SkillView, roots: &Roots) -> Option<SharedString> {
     if typed == skill.name.as_ref() {
         return None;
@@ -4901,9 +4963,9 @@ mod tests {
 
     use super::super::model::{Scan, SkillView};
     use super::{
-        FileNode, MAX_ROWS_OPEN, SKILL_FILE_NAME, Showing, SkillFileEdits, absent_sentence,
-        destination_taken, files_open_by_default, files_summary, fs, in_a_list, name_rules,
-        rename_problem, upstream_for,
+        FileNode, MAX_ROWS_OPEN, SKILL_FILE_NAME, Showing, absent_sentence, destination_taken,
+        files_open_by_default, files_summary, fs, in_a_list, name_rules, rename_problem,
+        upstream_for,
     };
 
     /// A directory of this test's own, named so two runs cannot collide.
@@ -5062,51 +5124,27 @@ mod tests {
         );
     }
 
-    /// Both tabs write `SKILL.md`, so both have to offer Save and both have to
-    /// ask before the work is taken away — but the dot says where the work is,
-    /// and a file the user has not opened is not where it is.
+    /// The `SKILL.md` tab is the only one the pane's own editor writes, so it
+    /// is the only one that can wear the dot. The Overview saves the same file
+    /// but never edits it, and a dot there would point at a tab with nothing
+    /// in it to fix.
     #[test]
-    fn only_the_tab_the_edit_was_made_in_wears_the_dot() {
+    fn only_the_skill_file_tab_wears_the_dot() {
         let overview = Showing::Overview;
         let file = Showing::File(SKILL_FILE_NAME.into());
 
-        let nothing = SkillFileEdits::default();
-        assert!(!nothing.any());
-        assert!(!nothing.dot(&overview));
-        assert!(!nothing.dot(&file));
+        // Nothing typed anywhere.
+        assert!(!overview.dot(false));
+        assert!(!file.dot(false));
 
-        // Renaming the skill in the Name field. `SKILL.md` is what a save
-        // writes, so the file is dirty; the user has not opened it, so its tab
-        // is not marked.
-        let renamed = SkillFileEdits {
-            fields: true,
-            body: false,
-        };
-        assert!(renamed.any(), "the file still has to be saveable");
-        assert!(renamed.dot(&overview));
-        assert!(!renamed.dot(&file));
-
-        // Typing in the editor. The Overview shows the same file's frontmatter
-        // but the user did not type there.
-        let edited = SkillFileEdits {
-            fields: false,
-            body: true,
-        };
-        assert!(edited.any());
-        assert!(!edited.dot(&overview));
-        assert!(edited.dot(&file));
-
-        // Both, which is one save and two places with work in them.
-        let both = SkillFileEdits {
-            fields: true,
-            body: true,
-        };
-        assert!(both.dot(&overview));
-        assert!(both.dot(&file));
+        // Typed into the editor. The Overview reads the same file's
+        // frontmatter, but the user did not type there.
+        assert!(!overview.dot(true));
+        assert!(file.dot(true));
 
         // A bundled file keeps its own dirty flag; this rule has nothing to say
         // about it.
-        assert!(!both.dot(&Showing::File("references/api.md".into())));
+        assert!(!Showing::File("references/api.md".into()).dot(true));
     }
 
     #[test]
