@@ -130,8 +130,8 @@ pub use remote::{
 };
 pub use skill::{SKILL_FILE_NAME, Skill};
 pub use skillsh::{
-    DEFAULT_LIMIT, MAX_LIMIT, MIN_QUERY_LEN, SEARCH_URL, SearchError, SearchHit, SearchResults,
-    SkillsSh, resolve,
+    DEFAULT_LIMIT, HitDetail, MAX_LIMIT, MIN_QUERY_LEN, SEARCH_URL, SearchError, SearchHit,
+    SearchResults, SkillsSh, describe, resolve,
 };
 pub use slug::{FALLBACK_SLUG, is_kebab_case, slugify};
 pub use usage::{

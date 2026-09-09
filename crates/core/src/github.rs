@@ -1130,6 +1130,36 @@ impl<H: Http> GitHub<H> {
         Ok(written)
     }
 
+    /// One file's bytes, pinned to a commit, or `None` when the repository does
+    /// not hold it.
+    ///
+    /// From `raw.githubusercontent.com`, which is not on the API rate limit, so
+    /// reading a file costs nothing against the hourly budget. Only the lookups
+    /// that work out `commit_sha` do.
+    ///
+    /// A missing file is a `None` rather than an error: the caller asked
+    /// whether it is there, and for a file that may or may not exist a 404 is
+    /// an answer.
+    pub fn fetch_file(
+        &self,
+        repo: &RepoRef,
+        commit_sha: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, GitHubError> {
+        let url = format!(
+            "{}/{}/{commit_sha}/{}",
+            self.raw_base,
+            repo.slug(),
+            encode_path(path.trim_matches('/'))
+        );
+        let response = self.fetch_bytes(&url)?;
+        match response.status {
+            200..=299 => Ok(Some(response.body)),
+            404 => Ok(None),
+            _ => Err(status_error(&url, &response)),
+        }
+    }
+
     /// A `GET` to a host that serves bytes rather than JSON — codeload for an
     /// archive, raw for one file. Neither is on the API rate limit, so neither
     /// carries rate limit headers to record, and a status is left to the

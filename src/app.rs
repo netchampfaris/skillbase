@@ -5,6 +5,7 @@
 //! field. The detail pane owns editing and the mutations that follow from it,
 //! and asks for a re-scan when it has changed the disk.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -27,9 +28,10 @@ use gpui_kit::{
     div, px,
 };
 use skillbase_core::{
-    FetchError, GITHUB_TOKEN_ENV, GitHub, InstallOptions, Installed, LocalState, Provenance,
-    RateLimit, RemoteCache, RepoRef, Roots, SkillLocation, TokenSource, UpdateReport, UpdateStatus,
-    UreqHttp, Usage, check_updates, github_token_source, local_state, refresh_github_token,
+    AgentDef, FetchError, GITHUB_TOKEN_ENV, GitHub, InstallError, InstallOptions, Installed,
+    Installer, LocalState, Outcome, Provenance, RateLimit, RemoteCache, RepoRef, Roots,
+    SkillLocation, TokenSource, UpdateReport, UpdateStatus, UreqHttp, Usage, check_updates,
+    github_token_source, local_state, refresh_github_token,
 };
 
 use crate::menus::{
@@ -38,15 +40,16 @@ use crate::menus::{
     ShowSettings, ToggleSidebar, UnlinkMarked, UpdateSkill,
 };
 use crate::ui::detail::{DetailEvent, DetailPane, Proceed};
-use crate::ui::discover::{InstallChoice, Installing, SearchState};
+use crate::ui::discover::{Described, InstallChoice, Installing, SearchState, StartedFrom};
 use crate::ui::list::{LIST_MAX_WIDTH, LIST_MIN_WIDTH, LIST_WIDTH, Marks};
 use crate::ui::model::{
     Library, LoadedPreferences, Preferences, Scan, Scope, SkillSort, SkillView, in_words,
     resolve_roots,
 };
 use crate::ui::{
-    BAND_HEIGHT, DETAIL_MIN_WIDTH, TRAFFIC_LIGHT_INSET, cache_failure_notification, capitalized,
-    drag_band, install_skill, take_cache_failure,
+    BAND_HEIGHT, DETAIL_MIN_WIDTH, Notice, TRAFFIC_LIGHT_INSET, cache_failure_notification,
+    cannot_see, capitalized, drag_band, install_skill, install_warnings, link_label, push_notice,
+    reach_sentence, report, take_cache_failure, wrote_sentence,
 };
 
 /// Where the scan has got to. A scan of every scope on a busy machine takes
@@ -166,6 +169,11 @@ pub struct Skillbase {
     /// Owned here rather than by the dialog because a dialog's builder runs
     /// again on every frame and keeps nothing between them.
     pub(crate) install_choices: Vec<InstallChoice>,
+    /// Which view opened the chooser, so that installing what is ticked lands
+    /// where the install that raised it would have landed. A repository holding
+    /// several skills asks this question from Discover and from the Install
+    /// from GitHub dialog alike.
+    pub(crate) install_choices_from: StartedFrom,
     /// The Discover pane's search field.
     pub(crate) discover_query: Entity<InputState>,
     /// What skills.sh last said, or why it did not say anything.
@@ -173,6 +181,13 @@ pub struct Skillbase {
     /// Bumped on every keystroke, so a search that lands after a newer one was
     /// typed is dropped rather than shown.
     pub(crate) discover_generation: u64,
+    /// The result row the user has opened, if any. One at a time: opening a row
+    /// asks GitHub where the skill is, and a page of them opened at once would
+    /// spend the hourly budget on rows nobody read.
+    pub(crate) discover_open: Option<SharedString>,
+    /// What opening a row found, kept by row id for as long as the results
+    /// stand, so closing and reopening one does not ask again.
+    pub(crate) discover_details: HashMap<SharedString, Described>,
     /// Where the GitHub token came from at startup, once the lookup has
     /// finished. Read once, because neither the environment nor a `gh` login is
     /// watched for changes.
@@ -237,9 +252,15 @@ pub struct Skillbase {
     _token_task: Option<Task<()>>,
     _updates_task: Option<Task<()>>,
     pub(crate) _discover_task: Option<Task<()>>,
+    /// The read of one result row's SKILL.md. Held so that opening another row
+    /// drops the one before it.
+    pub(crate) _describe_task: Option<Task<()>>,
     /// The install now in flight. Kept rather than detached, because Cancel
     /// needs something to drop.
     pub(crate) install_task: Option<Task<()>>,
+    /// Repaints the progress strip while a job runs, so the strip can say how
+    /// long the download has been going. Dropped when nothing is running.
+    pub(crate) _progress_task: Option<Task<()>>,
     /// The batch update now in flight, kept for the same reason.
     update_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -359,9 +380,12 @@ impl Skillbase {
             installing: None,
             updating: None,
             install_choices: Vec::new(),
+            install_choices_from: StartedFrom::Elsewhere,
             discover_query,
             discover: SearchState::Idle,
             discover_generation: 0,
+            discover_open: None,
+            discover_details: HashMap::new(),
             token_source: None,
             updates: UpdateState::Idle,
             rate_limit: None,
@@ -379,7 +403,9 @@ impl Skillbase {
             _token_task: None,
             _updates_task: None,
             _discover_task: None,
+            _describe_task: None,
             install_task: None,
+            _progress_task: None,
             update_task: None,
             _subscriptions: subscriptions,
         };
@@ -685,14 +711,16 @@ impl Skillbase {
         // separate facts, and together they are the reason the limit is about
         // to be spent all over again.
         if let Some(reason) = cache_failure {
-            window.push_notification(
-                Notification::warning(format!(
-                    "{}. What this check found could not be kept, so the next check spends \
-                     GitHub's whole hourly budget asking the same questions again.",
-                    capitalized(&reason)
-                ))
-                .title("Check not recorded")
-                .autohide(false),
+            push_notice(
+                Notice::warning(
+                    "Check not recorded",
+                    format!(
+                        "{}. What this check found could not be kept, so the next check spends \
+                         GitHub's whole hourly budget asking the same questions again.",
+                        capitalized(&reason)
+                    ),
+                ),
+                window,
                 cx,
             );
         }
@@ -778,6 +806,7 @@ impl Skillbase {
             Installing::new("updating", "checking which copies can be replaced")
                 .cancelled_by(cancel.clone()),
         );
+        self.tick_progress(window, cx);
         cx.notify();
 
         let roots = self.roots.clone();
@@ -1164,6 +1193,145 @@ impl Skillbase {
         self.rescan(Some(name), window, cx);
     }
 
+    /// Adopt a skill that has just been downloaded, without taking the window
+    /// away from what the user was doing.
+    ///
+    /// Discover is a place to install several things from, and a work area that
+    /// jumps to the library after each one is what stops that. The scan still
+    /// runs — it is what makes the library, the sidebar counts and the Discover
+    /// rows agree with the disk — it just does not move the view.
+    ///
+    /// Which agents can see the skill is still the next question. It is
+    /// answered in the notification instead: see
+    /// [`Skillbase::report_installed`].
+    pub(crate) fn installed_in_place(
+        &mut self,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.check_after_scan = true;
+        self.rescan(Some(name), window, cx);
+    }
+
+    /// Say what an install wrote, and whether the agents on this machine can
+    /// see it.
+    ///
+    /// One notification rather than two, because "three files landed" and "your
+    /// agent cannot read them" are two halves of one answer. The button is
+    /// there because the alternative is the **Visible to** switch at the foot
+    /// of the detail pane, which is a long scroll away from a user who has just
+    /// been told the skill is installed.
+    pub(crate) fn report_installed(
+        &mut self,
+        title: &str,
+        installed: &Installed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let blind = cannot_see(&self.roots, &installed.name);
+        let mut message = wrote_sentence(installed, &self.roots);
+        if let Some(reach) = reach_sentence(&self.roots, &blind, &installed.name, false) {
+            message.push(' ');
+            message.push_str(&reach);
+        }
+        let targets = vec![(
+            SharedString::from(installed.name.clone()),
+            installed.dir.clone(),
+        )];
+        self.push_install_notification(title, message, blind, targets, window, cx);
+        install_warnings(installed, window, cx);
+    }
+
+    /// The notification an install ends with.
+    ///
+    /// Plain success when every agent on the machine can already read the
+    /// store. When some cannot, it is a [`Notice`]: it names them and carries
+    /// the button that links them, and it stays until it is cleared, because a
+    /// sentence about an agent that cannot see the skill is worth nothing if
+    /// it goes before it can be acted on.
+    ///
+    /// `targets` is what the button links, as the name each skill landed under
+    /// and the directory it landed in.
+    pub(crate) fn push_install_notification(
+        &mut self,
+        title: &str,
+        message: String,
+        blind: Vec<&'static AgentDef>,
+        targets: Vec<(SharedString, PathBuf)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if blind.is_empty() {
+            window.push_notification(Notification::success(message).title(title.to_string()), cx);
+            return;
+        }
+
+        let label = link_label(&blind);
+        let this = cx.entity().downgrade();
+        push_notice(
+            Notice::info(title.to_string(), message).action(label, move |window, cx| {
+                let blind = blind.clone();
+                let targets = targets.clone();
+                this.update(cx, |this, cx| {
+                    this.link_installed(targets, blind, window, cx);
+                })
+                .ok();
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Link skills that have just been installed into the agents that cannot
+    /// see them.
+    ///
+    /// One write for the whole set rather than one per agent, so a link into
+    /// four agents is one notification and one scan.
+    pub(crate) fn link_installed(
+        &mut self,
+        targets: Vec<(SharedString, PathBuf)>,
+        agents: Vec<&'static AgentDef>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if targets.is_empty() || agents.is_empty() {
+            return;
+        }
+        let roots = self.roots.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let linked = cx
+                .background_spawn(async move {
+                    let installer = Installer::new(roots);
+                    let mut done = Outcome::default();
+                    for (name, origin) in &targets {
+                        for agent in &agents {
+                            // A refusal on the third link still leaves the
+                            // first two, and the notification has to say so
+                            // rather than report the refusal alone.
+                            match installer.link(name, origin, agent) {
+                                Ok(outcome) => done.changes.extend(outcome.changes),
+                                Err(source) => return Err(InstallError::partial(done, source)),
+                            }
+                        }
+                    }
+                    Ok(done)
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                report("Linked", "Could not link", linked, &this.roots, window, cx);
+                // Whatever it said: the links are what the counts and the
+                // agent rows are drawn from, and a refusal part-way through
+                // still moved them.
+                this.rescan(None, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Re-read the machine: scan every scope, count invocations again, and ask
     /// GitHub what has moved on.
     ///
@@ -1213,14 +1381,16 @@ impl Skillbase {
         let path = Preferences::path(&self.roots);
         self._notice_task = Some(cx.spawn_in(window, async move |_, cx| {
             cx.update(|window, cx| {
-                window.push_notification(
-                    Notification::warning(format!(
-                        "{problem} Skillbase started on the defaults, and the next setting you \
-                         change writes {} back over what is in it now.",
-                        path.display()
-                    ))
-                    .title("Could not read the settings")
-                    .autohide(false),
+                push_notice(
+                    Notice::warning(
+                        "Could not read the settings",
+                        format!(
+                            "{problem} Skillbase started on the defaults, and the next setting \
+                             you change writes {} back over what is in it now.",
+                            path.display()
+                        ),
+                    ),
+                    window,
                     cx,
                 );
             })
@@ -1290,14 +1460,13 @@ impl Skillbase {
                 .await;
             if let Err(error) = written {
                 cx.update(|window, cx| {
-                    window.push_notification(
-                        // Stays until it is dismissed. A failure the user
-                        // glanced away from would otherwise leave the
-                        // interface showing a preference the disk never
-                        // took, with nothing left on screen to say so.
-                        Notification::error(error.to_string())
-                            .title("Could not save the setting")
-                            .autohide(false),
+                    // Stays until it is cleared. A failure the user glanced
+                    // away from would otherwise leave the interface showing a
+                    // preference the disk never took, with nothing left on
+                    // screen to say so.
+                    push_notice(
+                        Notice::error("Could not save the setting", error.to_string()),
+                        window,
                         cx,
                     );
                 })
@@ -1529,20 +1698,19 @@ fn report_update_all(
 
     let clean =
         failures.is_empty() && held_back.is_empty() && unsourced.is_empty() && staging.is_none();
-    let notification = if written > 0 && clean {
-        Notification::success(message).title("Updated")
+    if written > 0 && clean {
+        window.push_notification(Notification::success(message).title("Updated"), cx);
     } else if written == 0 {
         // Nothing changed on screen, so this sentence is the only thing that
-        // says why. It stays until it is dismissed.
-        Notification::warning(message)
-            .title("Nothing was updated")
-            .autohide(false)
+        // says why. It stays until it is cleared.
+        push_notice(Notice::warning("Nothing was updated", message), window, cx);
     } else {
-        Notification::warning(message)
-            .title(format!("Updated {written} of {behind}"))
-            .autohide(false)
-    };
-    window.push_notification(notification, cx);
+        push_notice(
+            Notice::warning(format!("Updated {written} of {behind}"), message),
+            window,
+            cx,
+        );
+    }
     // Every skill here was installed through `install_skill`, so a failed
     // install record is reported the same way a single install reports it.
     if let Some(reason) = take_cache_failure() {

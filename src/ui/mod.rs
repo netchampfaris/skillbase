@@ -7,14 +7,21 @@ pub mod model;
 pub mod settings;
 pub mod sidebar;
 
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Mutex;
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{Icon, IconName, InteractiveElementExt as _, WindowExt as _, h_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, StyledExt as _,
+    WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Context, Div, InteractiveElement as _, IntoElement, MouseButton, Pixels, Render,
-    SharedString, Stateful, Window, WindowControlArea, div, px,
+    Anchor, AnyElement, App, Context, Div, Global, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement as _, Pixels, Render, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div, px,
 };
 use skillbase_core::{
     AgentDef, CacheWriteError, FetchError, GitHub, GitHubError, InstallError, InstallOptions,
@@ -22,7 +29,7 @@ use skillbase_core::{
     github_token_source, install_from_github,
 };
 
-use crate::ui::model::{display_path, in_words};
+use crate::ui::model::{display_path, in_words, join_and};
 
 /// The reading measure for a line of prose in the detail pane: a description,
 /// an explanatory caption, a tooltip's backing text. Wider than this and a
@@ -147,6 +154,258 @@ pub fn agent_icon(agent: &'static AgentDef) -> Icon {
         Icon::empty().path(format!("icons/agents/{}.svg", agent.id))
     } else {
         Icon::new(IconName::Bot)
+    }
+}
+
+// ---------------------------------------------------------------- notices
+
+/// A message that stays on screen until the reader clears it.
+///
+/// Most of what Skillbase says is a toast: it names something the user can see
+/// for themselves and goes after five seconds. A notice is the other kind —
+/// the only account of something that did not happen, or an offer the user has
+/// to be given time to take. Nothing else on screen records that an install
+/// failed, so the sentence cannot vanish on a timer.
+///
+/// Notices do not each get their own toast. Every outstanding one is a row in
+/// a single card, so a second failure lands under the first rather than on top
+/// of it, and each row carries the button that clears it. The card sits in the
+/// bottom-right corner, away from the toolbar and the Save button in the top
+/// right of the content area, and away from the toasts that report what did
+/// work.
+#[derive(Clone)]
+pub struct Notice {
+    kind: NoticeKind,
+    title: SharedString,
+    message: SharedString,
+    action: Option<NoticeAction>,
+}
+
+/// How serious a [`Notice`] is, which is the icon it gets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoticeKind {
+    Error,
+    Warning,
+    Info,
+}
+
+/// Something to run later, from a button on a notice or once an undo has
+/// finished. Shared rather than owned because a notice is rebuilt on every
+/// frame it is on screen.
+type Callback = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// The one thing a notice offers to do about itself: undo a delete, link a
+/// skill into the agents that cannot see it.
+#[derive(Clone)]
+struct NoticeAction {
+    label: SharedString,
+    run: Callback,
+}
+
+impl Notice {
+    /// Something did not happen, and this is the only account of why.
+    pub fn error(title: impl Into<SharedString>, message: impl Into<SharedString>) -> Self {
+        Self::new(NoticeKind::Error, title, message)
+    }
+
+    /// Something happened, and left a state the user would want to know about.
+    pub fn warning(title: impl Into<SharedString>, message: impl Into<SharedString>) -> Self {
+        Self::new(NoticeKind::Warning, title, message)
+    }
+
+    /// Something happened, and there is one more thing worth doing about it.
+    pub fn info(title: impl Into<SharedString>, message: impl Into<SharedString>) -> Self {
+        Self::new(NoticeKind::Info, title, message)
+    }
+
+    fn new(
+        kind: NoticeKind,
+        title: impl Into<SharedString>,
+        message: impl Into<SharedString>,
+    ) -> Self {
+        Self {
+            kind,
+            title: title.into(),
+            message: message.into(),
+            action: None,
+        }
+    }
+
+    /// Offer one thing to do about it. Taking the offer clears the notice.
+    pub fn action(
+        mut self,
+        label: impl Into<SharedString>,
+        run: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.action = Some(NoticeAction {
+            label: label.into(),
+            run: Rc::new(run),
+        });
+        self
+    }
+
+    /// The icon this kind of notice carries, in the colour the theme gives it.
+    fn icon(&self, cx: &App) -> Icon {
+        match self.kind {
+            NoticeKind::Error => Icon::new(IconName::CircleX).text_color(cx.theme().danger),
+            NoticeKind::Warning => {
+                Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning)
+            }
+            NoticeKind::Info => Icon::new(IconName::Info).text_color(cx.theme().info),
+        }
+    }
+}
+
+/// Every notice that has not been cleared, oldest first.
+///
+/// Application-global rather than held by a view: a notice is pushed from
+/// wherever the operation finished — a background task's completion, a
+/// notification's own button — and every one of those has an `App` and a
+/// `Window` and nothing else.
+#[derive(Default)]
+struct Notices {
+    /// The outstanding notices, each with the key its buttons are identified
+    /// by. Keys are never reused, so a row's Dismiss cannot come to mean a
+    /// different row after the one above it goes.
+    items: Vec<(u64, Notice)>,
+    /// The last key handed out.
+    last_key: u64,
+}
+
+impl Global for Notices {}
+
+/// The notification the notices are rendered in. Pushing again under the same
+/// id replaces the card rather than stacking a second one behind it.
+struct NoticeCard;
+
+/// How many notices are kept. Past this the oldest goes: a card holding
+/// twenty unread failures is not read either, and the newest are the ones the
+/// user is still in a position to act on.
+const MAX_NOTICES: usize = 12;
+
+/// The tallest the card gets before its rows scroll inside it.
+///
+/// Four failures in a row, each two sentences long, would otherwise make a
+/// card taller than the window.
+const NOTICES_MAX_HEIGHT: f32 = 340.;
+
+/// Put a message on screen that stays until it is cleared.
+pub fn push_notice(notice: Notice, window: &mut Window, cx: &mut App) {
+    let notices = cx.default_global::<Notices>();
+    notices.last_key += 1;
+    let key = notices.last_key;
+    notices.items.push((key, notice));
+    let overflow = notices.items.len().saturating_sub(MAX_NOTICES);
+    notices.items.drain(..overflow);
+
+    window.push_notification(
+        // No title, no message and no type of its own: everything the card
+        // shows is a row, and a row carries its own icon and heading. The card
+        // is pushed again for every notice, which replaces the one already up
+        // with a card holding the new row as well.
+        Notification::new()
+            .id::<NoticeCard>()
+            .autohide(false)
+            .placement(Anchor::BottomRight)
+            .content(|_, _, cx| render_notices(cx))
+            // The card's own close button, and a middle-click on it, clear
+            // every row at once. Without this the rows would come back the
+            // next time anything pushed a notice.
+            .on_close(|_, cx| {
+                cx.default_global::<Notices>().items.clear();
+            }),
+        cx,
+    );
+}
+
+/// Every outstanding notice as a row, newest last.
+fn render_notices(cx: &mut Context<Notification>) -> AnyElement {
+    let items = cx.default_global::<Notices>().items.clone();
+    let last = items.len().saturating_sub(1);
+
+    div()
+        .id("notices")
+        .debug_selector(|| "notices".to_string())
+        .max_h(px(NOTICES_MAX_HEIGHT))
+        .overflow_y_scroll()
+        .child(v_flex().gap_3().children(items.into_iter().enumerate().map(
+            |(index, (key, notice))| {
+                v_flex()
+                    .gap_3()
+                    .child(render_notice(key, &notice, cx))
+                    // A rule between rows, so two failures do not read as
+                    // one paragraph.
+                    .when(index < last, |this| {
+                        this.child(div().h(px(1.)).w_full().bg(cx.theme().border))
+                    })
+            },
+        )))
+        .into_any_element()
+}
+
+/// One notice: its icon, what happened, and the buttons that answer it.
+fn render_notice(key: u64, notice: &Notice, cx: &mut Context<Notification>) -> AnyElement {
+    let action = notice.action.clone();
+
+    h_flex()
+        .items_start()
+        .gap_2()
+        .child(div().pt(px(2.)).child(notice.icon(cx)))
+        .child(
+            v_flex()
+                .flex_1()
+                .gap_1()
+                .child(div().text_sm().font_semibold().child(notice.title.clone()))
+                .child(div().text_sm().child(notice.message.clone()))
+                .when_some(action, |this, action| {
+                    let run = action.run.clone();
+                    this.child(
+                        h_flex().pt_1().justify_end().child(
+                            Button::new(("notice-action", key as usize))
+                                .primary()
+                                .small()
+                                .label(action.label.clone())
+                                .on_click(cx.listener(move |card, _, window, cx| {
+                                    // The offer is taken, so the row that made
+                                    // it has nothing left to say.
+                                    clear_notice(key, card, window, cx);
+                                    run(window, cx);
+                                })),
+                        ),
+                    )
+                }),
+        )
+        // Always drawn, rather than appearing on hover the way the card's own
+        // close button does: a notice that never goes on its own has to be
+        // clearable without hunting for the control that clears it.
+        .child(
+            Button::new(("dismiss-notice", key as usize))
+                .icon(IconName::Close)
+                .ghost()
+                .xsmall()
+                .accessibility_label("Dismiss this message")
+                .on_click(cx.listener(move |card, _, window, cx| {
+                    cx.stop_propagation();
+                    clear_notice(key, card, window, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+/// Take one notice off the card, and take the card away with the last of them.
+fn clear_notice(
+    key: u64,
+    card: &mut Notification,
+    window: &mut Window,
+    cx: &mut Context<Notification>,
+) {
+    let notices = cx.default_global::<Notices>();
+    notices.items.retain(|(existing, _)| *existing != key);
+    let empty = notices.items.is_empty();
+    if empty {
+        card.dismiss(window, cx);
+    } else {
+        cx.notify();
     }
 }
 
@@ -354,49 +613,144 @@ pub fn report_install(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<SharedString> {
+    let installed = install_outcome(failed, result, roots, window, cx)?;
+    window.push_notification(
+        Notification::success(wrote_sentence(&installed, roots)).title(title.to_string()),
+        cx,
+    );
+    install_warnings(&installed, window, cx);
+    Some(installed.name.into())
+}
+
+/// Report a failed install, or hand back what a successful one wrote.
+///
+/// Everything [`report_install`] does apart from the sentence saying it worked.
+/// An install started from Discover leaves that sentence to its caller, because
+/// what there is to say about a skill that landed depends on which agents can
+/// read it, and that is a question about the machine rather than about the
+/// download.
+pub fn install_outcome(
+    failed: &str,
+    result: Result<Installed, FetchError>,
+    roots: &Roots,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Installed> {
     match result {
-        Ok(installed) => {
-            let name = SharedString::from(installed.name.clone());
-            window.push_notification(
-                Notification::success(format!(
-                    "Wrote {} file{} to {}",
-                    installed.files,
-                    if installed.files == 1 { "" } else { "s" },
-                    display_path(&installed.dir, roots)
-                ))
-                .title(title.to_string()),
-                cx,
-            );
-            if let Some(reason) = take_cache_failure() {
-                window.push_notification(
-                    cache_failure_notification(
-                        "The skill was installed, but what it installed could not be recorded",
-                        &reason,
-                    ),
-                    cx,
-                );
-            }
-            if let Some(warning) = installed.staging.warning() {
-                window.push_notification(
-                    Notification::warning(warning)
-                        .title("Staging directory not cleared")
-                        .autohide(false),
-                    cx,
-                );
-            }
-            Some(name)
-        }
+        Ok(installed) => Some(installed),
         Err(error) => {
-            window.push_notification(
-                // Nothing appeared in the list, so this sentence is the whole
-                // account of what went wrong. It stays until it is dismissed.
-                Notification::error(fetch_sentence(&error, roots))
-                    .title(failed.to_string())
-                    .autohide(false),
+            // Nothing appeared in the list, so this sentence is the whole
+            // account of what went wrong. It stays until it is cleared.
+            push_notice(
+                Notice::error(failed, fetch_sentence(&error, roots)),
+                window,
                 cx,
             );
             None
         }
+    }
+}
+
+/// What an install wrote, and where.
+pub fn wrote_sentence(installed: &Installed, roots: &Roots) -> String {
+    format!(
+        "Wrote {} file{} to {}.",
+        installed.files,
+        if installed.files == 1 { "" } else { "s" },
+        display_path(&installed.dir, roots)
+    )
+}
+
+/// The two things that can go wrong around an install that still leaves the
+/// skill installed: the install record could not be written, and a
+/// part-downloaded skill from an earlier run could not be cleared out of the
+/// staging directory. Each gets its own notification beside the success.
+pub fn install_warnings(installed: &Installed, window: &mut Window, cx: &mut App) {
+    if let Some(reason) = take_cache_failure() {
+        window.push_notification(
+            cache_failure_notification(
+                "The skill was installed, but what it installed could not be recorded",
+                &reason,
+            ),
+            cx,
+        );
+    }
+    if let Some(warning) = installed.staging.warning() {
+        window.push_notification(
+            Notification::warning(warning)
+                .title("Staging directory not cleared")
+                .autohide(false),
+            cx,
+        );
+    }
+}
+
+/// The agents on this machine that cannot see a skill sitting in the store.
+///
+/// Every install writes into `~/.agents/skills`. Most agents read that
+/// directory for themselves; Claude Code and Codex read one of their own, and a
+/// skill reaches them only through a link. This is the list of the ones that
+/// are on the machine, do not read the store, and hold no link to this skill
+/// yet — the answer to "can my agent use it now?".
+///
+/// [`Roots::agent_present`] decides what is on the machine, so this cannot come
+/// to disagree with the sidebar's count or the detail pane's rows.
+pub fn cannot_see(roots: &Roots, name: &str) -> Vec<&'static AgentDef> {
+    roots
+        .present_agents()
+        .into_iter()
+        .filter(|agent| !agent.reads_shared)
+        .filter(|agent| !holds_link(roots, agent, name))
+        .collect()
+}
+
+/// Whether this agent already holds a link to `name`, active or parked in its
+/// disabled directory.
+///
+/// A parked link is not a link that cannot see the skill; it is one the user
+/// switched off, which is a different question and not one an install should
+/// reopen.
+fn holds_link(roots: &Roots, agent: &'static AgentDef, name: &str) -> bool {
+    let there = |dir: PathBuf| std::fs::symlink_metadata(dir.join(name)).is_ok();
+    there(roots.agent_dir(agent)) || roots.disabled_dir(agent).is_some_and(there)
+}
+
+/// Who can use what was just installed, in one sentence.
+///
+/// `subject` names what landed, as it reads inside a sentence: "pdf", "these 3
+/// skills". `plural` decides the pronoun. `None` when there is nothing worth
+/// saying, which is the machine with no agent on it at all: naming every agent
+/// that is absent would be a list of software the user does not have.
+pub fn reach_sentence(
+    roots: &Roots,
+    blind: &[&'static AgentDef],
+    subject: &str,
+    plural: bool,
+) -> Option<String> {
+    let store = display_path(&roots.store_dir(), roots);
+    if blind.is_empty() {
+        if roots.present_agents().is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "Every agent on this machine reads {store}, so {subject} {} ready to use.",
+            if plural { "are" } else { "is" }
+        ));
+    }
+    let names: Vec<&str> = blind.iter().map(|agent| agent.display_name).collect();
+    Some(format!(
+        "{} {} not read {store}, so {} cannot use {subject} yet.",
+        join_and(&names),
+        if names.len() == 1 { "does" } else { "do" },
+        if names.len() == 1 { "it" } else { "they" }
+    ))
+}
+
+/// What the button that answers [`reach_sentence`] says.
+pub fn link_label(blind: &[&'static AgentDef]) -> String {
+    match blind {
+        [agent] => format!("Link to {}", agent.display_name),
+        many => format!("Link to {} agents", many.len()),
     }
 }
 
