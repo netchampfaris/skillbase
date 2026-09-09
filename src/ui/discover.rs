@@ -40,8 +40,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathPromptOptions, SharedString, Styled as _, Window, div, px, rems,
+    AnyElement, App, AppContext as _, Context, ElementId, InteractiveElement as _, IntoElement,
+    ParentElement as _, PathPromptOptions, RenderOnce, SharedString, Styled as _, WeakEntity,
+    Window, div, px, rems,
 };
 use skillbase_core::{
     DEFAULT_LIMIT, FetchError, GitHub, ImportOptions, InstallError, InstallOptions, Installed,
@@ -261,6 +262,66 @@ impl Installing {
 pub(crate) struct InstallChoice {
     location: SkillLocation,
     selected: bool,
+}
+
+/// The button that installs whatever is ticked in the chooser.
+///
+/// A component rather than a plain `Button` because its label and its disabled
+/// state count the ticked rows, and the count has to be taken when the footer
+/// is rendered rather than when the dialog is built: see the note in
+/// [`Skillbase::open_location_dialog`].
+#[derive(IntoElement)]
+struct InstallChoiceButton {
+    skillbase: WeakEntity<Skillbase>,
+}
+
+impl RenderOnce for InstallChoiceButton {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let ticked = self
+            .skillbase
+            .read_with(cx, |this, _| {
+                this.install_choices
+                    .iter()
+                    .filter(|choice| choice.selected)
+                    .count()
+            })
+            .unwrap_or(0);
+        let this = self.skillbase;
+
+        Button::new("confirm-install-choice")
+            .primary()
+            .label(match ticked {
+                0 => "Install".to_string(),
+                1 => "Install 1 skill".to_string(),
+                many => format!("Install {many} skills"),
+            })
+            .disabled(ticked == 0)
+            .on_click(move |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    let chosen: Vec<SkillLocation> = this
+                        .install_choices
+                        .iter()
+                        .filter(|choice| choice.selected)
+                        .map(|choice| choice.location.clone())
+                        .collect();
+                    this.install_choices.clear();
+                    if chosen.is_empty() {
+                        return;
+                    }
+                    let label = install_label(&chosen);
+                    this.run_install(
+                        InstallPlan::Ready(chosen),
+                        InstallOptions::new(),
+                        label,
+                        None,
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+                window.close_dialog(cx);
+            })
+    }
 }
 
 /// What an install task was asked to do.
@@ -674,32 +735,34 @@ impl Skillbase {
         cx.notify();
 
         let this = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        // Nothing in this builder may read this view. `open_dialog` keeps the
+        // builder and calls it from `Root::render_dialog_layer`, which is part
+        // of `Skillbase::render`, so the view is borrowed for the whole of it
+        // and reading it here aborts the process. The rows and the Install
+        // button below are rendered one step later, after `render` has
+        // returned and the borrow is gone, so both read the ticks as they are
+        // rather than as they were when the dialog opened.
+        window.open_dialog(cx, move |dialog, _, _| {
             let this = this.clone();
-            let choices: Vec<(SharedString, bool)> = this
-                .upgrade()
-                .map(|entity| {
-                    entity
-                        .read(cx)
-                        .install_choices
-                        .iter()
-                        .map(|choice| (choice_label(&choice.location), choice.selected))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let ticked = choices.iter().filter(|(_, on)| *on).count();
-            let all_ticked = !choices.is_empty() && ticked == choices.len();
 
             dialog
                 .title(title.clone())
                 .width(px(560.))
                 .content({
                     let lead = lead.clone();
-                    let choices = choices.clone();
                     let this = this.clone();
                     move |content, _, cx| {
-                        let choices = choices.clone();
                         let this = this.clone();
+                        let choices: Vec<(SharedString, bool)> = this
+                            .read_with(cx, |this, _| {
+                                this.install_choices
+                                    .iter()
+                                    .map(|choice| (choice_label(&choice.location), choice.selected))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let ticked = choices.iter().filter(|(_, on)| *on).count();
+                        let all_ticked = !choices.is_empty() && ticked == choices.len();
                         content.child(
                             v_flex()
                                 .p_4()
@@ -798,44 +861,9 @@ impl Skillbase {
                                     .label("Cancel"),
                             ),
                         )
-                        .child(
-                            Button::new("confirm-install-choice")
-                                .primary()
-                                .label(match ticked {
-                                    0 => "Install".to_string(),
-                                    1 => "Install 1 skill".to_string(),
-                                    many => format!("Install {many} skills"),
-                                })
-                                .disabled(ticked == 0)
-                                .on_click({
-                                    let this = this.clone();
-                                    move |_, window, cx| {
-                                        this.update(cx, |this, cx| {
-                                            let chosen: Vec<SkillLocation> = this
-                                                .install_choices
-                                                .iter()
-                                                .filter(|choice| choice.selected)
-                                                .map(|choice| choice.location.clone())
-                                                .collect();
-                                            this.install_choices.clear();
-                                            if chosen.is_empty() {
-                                                return;
-                                            }
-                                            let label = install_label(&chosen);
-                                            this.run_install(
-                                                InstallPlan::Ready(chosen),
-                                                InstallOptions::new(),
-                                                label,
-                                                None,
-                                                window,
-                                                cx,
-                                            );
-                                        })
-                                        .ok();
-                                        window.close_dialog(cx);
-                                    }
-                                }),
-                        ),
+                        .child(InstallChoiceButton {
+                            skillbase: this.clone(),
+                        }),
                 )
         });
     }
@@ -1953,5 +1981,113 @@ mod tests {
         fs::create_dir_all(roots.store_dir().join("pdf-2")).expect("pdf-2");
         assert_eq!(free_name(&roots, "pdf"), "pdf-3");
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// The three dialogs Discover opens, each one opened and then drawn.
+///
+/// Drawing is the assertion: `open_dialog` only stores its builder, and the
+/// builder runs from inside `Skillbase::render`. See
+/// [`crate::ui::list::dialog_probe`] for why that matters.
+#[cfg(test)]
+mod dialog_tests {
+    use gpui_kit::TestAppContext;
+    use skillbase_core::{RepoRef, SkillLocation};
+
+    use super::{Occupied, OccupiedSource};
+    use crate::ui::list::dialog_probe::{drawn, window};
+
+    fn locations() -> Vec<SkillLocation> {
+        let repo = RepoRef::new("anthropics", "skills", "main");
+        ["skills/docx", "skills/pdf", "skills/pptx"]
+            .into_iter()
+            .map(|path| SkillLocation {
+                repo: repo.clone(),
+                path: path.to_string(),
+            })
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn the_install_from_github_dialog_opens(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| this.open_install_dialog(window, cx));
+        });
+        drawn(&mut cx);
+    }
+
+    #[gpui_kit::test]
+    fn the_multi_skill_chooser_opens(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| {
+                this.open_location_dialog(
+                    "anthropics/skills".into(),
+                    "It holds 3 skills.".into(),
+                    locations(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        drawn(&mut cx);
+    }
+
+    /// Ticking a row is a write to the view followed by another frame, and the
+    /// frame is where the chooser reads the ticks back.
+    #[gpui_kit::test]
+    fn ticking_a_row_redraws_the_chooser(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| {
+                this.open_location_dialog(
+                    "anthropics/skills".into(),
+                    "It holds 3 skills.".into(),
+                    locations(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        drawn(&mut cx);
+
+        for ticked in [1, 3, 0] {
+            cx.update(|_, cx| {
+                skillbase.update(cx, |this, cx| {
+                    for (index, choice) in this.install_choices.iter_mut().enumerate() {
+                        choice.selected = index < ticked;
+                    }
+                    cx.notify();
+                });
+            });
+            drawn(&mut cx);
+            let counted = cx.update(|_, cx| {
+                skillbase
+                    .read(cx)
+                    .install_choices
+                    .iter()
+                    .filter(|choice| choice.selected)
+                    .count()
+            });
+            assert_eq!(counted, ticked);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_name_is_taken_dialog_opens(cx: &mut TestAppContext) {
+        let (mut cx, skillbase) = window(cx);
+        cx.update(|window, cx| {
+            skillbase.update(cx, |this, cx| {
+                let occupied = Occupied {
+                    source: OccupiedSource::Download(locations().remove(0)),
+                    name: "docx".into(),
+                    path: this.roots.store_dir().join("docx"),
+                    free_name: "docx-2".to_string(),
+                };
+                this.open_occupied_dialog(occupied, window, cx);
+            });
+        });
+        drawn(&mut cx);
     }
 }
