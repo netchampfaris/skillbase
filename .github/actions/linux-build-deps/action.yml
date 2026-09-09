@@ -1,0 +1,40 @@
+name: Linux build dependencies
+description: >
+  Install the system libraries GPUI needs to compile and to draw on Linux.
+
+runs:
+  using: composite
+  steps:
+    # Every package here is behind a `-sys` crate in Cargo.lock, so the list is
+    # derived rather than guessed:
+    #
+    #   aws-lc-sys (through rustls)  cmake, a C compiler, libclang
+    #   freetype-sys                 zlib, and cmake to build the vendored copy
+    #   yeslogic-fontconfig-sys      libfontconfig
+    #   wayland-sys                  libwayland
+    #   xkbcommon                    libxkbcommon, and its X11 half
+    #   ash                          the Vulkan loader, which it opens by name
+    #
+    # x11 and xcb are for the X11 session; a machine running Wayland still
+    # links them, because which of the two is in use is a runtime decision.
+    - shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          build-essential \
+          clang \
+          cmake \
+          libclang-dev \
+          libfontconfig-dev \
+          libfreetype6-dev \
+          libgl1-mesa-dev \
+          libvulkan-dev \
+          libwayland-dev \
+          libx11-dev \
+          libx11-xcb-dev \
+          libxcb1-dev \
+          libxcb-composite0-dev \
+          libxkbcommon-dev \
+          libxkbcommon-x11-dev \
+          pkg-config \
+          zlib1g-dev

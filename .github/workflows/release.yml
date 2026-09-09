@@ -1,0 +1,267 @@
+# Every merge into main becomes a release.
+#
+# The version is decided by script/next-version.sh: the newest tag with its
+# patch number raised by one, unless Cargo.toml already declares something
+# larger, in which case the manifest wins. That is the whole of the policy —
+# an ordinary merge moves the patch, and a feature release happens because
+# somebody edited Cargo.toml to 0.2.0 in the pull request that earned it.
+# Nothing here ever raises the major number on its own.
+#
+# Run it by hand on a branch, with `Dry run` left ticked, to build all four
+# artifacts and download them without tagging or publishing anything.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build the artifacts but do not tag or publish
+        type: boolean
+        default: true
+
+# One release at a time, and never cancel one half-way: a cancelled run can
+# leave a tag with no release attached to it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Decide the version
+    runs-on: ubuntu-22.04
+    # The bump commit this workflow pushes is not itself a release. A push made
+    # with GITHUB_TOKEN does not start another run, so this only matters if the
+    # token is ever swapped for one that does.
+    if: "!startsWith(github.event.head_commit.message || '', 'Release v')"
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      publish: ${{ steps.pick.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # next-version.sh reads the tags, and a shallow clone has none.
+          fetch-depth: 0
+
+      - id: pick
+        run: |
+          version="$(script/next-version.sh)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already tagged. Nothing to release." \
+              >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ inputs.dry-run }}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Dry run: building v$version without publishing it." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Releasing v$version." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # The same checks a pull request gets. They ran on the branch already, but a
+  # merge produces a commit that has not been tested as such, and a release is
+  # the wrong place to find that out.
+  checks:
+    name: Checks
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: ${{ matrix.name }}
+    needs: [version, checks]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One target failing should not hide what the other three did. The
+      # publish job needs all of them, so a red build still blocks the release.
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple silicon)
+            runner: macos-14
+            target: aarch64-apple-darwin
+            slug: macos-arm64
+          - name: macOS (Intel)
+            runner: macos-14
+            target: x86_64-apple-darwin
+            slug: macos-x86_64
+          - name: Linux (x86_64)
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            slug: linux-x86_64
+          # Arm Linux runners are a paid feature on private repositories. If
+          # this job never starts, that is why; drop it or make the repository
+          # public.
+          - name: Linux (aarch64)
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            slug: linux-aarch64
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # The oldest macOS the bundle claims to run on, which has to be told to
+      # the compiler as well as written into Info.plist.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # Here rather than on the step that uses them because a step's `if` can
+      # read the job's env and cannot read `secrets` at all. Unset secrets
+      # arrive as empty strings, which is exactly the test below.
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-build-deps
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Before the build, so that the version the settings pane shows and the
+      # one in Info.plist are the one being released.
+      - name: Set the version
+        run: script/set-version.sh "$VERSION"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Inert until the four secrets exist. With them, the bundle is signed
+      # with a Developer ID and the image is notarised, and macOS opens it
+      # without a detour through System Settings.
+      - name: Import the signing certificate
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+
+          # The identity is read back rather than configured, so a renewed
+          # certificate needs no change here.
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application.*\)"/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "no Developer ID in the certificate" >&2; exit 1; }
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+          xcrun notarytool store-credentials skillbase \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --keychain "$keychain"
+          echo "APPLE_NOTARY_KEYCHAIN_PROFILE=skillbase" >> "$GITHUB_ENV"
+          echo "APPLE_NOTARY_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          app="$(script/bundle-macos.sh release --target ${{ matrix.target }} --copy)"
+          script/dmg-macos.sh "$app" \
+            "$RUNNER_TEMP/out/Skillbase-$VERSION-${{ matrix.slug }}.dmg"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The directory inside the tarball is named for the release, not for
+          # the triple, so unpacking it leaves something a person can read.
+          name="skillbase-$VERSION-${{ matrix.slug }}"
+          dir="$(script/bundle-linux.sh release ${{ matrix.target }} "$name")"
+          mkdir -p "$RUNNER_TEMP/out"
+          tar -C "$(dirname "$dir")" -czf "$RUNNER_TEMP/out/$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.slug }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Tag and publish
+    needs: [version, checks, build]
+    if: needs.version.outputs.publish == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+          merge-multiple: true
+
+      - name: Record the version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          script/set-version.sh "$VERSION"
+          git add Cargo.toml Cargo.lock
+          # A pull request that bumped the version by hand leaves nothing to
+          # commit here, and the tag still has to be written.
+          git diff --cached --quiet || git commit -m "Release v$VERSION"
+
+          # Another merge may have landed while the four builds ran. Rebase
+          # before tagging: a rebase rewrites the commit, and a tag made first
+          # would name the one it replaced.
+          git pull --rebase origin "${{ github.ref_name }}"
+          git tag -a "v$VERSION" -m "Skillbase v$VERSION"
+          git push origin "HEAD:${{ github.ref_name }}" "refs/tags/v$VERSION"
+
+      - name: Checksums
+        working-directory: ${{ runner.temp }}/artifacts
+        # Bash expands the glob before it makes the file, so SHA256SUMS
+        # cannot end up listing itself.
+        run: sha256sum *.dmg *.tar.gz > SHA256SUMS
+
+      - name: Publish
+        working-directory: ${{ runner.temp }}/artifacts
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Install
+
+          **macOS** — download the `.dmg` for your Mac, open it, and drag
+          Skillbase to Applications. The build is not notarised yet, so the
+          first launch needs one extra step: right-click the app and choose
+          Open, or run `xattr -dr com.apple.quarantine /Applications/Skillbase.app`.
+
+          **Linux** — unpack the tarball and run `./install.sh`, which copies
+          the binary, the icon and the desktop entry into `~/.local`.
+
+          `SHA256SUMS` covers every file below.
+
+          NOTES
+
+          gh release create "v$VERSION" \
+            --title "Skillbase v$VERSION" \
+            --notes-file notes.md \
+            --generate-notes \
+            *.dmg *.tar.gz SHA256SUMS

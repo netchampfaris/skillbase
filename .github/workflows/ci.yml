@@ -1,0 +1,66 @@
+# The checks a pull request has to pass. They are deliberately the cheap ones:
+# a debug build and the test suite. The release profile and the four target
+# triples are exercised by release.yml, which can be run by hand on a branch
+# before that branch is merged.
+#
+# There is no `push` trigger. Every merge into main starts release.yml, and
+# that workflow calls this one before it builds anything, so a push that ran
+# both would run the suite twice and release regardless of the answer.
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+
+# A second push to the same branch makes the first run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # Not `-D warnings`: the tree has six long-standing clippy warnings, and
+      # a check that is red on arrival is a check nobody reads. They surface as
+      # annotations on the diff. Add `-- -D warnings` here once they are gone.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      # The GPUI tests open windows and draw them, on a headless test platform
+      # rather than a real one, so no display is needed.
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  linux:
+    name: Linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Tests
+        run: cargo test --workspace --locked
