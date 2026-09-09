@@ -230,6 +230,10 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
       GH_TOKEN: ${{ github.token }}
+      # The artifacts are downloaded outside the checkout, and `gh` reads the
+      # git remote of wherever it is standing to work out which repository it
+      # is talking to. Told outright, it does not have to stand anywhere.
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
         with:
