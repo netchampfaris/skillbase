@@ -68,7 +68,33 @@ will not fight it.
 
 ## Install
 
-Skillbase runs on macOS 11 or newer and on Linux. It needs Rust 1.98 or newer.
+Skillbase runs on macOS 11 or newer and on Linux, on both Apple silicon and
+Intel, and on both x86_64 and aarch64 Linux. Every build is on the
+[releases page](https://github.com/netchampfaris/skillbase/releases).
+
+**macOS.** Open the `.dmg` for your Mac and drag Skillbase to Applications.
+These builds are signed ad-hoc rather than with a Developer ID, so Gatekeeper
+stops the first launch. Right-click the application and choose Open, or clear
+the quarantine flag yourself:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Skillbase.app
+```
+
+**Linux.** Unpack the tarball and run the installer inside it, which copies the
+binary, the icon and the desktop entry under `~/.local`:
+
+```sh
+tar xzf skillbase-*-linux-x86_64.tar.gz
+cd skillbase-*-linux-x86_64
+./install.sh
+```
+
+`SHA256SUMS` on the release covers every file.
+
+### Build it yourself
+
+Building needs Rust 1.98 or newer.
 
 ```sh
 git clone https://github.com/netchampfaris/skillbase.git
@@ -162,6 +188,30 @@ The interface uses HugeIcons in its stroke-rounded variant, served from
 logos in `assets/icons/agents` come from Simple Icons and lobe-icons. They are
 trademarks of their owners and are used only to label each agent in the list.
 Both `SOURCES.md` files have the per-file detail.
+
+### Releases
+
+Merging into `main` publishes a release. `.github/workflows/release.yml` builds
+the four artifacts, tags the commit, and writes the notes from the pull
+requests that landed since the last tag.
+
+The version comes from `script/next-version.sh`, which takes the newest tag,
+raises its patch number by one, and uses that unless `Cargo.toml` already
+declares something larger. So an ordinary merge moves 0.1.3 to 0.1.4 and needs
+no thought. To cut a feature version instead, set the version in `Cargo.toml`
+to 0.2.0 in the pull request that earns it, and the manifest wins. The major
+number is never raised by the workflow; 1.0.0 is a decision, and it is made the
+same way, by editing the manifest.
+
+To see what a release would produce without publishing one, run the workflow by
+hand from the Actions tab with **Dry run** left ticked. It builds all four
+artifacts and attaches them to the run.
+
+Signing is ad-hoc until five repository secrets exist — `MACOS_CERTIFICATE`,
+`MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_PASSWORD` and
+`APPLE_TEAM_ID`. With them the workflow signs with the Developer ID in the
+certificate and notarises the disk images, and the quarantine step above stops
+being necessary. Nothing else has to change.
 
 ## Not in v1
 
