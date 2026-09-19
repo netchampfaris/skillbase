@@ -46,6 +46,7 @@ use crate::ui::model::{
     Library, LoadedPreferences, Preferences, Scan, Scope, SkillSort, SkillView, in_words,
     resolve_roots,
 };
+use crate::ui::tooltip::TextTooltipExt as _;
 use crate::ui::{
     BAND_HEIGHT, DETAIL_MIN_WIDTH, Notice, TRAFFIC_LIGHT_INSET, cache_failure_notification,
     cannot_see, capitalized, drag_band, install_skill, install_warnings, link_label, push_notice,
@@ -1564,7 +1565,7 @@ impl Skillbase {
                 .ghost()
                 .small()
                 .icon(Icon::new(IconName::PanelLeftOpen).size_4())
-                .tooltip("Show sidebar")
+                .text_tooltip("Show sidebar")
                 .accessibility_label("Show sidebar")
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)))
         })

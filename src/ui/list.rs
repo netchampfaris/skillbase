@@ -11,14 +11,13 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::skeleton::Skeleton;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
     StyledExt as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, ElementId, FocusHandle,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, FocusHandle,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, ScrollHandle,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, actions, div, px, rems,
 };
@@ -31,6 +30,7 @@ use crate::app::{ScanState, Skillbase};
 use crate::menus::{ClearMarks, MarkAll};
 
 use super::model::{Library, Scan, Scope, SkillSort, SkillView, display_path, join_and};
+use super::tooltip::{TextTooltipExt as _, text_tooltip};
 use super::{
     agent_icon, delete_cache_failure_notification, delete_effect, push_notice,
     remember_delete_cache_failure, report, report_delete, take_delete_cache_failure,
@@ -41,14 +41,6 @@ use super::{
 pub const LIST_WIDTH: f32 = 320.;
 pub const LIST_MIN_WIDTH: f32 = 240.;
 pub const LIST_MAX_WIDTH: f32 = 460.;
-
-/// How wide a tooltip carrying a sentence is allowed to get.
-///
-/// A tooltip is read in one glance, so the line has to be short enough that the
-/// eye finds the start of the next one — around fifty characters here. It is
-/// also the width of the column it sits beside, which keeps a tooltip from
-/// covering the list it explains.
-const TOOLTIP_WIDTH: f32 = 320.;
 
 /// The keymap context the list's own bindings live in.
 ///
@@ -552,7 +544,7 @@ impl Skillbase {
                     .ghost()
                     .small()
                     .icon(IconName::Ellipsis)
-                    .tooltip("Mark several skills, and what the groups mean")
+                    .text_tooltip("Mark several skills, and what the groups mean")
                     // A tooltip is not an accessible name, so an icon-only
                     // button has to be given one as well.
                     .accessibility_label("More list commands")
@@ -1071,7 +1063,7 @@ impl Skillbase {
             .ghost()
             .small()
             .icon(IconName::SortDescending)
-            .tooltip("Sort the list")
+            .text_tooltip("Sort the list")
             .accessibility_label("Sort the list")
             .dropdown_menu(move |menu, _, _| {
                 let this = this.clone();
@@ -1229,7 +1221,7 @@ impl Skillbase {
                                 .outline()
                                 .small()
                                 .label("Link…")
-                                .tooltip("Link every marked skill to one agent")
+                                .text_tooltip("Link every marked skill to one agent")
                                 .disabled(busy)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_link_marked_dialog(true, window, cx)
@@ -1240,7 +1232,7 @@ impl Skillbase {
                                 .outline()
                                 .small()
                                 .label("Unlink…")
-                                .tooltip("Take every marked skill's link out of one agent")
+                                .text_tooltip("Take every marked skill's link out of one agent")
                                 .disabled(busy)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_link_marked_dialog(false, window, cx)
@@ -1255,7 +1247,7 @@ impl Skillbase {
                                 .outline()
                                 .small()
                                 .label("Delete…")
-                                .tooltip(
+                                .text_tooltip(
                                     "Move every marked skill to the trash and remove its links",
                                 )
                                 .disabled(busy)
@@ -2200,7 +2192,7 @@ impl Skillbase {
                                 // `create_skill`, once the file is on disk.
                                 .disabled(!can_create)
                                 .when_some(footer_problem, |button, problem| {
-                                    button.tooltip(problem)
+                                    button.text_tooltip(problem)
                                 })
                                 .on_click(move |_, window, cx| {
                                     this.update(cx, |this, cx| this.create_skill(window, cx))
@@ -2364,27 +2356,6 @@ fn count_label(shown: usize, total: usize) -> SharedString {
         total.to_string().into()
     } else {
         format!("{shown} of {total}").into()
-    }
-}
-
-/// A tooltip carrying a sentence, capped at a width it can be read at.
-///
-/// Every text tooltip in this column is built here. `Tooltip::new` lays its
-/// text out on a single line however long the text is, so a description of
-/// several sentences drew a box wider than the window — worse than the
-/// truncated row it was there to explain.
-///
-/// The cap has to sit on an element of our own rather than on the tooltip: the
-/// tooltip's box is a row that takes whatever width its content asks for, and
-/// it is the block the text is laid out in that decides where the lines break.
-/// A block with a width also breaks a run that has no spaces in it, so a
-/// description written as one long word wraps rather than spilling out.
-fn text_tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
-    let text = text.into();
-    move |window, cx| {
-        let text = text.clone();
-        Tooltip::element(move |_, _| div().max_w(px(TOOLTIP_WIDTH)).child(text.clone()))
-            .build(window, cx)
     }
 }
 
@@ -2827,22 +2798,10 @@ mod dialog_tests {
 /// search that matches none of them, and a marked set.
 #[cfg(test)]
 mod render_tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    use gpui_kit::base::ElementExt as _;
-    use gpui_kit::{
-        AvailableSpace, ParentElement as _, Pixels, Size, TestAppContext, VisualTestContext, div,
-        point, px,
-    };
+    use gpui_kit::TestAppContext;
 
     use super::dialog_probe::{list_drawn, window};
-    use super::{TOOLTIP_WIDTH, text_tooltip};
     use crate::ui::model::{Library, Scope};
-
-    /// The margin, padding and border the tooltip draws around its text. The
-    /// cap is on the text, so the box is that much wider than the cap.
-    const CHROME: Pixels = px(48.);
 
     #[gpui_kit::test]
     fn the_list_draws_its_rows(cx: &mut TestAppContext) {
@@ -2891,86 +2850,5 @@ mod render_tests {
             });
         });
         list_drawn(&mut cx);
-    }
-
-    /// How large a tooltip built by [`text_tooltip`] draws.
-    ///
-    /// The window lays a tooltip out against its minimum size, which is what
-    /// leaves the box free to be as wide as its one line of text — so the
-    /// measurement has to be taken the same way for it to say anything.
-    fn tooltip_size(cx: &mut VisualTestContext, text: &str) -> Size<Pixels> {
-        let measured = Rc::new(Cell::new(Size::default()));
-        let build = text_tooltip(text.to_string());
-        let out = measured.clone();
-        cx.draw(
-            point(px(0.), px(0.)),
-            AvailableSpace::min_size(),
-            move |window, cx| {
-                let tooltip = build(window, cx);
-                div()
-                    .on_prepaint(move |bounds, _, _| out.set(bounds.size))
-                    .child(tooltip)
-            },
-        );
-        measured.get()
-    }
-
-    /// A tooltip used to be laid out on one line however long its text was, so
-    /// the full description offered on a truncated row arrived as a line wider
-    /// than the window — worse than the row it was explaining.
-    #[gpui_kit::test]
-    fn a_tooltip_holding_a_sentence_wraps_inside_a_reading_width(cx: &mut TestAppContext) {
-        let (mut cx, _) = window(cx);
-
-        let label = tooltip_size(&mut cx, "Short.");
-        // A short label still hugs its text: the cap is a maximum, not a width.
-        assert!(
-            label.width < px(TOOLTIP_WIDTH),
-            "a one-word tooltip drew {:?} wide",
-            label.width
-        );
-
-        let sentence = tooltip_size(
-            &mut cx,
-            "Use this skill whenever the user works with PDF files.",
-        );
-        let paragraph = tooltip_size(
-            &mut cx,
-            "Use this skill whenever the user works with PDF files: reading one, filling in a \
-             form, splitting one apart, or putting several together. It reads the pages and \
-             does not change them.",
-        );
-        // Nothing in this one is a place to break a line, so the break has to
-        // fall mid-word. Unwrapped, it was the description that ran off the
-        // screen.
-        let unbroken = tooltip_size(&mut cx, &"unbrokenrun".repeat(20));
-
-        for (what, size) in [
-            ("a sentence", sentence),
-            ("a paragraph", paragraph),
-            ("one long word", unbroken),
-        ] {
-            assert!(
-                size.width <= px(TOOLTIP_WIDTH) + CHROME,
-                "{what} drew {:?} wide, past the {TOOLTIP_WIDTH}pt cap",
-                size.width
-            );
-            assert!(
-                size.height > label.height,
-                "{what} is wider than the cap, so it has to take more than the one line \
-                 a label takes: {:?} against {:?}",
-                size.height,
-                label.height
-            );
-        }
-
-        // The lines pile up rather than the box being cut off at some height:
-        // three sentences take more of them than one.
-        assert!(
-            paragraph.height > sentence.height,
-            "a paragraph drew {:?} against a sentence's {:?}",
-            paragraph.height,
-            sentence.height
-        );
     }
 }

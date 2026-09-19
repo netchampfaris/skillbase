@@ -6,6 +6,7 @@ pub mod list;
 pub mod model;
 pub mod settings;
 pub mod sidebar;
+pub mod tooltip;
 
 use std::path::PathBuf;
 use std::rc::Rc;

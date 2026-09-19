@@ -32,7 +32,6 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
     WindowExt as _, h_flex, v_flex,
@@ -54,6 +53,7 @@ use skillbase_core::{
 use super::model::{
     Issue, Scan, SkillView, agent_label, ago, display_path, has_disable_state, short_sha,
 };
+use super::tooltip::{TextTooltipExt as _, text_tooltip};
 use super::{
     BAND_HEIGHT, PROSE_MAX_WIDTH, agent_icon, cache_failure_notification,
     delete_cache_failure_notification, delete_effect, drag_band, install_skill, push_notice,
@@ -2297,7 +2297,7 @@ impl DetailPane {
                             .ghost()
                             .small()
                             .icon(IconName::FolderOpen)
-                            .tooltip("Reveal the origin folder")
+                            .text_tooltip("Reveal the origin folder")
                             // Icon-only: a Button names itself from its label
                             // or this, never from its tooltip.
                             .accessibility_label("Reveal the origin folder")
@@ -2308,7 +2308,7 @@ impl DetailPane {
                             .ghost()
                             .small()
                             .icon(IconName::Delete)
-                            .tooltip("Delete this skill")
+                            .text_tooltip("Delete this skill")
                             .accessibility_label("Delete this skill")
                             .disabled(self.busy)
                             .on_click(
@@ -2327,7 +2327,7 @@ impl DetailPane {
                                     .outline()
                                     .small()
                                     .label("Update")
-                                    .tooltip("Replace this skill with the copy upstream holds")
+                                    .text_tooltip("Replace this skill with the copy upstream holds")
                                     .disabled(self.busy)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.update_skill(window, cx)
@@ -2363,7 +2363,7 @@ impl DetailPane {
             .ghost()
             .small()
             .icon(IconName::Ellipsis)
-            .tooltip("More actions")
+            .text_tooltip("More actions")
             .accessibility_label("More actions")
             .dropdown_menu(move |menu, _, _| {
                 let (rename, edit) = (this.clone(), this.clone());
@@ -2578,17 +2578,25 @@ impl DetailPane {
                                 .gap_2()
                                 .items_center()
                                 .child(
-                                    Switch::new("visible-shared")
-                                        .small()
-                                        .checked(skill.in_shared)
-                                        .disabled(!managed || self.busy)
-                                        .label("Shared")
-                                        .tooltip(shared_path.clone())
-                                        .on_click(cx.listener(
-                                            move |this, checked: &bool, window, cx| {
-                                                this.set_present(shared, *checked, window, cx)
-                                            },
-                                        )),
+                                    // A switch's own tooltip cannot be capped,
+                                    // so it takes one from around it.
+                                    div()
+                                        .id("visible-shared-tooltip")
+                                        .tooltip(text_tooltip(shared_path.clone()))
+                                        .child(
+                                            Switch::new("visible-shared")
+                                                .small()
+                                                .checked(skill.in_shared)
+                                                .disabled(!managed || self.busy)
+                                                .label("Shared")
+                                                .on_click(cx.listener(
+                                                    move |this, checked: &bool, window, cx| {
+                                                        this.set_present(
+                                                            shared, *checked, window, cx,
+                                                        )
+                                                    },
+                                                )),
+                                        ),
                                 )
                                 .child(help_dot(ElementId::from("shared-help"), shared_effect, cx)),
                         )
@@ -2667,7 +2675,7 @@ impl DetailPane {
                     .outline()
                     .small()
                     .label("Link all")
-                    .tooltip(if link_names.is_empty() {
+                    .text_tooltip(if link_names.is_empty() {
                         "Every agent below already reaches this skill".to_string()
                     } else {
                         format!(
@@ -2685,7 +2693,7 @@ impl DetailPane {
                     .outline()
                     .small()
                     .label("Unlink all")
-                    .tooltip(if unlink_names.is_empty() {
+                    .text_tooltip(if unlink_names.is_empty() {
                         "No agent below has a link to remove".to_string()
                     } else {
                         format!("Removes the links at {unlink_names}, in one write")
@@ -2788,9 +2796,7 @@ impl DetailPane {
             .id(ElementId::from((ElementId::from("agent-row"), agent.id)))
             .gap_3()
             .items_center()
-            .when(note.is_none(), |this| {
-                this.tooltip(move |window, cx| Tooltip::new(effect.clone()).build(window, cx))
-            })
+            .when(note.is_none(), |this| this.tooltip(text_tooltip(effect)))
             .child(
                 h_flex()
                     .flex_1()
@@ -2823,61 +2829,78 @@ impl DetailPane {
                     .justify_end()
                     .when(switchable, |this| {
                         this.child(
-                            Switch::new((ElementId::from("enabled"), agent.id))
-                                .small()
-                                .checked(enabled)
-                                .disabled(locked || self.busy)
-                                .label("Enabled")
-                                // The visible label has room for one word;
-                                // a reader who cannot see which row it sits
-                                // in needs the agent named, and this
-                                // switch moves files on disk.
-                                .accessibility_label(format!("{} enabled", agent.display_name))
-                                .tooltip(how)
-                                .on_click(cx.listener(move |this, checked: &bool, window, cx| {
-                                    this.set_enabled(agent, *checked, window, cx)
-                                })),
+                            // A switch's own tooltip cannot be capped, so it
+                            // takes one from around it.
+                            div()
+                                .id((ElementId::from("enabled-tooltip"), agent.id))
+                                .tooltip(text_tooltip(how))
+                                .child(
+                                    Switch::new((ElementId::from("enabled"), agent.id))
+                                        .small()
+                                        .checked(enabled)
+                                        .disabled(locked || self.busy)
+                                        .label("Enabled")
+                                        // The visible label has room for one
+                                        // word; a reader who cannot see which
+                                        // row it sits in needs the agent
+                                        // named, and this switch moves files
+                                        // on disk.
+                                        .accessibility_label(format!(
+                                            "{} enabled",
+                                            agent.display_name
+                                        ))
+                                        .on_click(cx.listener(
+                                            move |this, checked: &bool, window, cx| {
+                                                this.set_enabled(agent, *checked, window, cx)
+                                            },
+                                        )),
+                                ),
                         )
                     }),
             )
             .child(
                 h_flex().flex_shrink_0().w(rems(4.5)).justify_end().child(
-                    // "Linked", not "Visible": this switch adds or
-                    // removes the link, which is the word the row's
-                    // own caption and its notification already use.
-                    // "Visible" and "Enabled" side by side read as the
-                    // same question asked twice.
-                    Switch::new((ElementId::from("visible"), agent.id))
-                        .small()
-                        // On for an agent that is reached through
-                        // Shared, because it is. The section header
-                        // has always counted those agents as reached;
-                        // the row used to sit at Off beside it and say
-                        // the opposite about the same agent.
-                        .checked(present || via_shared)
-                        // ...and not the control that put it there, so
-                        // it does not offer to change it. Its own
-                        // tooltip says where the control is.
-                        .disabled(!managed || self.busy || via_shared)
-                        .label("Linked")
-                        .tooltip(unlink)
-                        .accessibility_label(if via_shared {
-                            format!(
-                                "{} reached through Shared, not linked separately",
-                                agent.display_name
-                            )
-                        } else {
-                            format!("{} linked", agent.display_name)
-                        })
-                        .on_click(cx.listener(move |this, checked: &bool, window, cx| {
-                            // What is written to disk is unchanged.
-                            // The switch is clickable only where what
-                            // it shows *is* the link state, so
-                            // `checked` is never the Shared reading
-                            // and this cannot write a link the row
-                            // did not ask for.
-                            this.set_present(agent, *checked, window, cx)
-                        })),
+                    // Around the switch, like the one beside it.
+                    div()
+                        .id((ElementId::from("visible-tooltip"), agent.id))
+                        .tooltip(text_tooltip(unlink))
+                        .child(
+                            // "Linked", not "Visible": this switch adds or
+                            // removes the link, which is the word the row's
+                            // own caption and its notification already use.
+                            // "Visible" and "Enabled" side by side read as the
+                            // same question asked twice.
+                            Switch::new((ElementId::from("visible"), agent.id))
+                                .small()
+                                // On for an agent that is reached through
+                                // Shared, because it is. The section header
+                                // has always counted those agents as reached;
+                                // the row used to sit at Off beside it and say
+                                // the opposite about the same agent.
+                                .checked(present || via_shared)
+                                // ...and not the control that put it there, so
+                                // it does not offer to change it. Its own
+                                // tooltip says where the control is.
+                                .disabled(!managed || self.busy || via_shared)
+                                .label("Linked")
+                                .accessibility_label(if via_shared {
+                                    format!(
+                                        "{} reached through Shared, not linked separately",
+                                        agent.display_name
+                                    )
+                                } else {
+                                    format!("{} linked", agent.display_name)
+                                })
+                                .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                                    // What is written to disk is unchanged.
+                                    // The switch is clickable only where what
+                                    // it shows *is* the link state, so
+                                    // `checked` is never the Shared reading
+                                    // and this cannot write a link the row
+                                    // did not ask for.
+                                    this.set_present(agent, *checked, window, cx)
+                                })),
+                        ),
                 ),
             )
             .into_any_element()
@@ -3111,7 +3134,9 @@ impl DetailPane {
                                     .small()
                                     .icon(IconName::SquareTerminal)
                                     .label("Open in editor")
-                                    .tooltip("Open the whole directory with $VISUAL or $EDITOR")
+                                    .text_tooltip(
+                                        "Open the whole directory with $VISUAL or $EDITOR",
+                                    )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.edit_externally(window, cx)
                                     })),
@@ -3193,7 +3218,7 @@ impl DetailPane {
                             } else {
                                 format!("Replace {replace} copies")
                             })
-                            .tooltip("Replace each copy with a symlink to the origin")
+                            .text_tooltip("Replace each copy with a symlink to the origin")
                             .disabled(self.busy || replace == 0)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.confirm_consolidate(window, cx)
@@ -3321,7 +3346,7 @@ impl DetailPane {
                         .xsmall()
                         .flex_shrink_0()
                         .icon(IconName::FolderOpen)
-                        .tooltip(if cfg!(target_os = "macos") {
+                        .text_tooltip(if cfg!(target_os = "macos") {
                             "Reveal this copy in Finder"
                         } else {
                             "Open this copy's folder"
@@ -4360,7 +4385,7 @@ fn help_dot(id: ElementId, text: String, cx: &App) -> impl IntoElement + use<> {
         .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child("?")
-        .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+        .tooltip(text_tooltip(text))
 }
 
 /// One agent's share of linking or unlinking, appended to `done`.

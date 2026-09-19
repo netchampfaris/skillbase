@@ -15,7 +15,6 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
     v_flex,
@@ -31,6 +30,7 @@ use crate::app::{ScanState, Skillbase, UpdateState};
 
 use super::PAGE_MAX_WIDTH;
 use super::model::{DirStatus, HOME_OVERRIDE_ENV, Preferences, display_path, in_words};
+use super::tooltip::text_tooltip;
 
 impl Skillbase {
     pub(crate) fn render_settings(
@@ -146,7 +146,7 @@ impl Skillbase {
             // Truncation clips the end of the path, which is the part that
             // says which directory this is. The row is what Settings exists
             // to answer, so the whole path stays reachable.
-            .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+            .tooltip(text_tooltip(full))
             .child(
                 h_flex()
                     .gap_2()
@@ -279,9 +279,7 @@ impl Skillbase {
                                     .items_center()
                                     // The truncated end of the path is the part
                                     // that identifies the directory.
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(full.clone()).build(window, cx)
-                                    })
+                                    .tooltip(text_tooltip(full))
                                     .child(
                                         div()
                                             .w_40()

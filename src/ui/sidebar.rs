@@ -8,7 +8,6 @@ use std::rc::Rc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::sidebar::{Sidebar, SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::skeleton::Skeleton;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Collapsible, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
@@ -24,6 +23,7 @@ use crate::app::{Skillbase, UpdateState, WorkArea};
 
 use super::agent_icon;
 use super::model::{Library, Scope};
+use super::tooltip::{TextTooltipExt as _, text_tooltip};
 use super::{BAND_HEIGHT, TRAFFIC_LIGHT_INSET, drag_band};
 
 /// Wide enough for the longest scope label, and visibly subordinate to the
@@ -239,7 +239,7 @@ impl Skillbase {
                     .ghost()
                     .small()
                     .icon(Icon::new(IconName::PanelLeftClose).size_4())
-                    .tooltip("Hide sidebar")
+                    .text_tooltip("Hide sidebar")
                     .accessibility_label("Hide sidebar")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx))),
             )
@@ -273,9 +273,7 @@ impl Skillbase {
                             div()
                                 .id("home-override")
                                 .flex_shrink_0()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(format!("SKILLBASE_HOME={home}")).build(window, cx)
-                                })
+                                .tooltip(text_tooltip(format!("SKILLBASE_HOME={home}")))
                                 .child(
                                     Icon::new(IconName::TriangleAlert)
                                         .xsmall()
@@ -292,7 +290,9 @@ impl Skillbase {
                     // Said here rather than only in Settings: this is the
                     // control someone hesitates over, and what stops them is
                     // not knowing whether a scan writes anything.
-                    .tooltip("Re-scan every scope. Scanning only reads; nothing on disk changes")
+                    .text_tooltip(
+                        "Re-scan every scope. Scanning only reads; nothing on disk changes",
+                    )
                     .accessibility_label("Re-scan every scope")
                     // The one gesture that means "look at the machine again",
                     // which is why it is also the one that spends requests on
