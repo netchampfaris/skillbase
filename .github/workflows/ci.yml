@@ -3,8 +3,8 @@
 # triples are exercised by release.yml, which can be run by hand on a branch
 # before that branch is merged.
 #
-# There is no `push` trigger. Every merge into main starts release.yml, and
-# that workflow calls this one before it builds anything, so a push that ran
+# There is no `push` trigger. Every merge into main that changes what ships
+# starts release.yml, and that workflow calls this one before it builds anything, so a push that ran
 # both would run the suite twice and release regardless of the answer.
 name: CI
 

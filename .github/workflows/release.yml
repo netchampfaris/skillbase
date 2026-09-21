@@ -1,4 +1,4 @@
-# Every merge into main becomes a release.
+# Every merge into main that changes what ships becomes a release.
 #
 # The version is decided by script/next-version.sh: the newest tag with its
 # patch number raised by one, unless Cargo.toml already declares something
@@ -16,6 +16,19 @@ name: Release
 on:
   push:
     branches: [main]
+    # A merge that changes none of what ships is not a release: documentation,
+    # the workflows themselves, and the scripts only a developer runs. A merge
+    # that touches anything else still publishes, whatever else it carries.
+    paths-ignore:
+      - "**.md"
+      - docs/**
+      - LICENSE
+      - .gitignore
+      - .claude/**
+      - .github/**
+      - script/preview.sh
+      - script/screenshot.sh
+      - script/window-id.swift
   # Narrowed to the files that decide what a release contains, because
   # building four release binaries is not something every pull request needs.
   pull_request:
