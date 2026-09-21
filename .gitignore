@@ -1,1 +1,5 @@
 /target
+
+# The gpui-kit skills are installed per contributor, not shipped with the repo.
+/.claude/skills/gpui-kit/
+/.claude/skills/gpui-kit-design-guides/
